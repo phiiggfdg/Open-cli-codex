@@ -160,6 +160,60 @@ _file_cache: dict = {}  # {abs_path: {"content": str, "symbols": dict, "mtime": 
 CACHE_MAX_FILES  = 6      # tối đa N file trong cache block (LRU — file cũ nhất bị drop khỏi prompt)
 CACHE_MAX_CHARS  = 5_000  # tổng ký tự inject vào system prompt, không vượt quá
 
+# ── Memory pressure eviction ──────────────────────────────────────────────────
+# Evict _file_cache entries khi RAM cao để tránh OOM trên Android.
+# Ngưỡng: soft=50%, hard=65%, critical=80% tổng RAM.
+# Kích hoạt sau mỗi batch tool calls từ agent_turn().
+_MEM_SOFT     = float(os.environ.get("FW_MEM_SOFT",     "0.50"))
+_MEM_HARD     = float(os.environ.get("FW_MEM_HARD",     "0.65"))
+_MEM_CRITICAL = float(os.environ.get("FW_MEM_CRITICAL", "0.80"))
+_MEM_COOLDOWN = 5.0   # giây giữa 2 lần evict liên tiếp
+_mem_last_evict: float = 0.0
+
+def _mem_ratio() -> float:
+    """RSS / total RAM. Trả về 0.0 nếu không đọc được."""
+    try:
+        import resource as _res
+        rss   = _res.getrusage(_res.RUSAGE_SELF).ru_maxrss
+        # Linux: KB, macOS: bytes
+        rss_bytes = rss * 1024 if sys.platform != "darwin" else rss
+        total = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+        return rss_bytes / total if total > 0 else 0.0
+    except Exception:
+        return 0.0
+
+def memory_pressure_evict() -> None:
+    """
+    Evict _file_cache theo mức RAM:
+    - soft  (≥50%): xóa entry không access trong 60 phút.
+    - hard  (≥65%): xóa entry không access trong 30 phút.
+    - critical (≥80%): clear toàn bộ cache.
+    Có cooldown 5s để không spam khi nhiều tool calls liên tiếp.
+    """
+    global _mem_last_evict
+    if not _file_cache:
+        return
+    now = time.time()
+    if now - _mem_last_evict < _MEM_COOLDOWN:
+        return
+    ratio = _mem_ratio()
+    if ratio < _MEM_SOFT:
+        return
+    _mem_last_evict = now
+    if ratio >= _MEM_CRITICAL:
+        _file_cache.clear()
+        if _cache_debug:
+            print(f"  {RED}[cache mem]{R} critical ({ratio:.0%}) → clear all")
+        return
+    cutoff_min = 30 if ratio >= _MEM_HARD else 60
+    cutoff_ts  = now - cutoff_min * 60
+    stale = [k for k, v in _file_cache.items() if v.get("access", 0) < cutoff_ts]
+    for k in stale:
+        _file_cache.pop(k, None)
+    if stale and _cache_debug:
+        level = "hard" if ratio >= _MEM_HARD else "soft"
+        print(f"  {YELLOW}[cache mem]{R} {level} ({ratio:.0%}) → evict {len(stale)} entries")
+
 # ── Bug 3 fix: symbol parsing mạnh hơn ───────────────────────────────────────
 def _parse_symbols(content: str, ext: str = "") -> dict:
     """

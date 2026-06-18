@@ -853,6 +853,7 @@ def agent_turn(messages, model, api_key, conn, sid, max_steps=20, agent=AGENT_BU
         messages.extend(tool_results)
         for tr in tool_results_history:
             message_save(conn, sid, "tool", tr)
+        memory_pressure_evict()   # evict file cache nếu RAM cao
         steps += 1
 
     if total_in or total_out:

@@ -867,13 +867,17 @@ def _anchor_map(lines: list[str], focus_line: int | None = None) -> str:
         r"export |export default |"                                  # JS/TS exports
         r"const \w+\s*=\s*\(|const \w+\s*=\s*async|"                 # arrow function consts
         r"interface |type \w+\s*=|enum |"                             # TS types
+        r"#\s*##==\s*\w|##==\s*\w|"                                  # section markers ##== NAME ==## (with or without leading #)
         r"# |## |### |#### |"                                         # markdown / comments
         r"@app\.|@\w+|"                                               # decorators (Flask, etc.)
         r"<(h[1-6]|section|nav|header|footer|main|article|aside|form|table)\b|" # HTML structural tags
         r"@media|@keyframes|@font-face|"                              # CSS at-rules
         r"(?!if |for |while |switch |else|catch|return |function)[.#a-zA-Z][\w\-\.\#\s:,>+~\[\]=\"']*\{\s*$|"  # generic CSS selectors
         r"\w+:\s*$|"                                                  # YAML/JSON-ish top-level keys
-        r"(public|private|protected|static)\s+\w"                    # Java/C#/PHP methods
+        r"(public|private|protected|static)\s+\w|"                   # Java/C#/PHP methods
+        r"fn \w|async fn \w|impl \w|pub fn \w|pub async fn \w|"      # Rust
+        r"func \w|"                                                    # Go
+        r"(void|int|char|bool|string|uint|float|double|size_t)\s+\w+\s*\("  # C/C++
         r")"
     )
     # Collect ALL matching anchor line numbers (1-based), tagged with a type
@@ -884,12 +888,17 @@ def _anchor_map(lines: list[str], focus_line: int | None = None) -> str:
         if t.startswith(("function", "export default", "export ")): return "fn"
         if t.startswith(("const ",)) and "=>" in t: return "fn"
         if t.startswith(("interface ", "type ", "enum ")): return "type"
+        if t.startswith(("fn ", "async fn ", "pub fn ", "pub async fn ")): return "fn"
+        if t.startswith("impl "): return "class"
+        if t.startswith("func "): return "fn"
+        if any(t.startswith(k) for k in ("void ", "int ", "char ", "bool ", "string ", "uint ", "float ", "double ", "size_t ")): return "fn"
+        if t.startswith(("public ", "private ", "protected ", "static ")): return "method"
         if t.startswith(("@media", "@keyframes", "@font-face")): return "css"
         if t.startswith(("@",)): return "deco"
+        if t.startswith("##==") or "##==" in t[:6]: return "sec"
         if t.startswith("#"): return "md"
         if t.startswith("<"): return "html"
         if t.startswith((".", "#")) or t.rstrip().endswith("{"): return "css"
-        if t.startswith(("public ", "private ", "protected ", "static ")): return "method"
         if t.rstrip().endswith(":"): return "key"
         return "·"
 

@@ -581,7 +581,7 @@ def main():
             print(f"{DIM}  session: {r['token_input']:,}↑  {r['token_output']:,}↓")
             print(f"  context now: ~{est:,} tokens estimated")
             print(f"  {bar}")
-            print(f"  {_session_cost_str()}{R}\n"); continue
+            print(f"  {_session_cost_str()}{R}"); continue
 
         if user.lower().startswith("/checkpoint"):
             label = user[len("/checkpoint"):].strip()
