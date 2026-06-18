@@ -141,11 +141,8 @@ _input_history: list[str] = []  # load từ file khi main() khởi động
 
 def _multiline_input_with_hint(prompt: str) -> str | None:
     """
-    Raw-mode input với:
-      - Slash hint: gõ '/' hiển thị gợi ý lệnh (đã fix cursor)
-      - ↑↓ history: duyệt lịch sử input như shell
-      - @file Tab complete: gõ '@foo' rồi Tab → gợi ý file khớp
-    Fallback về _multiline_input nếu terminal không hỗ trợ raw mode.
+    Raw-mode input với slash hint, history, @file complete.
+    Hint hiện trên 1 dòng phía dưới prompt, xóa sạch mỗi keystroke.
     """
     import sys, termios, tty as _tty
 
@@ -159,130 +156,49 @@ def _multiline_input_with_hint(prompt: str) -> str | None:
         return _multiline_input(prompt)
 
     buf: list[str] = []
-    hist_idx = len(_input_history)   # trỏ vào "dòng mới" (past end)
-    hist_saved = ""                  # lưu buf hiện tại khi bắt đầu duyệt history
+    hist_idx  = len(_input_history)
+    hist_saved = ""
+    has_hint  = [False]
 
-    # ── helpers ──────────────────────────────────────────────────────────────
-    # Số dòng hint đang hiện bên dưới dòng input — dùng để clear chính xác
-    n_hint_lines = 0
-
-    _prev_wrapped = [1]
-
-    def _redraw(text: str, force: bool = False):
-        """Xoá và vẽ lại prompt + text.
-        force=True khi backspace/history (cần redraw full dù đang wrap).
-        Khi chỉ thêm ký tự mới và đang wrap: chỉ in ký tự, không cursor-up.
-        """
-        import re as _re
-        _ansi = _re.compile(r"\033\[[0-9;]*m")
-        visible_prompt = len(_ansi.sub("", prompt))
-        cols = shutil.get_terminal_size((80, 20)).columns
-        total_len = visible_prompt + len(text)
-        cur_wrapped = max(1, (total_len + cols - 1) // cols)
-
-        if not force and cur_wrapped > 1 and cur_wrapped >= _prev_wrapped[0]:
-            # Đang wrap, chỉ thêm ký tự → in thêm ký tự cuối, terminal tự wrap
-            sys.stdout.write(text[-1] if text else "")
+    # ── render: hint hiện inline sau text trên cùng dòng ─────────────────────
+    def _render(text: str):
+        # Tính hint
+        hint = ""
+        if text.startswith("/"):
+            hints = _slash_hint(text)
+            if hints:
+                hint = "  ".join(hints[:6])
+        elif "@" in text:
+            m = re.search(r"@([\w./\\-]*)$", text)
+            if m:
+                files = _at_file_complete(m.group(1))
+                if files:
+                    hint = f"@{files[0]}" + (f"  +{len(files)-1}" if len(files) > 1 else "")
+        # Xóa dòng hiện tại và vẽ lại: prompt + text + hint mờ
+        line = prompt + text
+        if hint:
+            hint_display = f"  {DIM}{hint}{R}"
+            line += hint_display
+            has_hint[0] = True
         else:
-            # Redraw full: lên về dòng đầu dựa vào wrap lần trước
-            up = _prev_wrapped[0] - 1
-            if up > 0:
-                sys.stdout.write(f"\033[{up}A")
-            sys.stdout.write(f"\r\033[J{prompt}{text}")
-
-        _prev_wrapped[0] = cur_wrapped
+            has_hint[0] = False
+        sys.stdout.write(f"\r\033[K{line}")
+        # Đưa cursor về sau text (trước hint)
+        if hint:
+            hint_visible = len(hint) + 2  # +2 cho "  " prefix
+            sys.stdout.write(f"\033[{hint_visible}D")
         sys.stdout.flush()
 
-
-    def _clear_hints():
-        """Xoá đúng số dòng hint đang hiện, đưa cursor về dòng input."""
-        nonlocal n_hint_lines
-        if n_hint_lines == 0:
-            return
-        # Xuống tới dòng cuối hint, xoá từng dòng, rồi lên lại
-        for _ in range(n_hint_lines):
-            sys.stdout.write("\r\n\033[K")
-        # Lên lại đúng n dòng
-        sys.stdout.write(f"\033[{n_hint_lines}A")
-        sys.stdout.flush()
-        n_hint_lines = 0
-
-    def _show_slash_hints(text: str):
-        nonlocal n_hint_lines
-        if not text.startswith("/"):
-            return
-        hints = _slash_hint(text)
-        if not hints:
-            return
-        if len(hints) <= 4:
-            for cmd in hints:
-                desc = SLASH_DESC.get(cmd, "")
-                sys.stdout.write(f"\r\n{CYAN}{cmd}{R}  {GRAY}{desc}{R}\033[K")
-            n = len(hints)
-        else:
-            hint_str = "  ".join(hints[:10])
-            sys.stdout.write(f"\r\n{DIM}  {hint_str}{R}\033[K")
-            n = 1
-        # Lên lại + redraw dòng input
-        sys.stdout.write(f"\033[{n}A\r")
-        sys.stdout.write(prompt + text)
-        sys.stdout.flush()
-        n_hint_lines = n
-
-    def _show_at_hints(text: str):
-        """Hiện gợi ý @file bên dưới cursor."""
-        nonlocal n_hint_lines
-        m = re.search(r"@([\w./\\-]*)$", text)
-        if not m:
-            return
-        prefix = m.group(1)
-        files = _at_file_complete(prefix)
-        if not files:
-            return
-        # Show tối đa 4 file
-        show = files[:4]
-        for f in show:
-            sys.stdout.write(f"\r\n{GREEN}@{f}{R}\033[K")
-        if len(files) > 4:
-            sys.stdout.write(f"\r\n{DIM}  ...+{len(files)-4} more{R}\033[K")
-            show_n = len(show) + 1
-        else:
-            show_n = len(show)
-        sys.stdout.write(f"\033[{show_n}A\r")
-        sys.stdout.write(prompt + text)
-        sys.stdout.flush()
-        n_hint_lines = show_n
-
-    def _do_tab_complete(buf: list[str]) -> list[str]:
-        """Tab pressed: complete @file token tại cuối buf."""
-        text = "".join(buf)
-        m = re.search(r"@([\w./\\-]*)$", text)
-        if not m:
-            return buf
-        prefix = m.group(1)
-        files = _at_file_complete(prefix)
-        if not files:
-            return buf
-        if len(files) == 1:
-            # Duy nhất → complete luôn
-            completed = text[:m.start()] + "@" + files[0]
-            return list(completed)
-        # Tìm common prefix
-        common = files[0]
-        for f in files[1:]:
-            while not f.startswith(common):
-                common = common[:-1]
-                if not common:
-                    break
-        if common and len(common) > len(prefix):
-            completed = text[:m.start()] + "@" + common
-            return list(completed)
-        return buf
+    def _clear_hint(current_buf: list):
+        """Xóa phần hint inline khỏi màn hình."""
+        if has_hint[0]:
+            sys.stdout.write(f"\r\033[K{prompt}{''.join(current_buf)}")
+            sys.stdout.flush()
+        has_hint[0] = False
 
     # ── main raw loop ─────────────────────────────────────────────────────────
     try:
         _tty.setraw(fd)
-        # Bật bracketed paste mode: paste wrap trong \x1b[200~...text...\x1b[201~
         sys.stdout.write("\x1b[?2004h")
         sys.stdout.write(prompt)
         sys.stdout.flush()
@@ -290,9 +206,9 @@ def _multiline_input_with_hint(prompt: str) -> str | None:
         while True:
             ch = sys.stdin.read(1)
 
-            # ── Enter ─────────────────────────────────────────────────────────
+            # Enter
             if ch in ("\r", "\n"):
-                _clear_hints()
+                _clear_hint(buf)
                 sys.stdout.write("\r\n")
                 sys.stdout.flush()
                 line = "".join(buf).strip()
@@ -306,110 +222,82 @@ def _multiline_input_with_hint(prompt: str) -> str | None:
                     history_save(_input_history)
                 return line or None
 
-            # ── Ctrl-C ────────────────────────────────────────────────────────
-            if ch == "\x03":
-                _clear_hints()
+            # Ctrl-C / Ctrl-D
+            if ch in ("\x03", "\x04"):
+                _clear_hint(buf)
                 sys.stdout.write("\r\n")
                 sys.stdout.flush()
                 return None
 
-            # ── Ctrl-D ────────────────────────────────────────────────────────
-            if ch == "\x04":
-                _clear_hints()
-                sys.stdout.write("\r\n")
-                sys.stdout.flush()
-                return None
-
-            # ── Tab: @file complete ───────────────────────────────────────────
+            # Tab: @file complete
             if ch == "\t":
-                _clear_hints()
-                text_before = "".join(buf)
-                buf = _do_tab_complete(buf)
-                text_after = "".join(buf)
-                if text_after != text_before:
-                    _redraw(text_after)
-                else:
-                    # Không complete được → show gợi ý
-                    _show_at_hints(text_after)
+                text = "".join(buf)
+                m = re.search(r"@([\w./\\-]*)$", text)
+                if m:
+                    files = _at_file_complete(m.group(1))
+                    if len(files) == 1:
+                        buf = list(text[:m.start()] + "@" + files[0])
+                    elif files:
+                        common = files[0]
+                        for f in files[1:]:
+                            while not f.startswith(common):
+                                common = common[:-1]
+                        if len(common) > len(m.group(1)):
+                            buf = list(text[:m.start()] + "@" + common)
+                _render("".join(buf))
                 continue
 
-            # ── Escape sequence (arrow keys, etc.) ────────────────────────────
+            # Escape sequence (arrow keys)
             if ch == "\x1b":
                 seq = sys.stdin.read(1)
                 if seq == "[":
                     arrow = sys.stdin.read(1)
-
-                    # Bracketed paste begin: \x1b[200~
+                    # Bracketed paste
                     if arrow == "2":
-                        rest = sys.stdin.read(2)  # "0~"
+                        rest = sys.stdin.read(2)
                         if rest == "0~":
                             pasted = []
                             while True:
                                 pc = sys.stdin.read(1)
                                 if pc == "\x1b":
-                                    sys.stdin.read(4)  # "[201~"
+                                    sys.stdin.read(4)
                                     break
                                 pasted.append(pc)
                             paste_text = "".join(pasted).replace("\r","").replace("\n"," ").strip()
                             buf.extend(list(paste_text))
                             hist_idx = len(_input_history)
-                            text = "".join(buf)
-                            _clear_hints()
-                            _redraw(text)
+                            _render("".join(buf))
                         continue
-
                     # ↑ history
                     if arrow == "A":
-                        if not _input_history:
-                            continue
-                        if hist_idx == len(_input_history):
-                            hist_saved = "".join(buf)  # lưu dòng đang gõ
-                        if hist_idx > 0:
-                            hist_idx -= 1
-                            buf = list(_input_history[hist_idx])
-                            _clear_hints()
-                            _redraw("".join(buf), force=True)
+                        if _input_history:
+                            if hist_idx == len(_input_history):
+                                hist_saved = "".join(buf)
+                            if hist_idx > 0:
+                                hist_idx -= 1
+                                buf = list(_input_history[hist_idx])
+                                _render("".join(buf))
                         continue
-
                     # ↓ history
                     if arrow == "B":
                         if hist_idx < len(_input_history):
                             hist_idx += 1
-                            if hist_idx == len(_input_history):
-                                buf = list(hist_saved)
-                            else:
-                                buf = list(_input_history[hist_idx])
-                            _clear_hints()
-                            _redraw("".join(buf), force=True)
+                            buf = list(hist_saved if hist_idx == len(_input_history) else _input_history[hist_idx])
+                            _render("".join(buf))
                         continue
-
-                    # ← → Home End — bỏ qua (cursor move không hỗ trợ)
                 continue
 
-            # ── Backspace ─────────────────────────────────────────────────────
+            # Backspace
             if ch in ("\x7f", "\x08"):
                 if buf:
                     buf.pop()
-                    text = "".join(buf)
-                    _clear_hints()
-                    _redraw(text, force=True)
-                    if text.startswith("/"):
-                        _show_slash_hints(text)
-                    elif "@" in text:
-                        _show_at_hints(text)
+                    _render("".join(buf))
                 continue
 
-            # ── Ký tự bình thường ─────────────────────────────────────────────
+            # Ký tự bình thường
             buf.append(ch)
-            hist_idx = len(_input_history)  # reset history index khi gõ mới
-
-            text = "".join(buf)
-            _clear_hints()
-            _redraw(text)
-            if text.startswith("/"):
-                _show_slash_hints(text)
-            elif "@" in text:
-                _show_at_hints(text)
+            hist_idx = len(_input_history)
+            _render("".join(buf))
 
     except Exception:
         return _multiline_input(prompt)
@@ -420,4 +308,3 @@ def _multiline_input_with_hint(prompt: str) -> str | None:
             termios.tcsetattr(fd, termios.TCSADRAIN, old)
         except Exception:
             pass
-
