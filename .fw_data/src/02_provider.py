@@ -54,6 +54,74 @@ PROVIDERS = {
         ],
         "rate_limit_delay": 0.0,
     },
+    "cohere": {
+        "name":         "Cohere",
+        # Cohere Compatibility API — endpoint OpenAI-compatible chính thức,
+        # hỗ trợ đầy đủ chat/completions streaming + function calling.
+        "base_url":     "https://api.cohere.com/compatibility/v1",
+        "models_url":   "https://api.cohere.com/v1/models?endpoint=chat&page_size=1000",
+        "key_check_url":"https://api.cohere.com/v1/models?endpoint=chat&page_size=1",
+        "env_key":      "COHERE_API_KEY",
+        "config_key":   "cohere_api_key",
+        "fallback_models": [
+            "command-r-plus-08-2024",
+            "command-r-08-2024",
+            "command-r7b-12-2024",
+        ],
+        "context_limits": {
+            "command-a-plus":   256_000,
+            "command-a":        256_000,
+            "north-mini-code":  256_000,
+            "command-r-plus":   128_000,
+            "command-r7b":      128_000,
+            "command-r":        128_000,
+        },
+        # /v1/models trả về {"models": [{"name": ..., "endpoints": [...]}]}
+        # endpoint=chat đã filter ở query string nhưng vẫn lẫn nhiều model
+        # không hợp dùng qua pipeline OpenAI-compat hiện tại:
+        #   - aya-*, tiny-aya-*     : đa ngôn ngữ, không tối ưu code/tool-use
+        #   - *-vision-*            : multimodal, code này chỉ gửi text
+        #   - *-translate-*         : chuyên dịch thuật
+        #   - *-reasoning-*         : trả "thinking" block riêng, format
+        #                             khác chuẩn OpenAI → vỡ _stream_response
+        #   - *-arabic-*            : fine-tune riêng tiếng Ả Rập
+        # Chỉ giữ lại Command (A/A+/R-plus/R/R7B) và North Mini Code.
+        "parse_models":     lambda data: [
+            m["name"] for m in data.get("models", [])
+            if m.get("name") and "chat" in (m.get("endpoints") or [])
+            and not any(x in m["name"].lower() for x in (
+                "aya", "vision", "translate", "reasoning", "arabic",
+                "command-a-03",   # tool calling không thật, chỉ hallucinate
+                "north-mini-code",# stuck loop hỏi mãi, không bao giờ action
+            ))
+        ],
+        "rate_limit_delay": 0.0,
+    },
+    "cerebras": {
+        "name":         "Cerebras",
+        # Cerebras Inference — OpenAI-compatible API, hỗ trợ streaming +
+        # function calling. Chạy trên wafer-scale chip → tốc độ rất cao.
+        "base_url":     "https://api.cerebras.ai/v1",
+        "models_url":   "https://api.cerebras.ai/v1/models",
+        "key_check_url":"https://api.cerebras.ai/v1/models",
+        "env_key":      "CEREBRAS_API_KEY",
+        "config_key":   "cerebras_api_key",
+        "fallback_models": [
+            "zai-glm-4.7",
+            "gpt-oss-120b",
+        ],
+        "context_limits": {
+            "zai-glm-4.7":   131_072,
+            "gpt-oss-120b":  128_000,
+        },
+        # /v1/models trả về OpenAI-compatible format: {"data": [{"id": ...}]}
+        # Chỉ giữ 2 model test được — bỏ các model embed / audio / vision
+        "parse_models":     lambda data: [
+            m["id"] for m in data.get("data", [])
+            if m.get("id") and m["id"] in ("zai-glm-4.7", "gpt-oss-120b")
+        ],
+        "rate_limit_delay": 0.0,
+    },
     "mistral": {
         "name":         "Mistral AI",
         "base_url":     "https://api.mistral.ai/v1",
@@ -235,6 +303,22 @@ PROVIDERS = {
                 "-mt-",
             ))
         ],
+        "rate_limit_delay": 0.0,
+    },
+    "mercury": {
+        "name":         "Mercury 2 (Inception Labs)",
+        "base_url":     "https://api.inceptionlabs.ai/v1",
+        "models_url":   None,
+        "key_check_url": None,
+        "env_key":      "INCEPTION_API_KEY",
+        "config_key":   "inception_api_key",
+        "fallback_models": [
+            "mercury-2",
+        ],
+        "context_limits": {
+            "mercury-2": 128_000,
+        },
+        "parse_models":     lambda data: [],
         "rate_limit_delay": 0.0,
     },
 }

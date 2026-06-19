@@ -650,7 +650,7 @@ def tool_read(path, offset=1, limit=READ_DEFAULT_LIMIT, depth=4):
 def _check_sandbox_read(path: str) -> str | None:
     """
     Nếu project_dir đã được gán, chỉ cho phép đọc bên trong đó.
-    Luôn chặn .fw_data bất kể project_dir.
+    Luôn chặn .fw_data và fw.py bất kể project_dir.
     Trả về error string nếu vi phạm, None nếu OK.
     """
     # Chặn .fw_data tuyệt đối — không ai được đọc thư mục ẩn này
@@ -661,6 +661,11 @@ def _check_sandbox_read(path: str) -> str | None:
         return f"[not found: {path}]"   # Giả vờ không tồn tại, không lộ lý do
     except ValueError:
         pass
+
+    # Chặn fw.py (entry loader) tuyệt đối — luôn ẩn, không lộ lý do
+    fw_py = (Path.cwd() / "fw.py").resolve()
+    if p == fw_py:
+        return f"[not found: {path}]"
 
     if _project_dir is None:
         return None  # chưa init, chưa cần giới hạn

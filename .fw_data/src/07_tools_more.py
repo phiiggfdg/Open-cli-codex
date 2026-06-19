@@ -138,18 +138,19 @@ def tool_glob(pattern, cwd=None):
         try:
             r = subprocess.run(
                 ["fd", "--glob", pattern, "--base-directory", str(base),
-                 "--exclude", FW_DATA_NAME],
+                 "--exclude", FW_DATA_NAME, "--exclude", "fw.py"],
                 capture_output=True, text=True, timeout=10)
             out = r.stdout.strip()
-            return out or "(no matches)"
+            lines = [l for l in out.splitlines() if l.strip() not in ("fw.py", "./fw.py")]
+            return "\n".join(lines) or "(no matches)"
         except Exception:
             pass
     try:
         matches = sorted(base.glob(pattern))
-        # Lọc bỏ .fw_data — không bao giờ xuất hiện trong kết quả
-        fw = FW_DATA_NAME + "/"
+        # Lọc bỏ .fw_data và fw.py — không bao giờ xuất hiện trong kết quả
         matches = [m for m in matches
-                   if FW_DATA_NAME not in m.parts]
+                   if FW_DATA_NAME not in m.parts
+                   and not (m.parent == base and m.name == "fw.py")]
         return "\n".join(str(m.relative_to(base)) for m in matches[:300]) or "(no matches)"
     except Exception as e:
         return f"[error: {e}]"
@@ -163,7 +164,8 @@ def tool_grep(pattern, path=None, glob=None):
     if rg:
         try:
             cmd = [rg, "--line-number", "--no-heading", "--color=never", "--smart-case",
-                   "--glob", f"!{FW_DATA_NAME}/**"]   # ẩn .fw_data
+                   "--glob", f"!{FW_DATA_NAME}/**",   # ẩn .fw_data
+                   "--glob", "!fw.py"]                 # ẩn fw.py
             if glob: cmd += ["--glob", glob]
             cmd += [pattern, base]
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
@@ -173,7 +175,8 @@ def tool_grep(pattern, path=None, glob=None):
     # Fallback to grep
     try:
         cmd = ["grep", "-rn", "--color=never",
-               f"--exclude-dir={FW_DATA_NAME}"]       # ẩn .fw_data
+               f"--exclude-dir={FW_DATA_NAME}",       # ẩn .fw_data
+               "--exclude=fw.py"]                       # ẩn fw.py
         if glob: cmd += [f"--include={glob}"]
         cmd += [pattern, base]
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)

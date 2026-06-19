@@ -49,9 +49,12 @@ def get_api_key():
     print(f"\n{YELLOW}Chưa tìm thấy {pname} API key.{R}")
     key_url = {
         "fireworks": "https://fireworks.ai/account/api-keys",
+        "cohere":    "https://dashboard.cohere.com/api-keys",
+        "cerebras":  "https://cloud.cerebras.ai/platform/apikeys",
         "mistral":   "https://console.mistral.ai/api-keys",
         "commandcode": "https://commandcode.ai/studio",
         "mimo":      "https://xiaomimimo.com",
+        "mercury":   "https://platform.inceptionlabs.ai/dashboard/api-keys",
     }.get(_active_provider, "")
     if key_url:
         print(f"{DIM}Lấy key tại: {key_url}{R}\n")
@@ -220,18 +223,18 @@ def choose_model(api_key):
 
 
 # ── Retry config ──────────────────────────────────────────────────────────────
-_RETRY_MAX     = 4          # số lần retry tối đa
+_RETRY_MAX     = 5          # số lần retry tối đa
 _RETRY_CODES   = {429, 500, 502, 503, 504}   # HTTP codes đáng retry
-_RETRY_DELAYS  = [2, 5, 15, 30]              # backoff (giây) sau mỗi attempt
+_RETRY_DELAYS  = [5, 15, 25, 30, 30]         # backoff (giây) sau mỗi attempt
 _COST_PROVIDERS  = {"fireworks"}              # providers có bảng giá hiển thị
-_CACHE_PROVIDERS = {"fireworks", "qwen"}      # providers trả về cached_tokens thật
+_CACHE_PROVIDERS = {"fireworks", "qwen", "cerebras"}  # providers trả về cached_tokens thật
 
 def _parse_retry_after(e: "urllib.error.HTTPError") -> float | None:
-    """Đọc Retry-After header nếu có, trả về số giây cần chờ."""
+    """Đọc Retry-After header nếu có, trả về số giây cần chờ (tối đa 30s)."""
     try:
         val = e.headers.get("Retry-After") or e.headers.get("retry-after")
         if val:
-            return float(val)
+            return min(float(val), 30.0)   # cap 30s — Cerebras hay trả 60s
     except Exception:
         pass
     return None
@@ -239,6 +242,8 @@ def _parse_retry_after(e: "urllib.error.HTTPError") -> float | None:
 def _call_simple(messages, model, api_key):
     payload = {"model": model, "messages": messages,
                "max_tokens": 4096, "temperature": 0.3, "stream": False}
+    if _active_provider == "mercury":
+        payload["reasoning_effort"] = "low"
     for attempt in range(_RETRY_MAX):
         _rate_limit_wait()
         req = _provider_request("/chat/completions", api_key, payload)
@@ -336,15 +341,29 @@ def _sanitize_tool_turns(messages: list) -> list:
     return result
 
 
+# Cache max_tokens đã biết là an toàn cho từng model (key: model name).
+# Tránh việc turn nào cũng phải dính 400 rồi retry lại từ đầu.
+_known_max_tokens: dict = {}
+
 def call_api_stream(messages, model, api_key, tool_choice="auto", session_id=None, tools=None):
     api_tools = tools if tools is not None else TOOLS
     payload = {
         "model": model, "messages": messages,
         "tools": api_tools, "tool_choice": tool_choice,
-        "max_tokens": 32768, "temperature": 0.3, "stream": True,
+        "max_tokens": _known_max_tokens.get(model, 32768),
+        "temperature": 0.3, "stream": True,
         "stream_options": {"include_usage": True},
         "parallel_tool_calls": True,
     }
+    if _active_provider == "mercury":
+        payload["reasoning_effort"] = "low"
+    if _active_provider in ("cohere", "cerebras"):
+        # Cohere + Cerebras không hỗ trợ parallel_tool_calls → trả 422 nếu gửi.
+        del payload["parallel_tool_calls"]
+    if _active_provider == "cerebras":
+        # zai-glm-4.7 max output là 40K, gpt-oss-120b giới hạn tương tự.
+        # Dùng max_completion_tokens thay max_tokens (Cerebras docs khuyến nghị).
+        payload["max_completion_tokens"] = payload.pop("max_tokens", 32768)
     extra_hdrs = {}
     if session_id:
         extra_hdrs["x-session-affinity"] = session_id
@@ -373,12 +392,19 @@ def call_api_stream(messages, model, api_key, tool_choice="auto", session_id=Non
             _rate_limit_mark()
             body_txt = e.read().decode(errors="replace")
 
-            # 400 max_tokens: retry với 8192 (Fireworks giới hạn một số model)
-            if e.code == 400 and "max_tokens" in body_txt.lower():
+            # 400 max_tokens: model có giới hạn output riêng (Fireworks/Cohere).
+            # Cohere báo lỗi dạng "max tokens must be less than or equal to N"
+            # (khoảng trắng, không gạch dưới) — parse N thật từ message để
+            # chính xác theo từng model, thay vì đoán cố định 8192.
+            body_lower = body_txt.lower()
+            if e.code == 400 and ("max_tokens" in body_lower or "max tokens" in body_lower):
                 if attempt == 0:
+                    m = re.search(r"less than or equal to (\d+)", body_lower)
+                    safe_limit = int(m.group(1)) if m else 8192
                     spinner_ref[0].stop()
-                    print(f"\n{YELLOW}  ⚠ max_tokens quá cao — retry với 8192...{R}")
-                    payload["max_tokens"] = 8192
+                    print(f"\n{YELLOW}  ⚠ max_tokens quá cao — retry với {safe_limit}...{R}")
+                    payload["max_tokens"] = safe_limit
+                    _known_max_tokens[model] = safe_limit  # nhớ cho turn sau
                     continue
 
             # 429 / 5xx: retry với backoff
