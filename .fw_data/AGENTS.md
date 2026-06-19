@@ -19,20 +19,6 @@ Tự hỏi: "Senior engineer có nói cái này overcomplicated không?" Nếu c
 - **Không có import giữa các module** — tất cả chạy trong shared namespace, biến global là shared.
 - **`.fw_data/src/`** là thư mục ẩn — không xuất hiện trong file listing thông thường.
 
-### Module map
-
-| File | Vai trò |
-|------|---------|
-| `01_ui.py` | Colors, spinner, print helpers, TUI output |
-| `02_provider.py` | Provider/model config, API key lookup |
-| `03_mcp.py` | MCP server integration |
-| `04_agent_cache.py` | File read cache, AGENTS.md loader, permissions |
-| `05_session_db.py` | SQLite session/message persistence |
-| `06_tools_fs.py` | File tools: read, write, edit, glob, grep, extract |
-| `07_tools_more.py` | Tools: bash, websearch, webfetch, task, lsp, verify |
-| `08_undo_dispatch.py` | Undo stack, tool dispatch |
-| `09_api_system.py` | System prompt builder, agentic loop, cache logic |
-| `10_main.py` | CLI entry, REPL, session management, slash commands |
 
 ## Quy tắc chỉnh sửa
 
@@ -52,6 +38,30 @@ Tất cả module chạy trong **cùng 1 namespace** qua `exec()`. Hệ quả:
 
 Nếu cần thêm file module mới vào `.fw_data/src/`:
 1. Đặt tên theo pattern `NN_name.py` (số thứ tự tiếp theo).
+2. Thêm vào `_MODULES` trong `fw.py` đúng vị trí phụ thuộc.
+3. Cập nhật module map ở AGENTS.md này.
+
+## Môi trường: Termux / Android
+
+- `pip install` luôn cần `--break-system-packages`.
+- Không có `sudo` — không dùng `apt`, `systemctl`, hay lệnh cần root.
+- Home path: `/data/data/com.termux/files/home`.
+
+## Section markers
+
+File mới >80 dòng dùng pattern: `# ##== NAME ==##`. Ví dụ:
+```python
+# ##== PROVIDER ==##
+...code...
+# ##== /end PROVIDER ==##
+```
+
+## Output / UX
+
+- Không emoji trong output của agent.
+- Tóm tắt sau task: files đã thay đổi + cách chạy/verify. Ngắn gọn.
+- Không giải thích lại những gì đã rõ.
+p theo).
 2. Thêm vào `_MODULES` trong `fw.py` đúng vị trí phụ thuộc.
 3. Cập nhật module map ở AGENTS.md này.
 
