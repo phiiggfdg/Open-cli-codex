@@ -95,10 +95,12 @@ def get_api_key():
 
 def fetch_models(api_key):
     p = _prov()
-    if not p.get("models_url"):
+    # Qwen: dùng workspace-specific URL nếu có QWEN_WORKSPACE_ID
+    models_url = _qwen_models_url() if _active_provider == "qwen" else p.get("models_url")
+    if not models_url:
         return p["fallback_models"] + _load_extra_models()
     try:
-        req = _provider_request(p["models_url"], api_key)
+        req = _provider_request(models_url, api_key)
         with urllib.request.urlopen(req, timeout=8) as resp:
             data = json.loads(resp.read())
             ids  = p["parse_models"](data)
@@ -128,16 +130,69 @@ def choose_model(api_key):
     print(f"{DIM}  Đang tải...{R}", end="\r")
     models = fetch_models(api_key)
     print(" "*30, end="\r")
+    PAGE_SIZE = 10
+    page = 0
+    _last_lines = 0   # số dòng đã in lần trước để xoá đúng
+    _first_draw = True
+
+    def _clear_last(n):
+        """Xoá n dòng vừa in (cursor lên rồi xoá từ đó xuống)."""
+        if n > 0:
+            # +1 để tính luôn dòng input prompt
+            print(f"\033[{n+1}A\033[J", end="", flush=True)
+
+    def _print_page(page, models):
+        total = len(models)
+        total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+        start = page * PAGE_SIZE
+        end   = min(start + PAGE_SIZE, total)
+        page_models = models[start:end]
+        lines = 0
+
+        print(f"{BOLD}{CYAN}╔══ Trang {page+1}/{total_pages}  [{start+1}–{end}/{total} model] ══╗{R}")
+        lines += 1
+        for i, m in enumerate(page_models, start + 1):
+            print(f"  {YELLOW}{i:>3}.{R} {m.split('/')[-1]}")
+            lines += 1
+        print()
+        lines += 1
+        nav = []
+        if page > 0:              nav.append(f"{CYAN}P{R} ← Trang trước")
+        if page < total_pages-1:  nav.append(f"{CYAN}N{R} → Trang sau")
+        nav.append(f"{YELLOW}T{R} Thêm model")
+        nav.append(f"{RED}0{R} Thoát")
+        print("  " + "   ".join(nav))
+        lines += 1
+        print()
+        lines += 1
+        return lines
+
     while True:
-        for i, m in enumerate(models, 1):
-            print(f"  {YELLOW}{i:>2}.{R} {m.split('/')[-1]}")
-            print(f"      {DIM}{m}{R}")
-        print(f"  {YELLOW} T.{R} Thêm model")
-        print(f"  {YELLOW} 0.{R} Thoát\n")
-        raw = input(f"{CYAN}Chọn: {R}").strip()
+        total = len(models)
+        total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+
+        if _first_draw:
+            _first_draw = False
+        else:
+            _clear_last(_last_lines)
+        _last_lines = _print_page(page, models)
+
+        try:
+            raw = input(f"{CYAN}Chọn (số / P / N / T / 0): {R}").strip()
+        except (KeyboardInterrupt, EOFError):
+            print(f"\n{RED}Huỷ.{R}"); sys.exit(0)
         if not raw:
             continue
-        if raw.lower() == "t":
+        rl = raw.lower()
+        if rl == "n":
+            if page < total_pages - 1:
+                page += 1
+            continue
+        if rl == "p":
+            if page > 0:
+                page -= 1
+            continue
+        if rl == "t":
             try:
                 new_model = input(f"{CYAN}Nhập model ID: {R}").strip()
             except (EOFError, KeyboardInterrupt):
@@ -145,14 +200,21 @@ def choose_model(api_key):
             if new_model:
                 _save_extra_model(new_model)
                 models = fetch_models(api_key)   # reload
-                print(f"{GREEN}✓ Đã thêm: {new_model}{R}\n")
+                total_pages = max(1, (len(models) + PAGE_SIZE - 1) // PAGE_SIZE)
+                print(f"{GREEN}✓ Đã thêm: {new_model}{R}")
+            # reset để vẽ lại từ đầu, không xoá nhầm
+            _last_lines = 0
+            _first_draw = True
             continue
         try:
             n = int(raw)
             if n == 0:
                 print(f"\n{RED}Huỷ.{R}"); sys.exit(0)
-            elif 1 <= n <= len(models):
+            elif 1 <= n <= total:
                 return models[n-1]
+            else:
+                print(f"{RED}  Số không hợp lệ (1–{total}).{R}")
+                __import__("time").sleep(1)   # cho đọc kịp rồi mới xoá
         except (ValueError, KeyboardInterrupt):
             print(f"\n{RED}Huỷ.{R}"); sys.exit(0)
 
@@ -161,8 +223,8 @@ def choose_model(api_key):
 _RETRY_MAX     = 4          # số lần retry tối đa
 _RETRY_CODES   = {429, 500, 502, 503, 504}   # HTTP codes đáng retry
 _RETRY_DELAYS  = [2, 5, 15, 30]              # backoff (giây) sau mỗi attempt
-_COST_PROVIDERS  = {"fireworks"}   # providers có bảng giá hiển thị
-_CACHE_PROVIDERS = {"fireworks"}   # providers hỗ trợ prefix cache
+_COST_PROVIDERS  = {"fireworks"}              # providers có bảng giá hiển thị
+_CACHE_PROVIDERS = {"fireworks", "qwen"}      # providers trả về cached_tokens thật
 
 def _parse_retry_after(e: "urllib.error.HTTPError") -> float | None:
     """Đọc Retry-After header nếu có, trả về số giây cần chờ."""
@@ -192,7 +254,7 @@ def _call_simple(messages, model, api_key):
                 wait = _parse_retry_after(e) or _RETRY_DELAYS[attempt]
                 print(f"\n{YELLOW}  ⚠ HTTP {e.code} — retry {attempt+1}/{_RETRY_MAX-1} "
                       f"sau {wait:.0f}s...{R}", flush=True)
-                time.sleep(wait)
+                __import__("time").sleep(wait)
                 continue
             body_txt = e.read().decode(errors="replace")
             return {"text": f"[HTTP {e.code}: {body_txt[:200]}]", "tool_calls": []}
@@ -325,7 +387,7 @@ def call_api_stream(messages, model, api_key, tool_choice="auto", session_id=Non
                 spinner_ref[0].stop()
                 print(f"\n{YELLOW}  ⚠ HTTP {e.code} — retry {attempt+1}/{_RETRY_MAX-1} "
                       f"sau {wait:.0f}s...{R}", flush=True)
-                time.sleep(wait)
+                __import__("time").sleep(wait)
                 # Khởi động lại spinner cho lần retry
                 spinner = Spinner(f"Retry {attempt+1}")
                 spinner.start()
@@ -345,7 +407,7 @@ def call_api_stream(messages, model, api_key, tool_choice="auto", session_id=Non
                 spinner_ref[0].stop()
                 print(f"\n{YELLOW}  ⚠ Network error: {e.reason} — retry {attempt+1}/{_RETRY_MAX-1} "
                       f"sau {wait:.0f}s...{R}", flush=True)
-                time.sleep(wait)
+                __import__("time").sleep(wait)
                 spinner = Spinner(f"Retry {attempt+1}")
                 spinner.start()
                 spinner_ref[0] = spinner
@@ -771,7 +833,7 @@ def agent_turn(messages, model, api_key, conn, sid, max_steps=20, agent=AGENT_BU
             truncated = result2.get("truncated", False)
             total_in     += result2["usage"].get("prompt_tokens", 0)
             total_out    += result2["usage"].get("completion_tokens", 0)
-            if _active_provider in {"fireworks"}:
+            if _active_provider in _CACHE_PROVIDERS:
                 total_cached += (result2["usage"].get("prompt_tokens_details") or {}).get("cached_tokens", 0)
             continue_count += 1
         if result.get("interrupted") or (truncated and continue_count < 3 and not tcs):
@@ -779,7 +841,7 @@ def agent_turn(messages, model, api_key, conn, sid, max_steps=20, agent=AGENT_BU
 
         total_in     += usage.get("prompt_tokens", 0)
         total_out    += usage.get("completion_tokens", 0)
-        if _active_provider in {"fireworks"}:
+        if _active_provider in _CACHE_PROVIDERS:
             total_cached += (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
 
         if text or tcs:

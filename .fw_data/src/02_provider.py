@@ -157,6 +157,86 @@ PROVIDERS = {
         "parse_models":     lambda data: [],
         "rate_limit_delay": 0.0,
     },
+    "qwen": {
+        "name":         "Qwen API (Singapore)",
+        # DashScope Singapore workspace-specific endpoint (OpenAI-compatible)
+        # Thay {WorkspaceId} bằng Workspace ID thực của bạn từ Model Studio console.
+        # Nếu chưa set QWEN_WORKSPACE_ID, fallback về endpoint global dashscope-intl.
+        "base_url":     "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        # DashScope có GET /v1/models trả về danh sách model
+        "models_url":   "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/models",
+        "key_check_url":"https://dashscope-intl.aliyuncs.com/compatible-mode/v1/models",
+        "env_key":      "DASHSCOPE_API_KEY",
+        "config_key":   "qwen_api_key",
+        # Fallback models — các model Qwen phổ biến nhất trên DashScope
+        "fallback_models": [
+            # ── Qwen3 flagship ──────────────────────────────────────────────
+            "qwen3-235b-a22b",          # MoE 235B, flagship
+            "qwen3-32b",                # Dense 32B
+            "qwen3-30b-a3b",            # MoE 30B
+            "qwen3-14b",
+            "qwen3-8b",
+            # ── Qwen commercial (Max / Plus / Flash / Turbo) ────────────────
+            "qwen-max",                 # alias → latest qwen-max snapshot
+            "qwen-plus",                # alias → latest qwen-plus snapshot
+            "qwen-turbo",
+            "qwen-long",
+            # ── Qwen Coder ──────────────────────────────────────────────────
+            "qwen2.5-coder-32b-instruct",
+            "qwen-coder-plus",
+            # ── Qwen Math ───────────────────────────────────────────────────
+            "qwen2.5-math-72b-instruct",
+            # ── DeepSeek trên DashScope ─────────────────────────────────────
+            "deepseek-v3",
+            "deepseek-r1",
+            # ── Kimi / GLM / MiniMax (re-sold qua DashScope) ────────────────
+            "kimi-k2",
+            "glm-4",
+            "minimax-text-01",
+        ],
+        "context_limits": {
+            # Qwen3 series
+            "qwen3-235b":       131_072,
+            "qwen3-32b":        131_072,
+            "qwen3-30b":        131_072,
+            "qwen3-14b":        131_072,
+            "qwen3-8b":         131_072,
+            # Qwen commercial
+            "qwen-max":         131_072,
+            "qwen-plus":        131_072,
+            "qwen-turbo":       131_072,
+            "qwen-long":      1_000_000,
+            # Coder
+            "qwen2.5-coder":    131_072,
+            "qwen-coder":       131_072,
+            # Math
+            "qwen2.5-math":      32_768,
+            # DeepSeek
+            "deepseek-v3":      131_072,
+            "deepseek-r1":      131_072,
+            # Others
+            "kimi":             131_072,
+            "glm-4":            131_072,
+            "minimax":          131_072,
+        },
+        # DashScope /v1/models trả về OpenAI-compatible format: {"data": [...]}
+        # Lọc bỏ embedding / rerank / audio / image-gen để chỉ giữ LLM text
+        "parse_models": lambda data: [
+            m["id"] for m in data.get("data", [])
+            if m.get("id") and not any(x in m["id"].lower() for x in (
+                "embed", "rerank", "text-to-image", "wanx", "cosyvoice",
+                "sambert", "paraformer", "qwen-vl", "qwen-audio", "omni",
+                "ocr", "tts", "asr",
+                # image gen / edit / vision
+                "image", "wan", "-vl-",
+                # audio / speech / translation
+                "livetranslate", "s2s", "realtime", "tingwu",
+                # machine translation API
+                "-mt-",
+            ))
+        ],
+        "rate_limit_delay": 0.0,
+    },
 }
 
 # ── Active provider (set khi startup qua choose_provider()) ───────────────────
@@ -168,7 +248,20 @@ def _prov() -> dict:
 
 # ── Compat aliases — code cũ dùng BASE_URL / MODEL_CONTEXT_LIMITS vẫn chạy ──
 def _base_url() -> str:
-    return _prov()["base_url"]
+    """Trả về base_url — với Qwen thì ưu tiên workspace-specific Singapore URL."""
+    prov = _prov()
+    if _active_provider == "qwen":
+        ws_id = os.environ.get("QWEN_WORKSPACE_ID", "").strip()
+        if ws_id:
+            return f"https://{ws_id}.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"
+    return prov["base_url"]
+
+def _qwen_models_url() -> str:
+    """Trả về models_url cho Qwen — dùng workspace URL nếu có QWEN_WORKSPACE_ID."""
+    ws_id = os.environ.get("QWEN_WORKSPACE_ID", "").strip()
+    if ws_id:
+        return f"https://{ws_id}.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1/models"
+    return PROVIDERS["qwen"]["models_url"]
 
 MODEL_CONTEXT_LIMITS: dict = {}   # populated dynamically by _prov()["context_limits"]
 
