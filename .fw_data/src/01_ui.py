@@ -161,8 +161,38 @@ def _multiline_input_with_hint(prompt: str) -> str | None:
     has_hint  = [False]
 
     # ── render: hint hiện inline sau text trên cùng dòng ─────────────────────
+    _ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+
+    def _visible_len(s: str) -> int:
+        """Độ dài hiển thị thực (bỏ ANSI escape codes)."""
+        return len(_ANSI_RE.sub("", s))
+
+    # theo dõi số dòng đang hiển thị để xoá đúng khi keystroke tiếp theo
+    _cur_lines = [1]  # bắt đầu là 1 dòng
+
+    def _redraw(text: str, hint: str = ""):
+        """Xoá đúng số dòng cũ rồi vẽ lại từ đầu."""
+        term_w = shutil.get_terminal_size((80, 24)).columns
+        # lên về dòng đầu tiên của input
+        if _cur_lines[0] > 1:
+            sys.stdout.write(f"\033[{_cur_lines[0]-1}A")
+        sys.stdout.write("\r\033[J")  # xoá từ đây xuống hết
+
+        line = prompt + text
+        if hint:
+            line += f"  {DIM}{hint}{R}"
+        sys.stdout.write(line)
+
+        # tính số dòng mới chiếm sau khi vẽ
+        visible = _visible_len(prompt + text) + (_visible_len(hint) + 2 if hint else 0)
+        _cur_lines[0] = max(1, (visible + term_w - 1) // term_w)
+
+        if hint:
+            hint_visible = _visible_len(f"  {hint}")
+            sys.stdout.write(f"\033[{hint_visible}D")
+        sys.stdout.flush()
+
     def _render(text: str):
-        # Tính hint
         hint = ""
         if text.startswith("/"):
             hints = _slash_hint(text)
@@ -174,27 +204,13 @@ def _multiline_input_with_hint(prompt: str) -> str | None:
                 files = _at_file_complete(m.group(1))
                 if files:
                     hint = f"@{files[0]}" + (f"  +{len(files)-1}" if len(files) > 1 else "")
-        # Xóa dòng hiện tại và vẽ lại: prompt + text + hint mờ
-        line = prompt + text
-        if hint:
-            hint_display = f"  {DIM}{hint}{R}"
-            line += hint_display
-            has_hint[0] = True
-        else:
-            has_hint[0] = False
-        sys.stdout.write(f"\r\033[K{line}")
-        # Đưa cursor về sau text (trước hint)
-        if hint:
-            hint_visible = len(hint) + 2  # +2 cho "  " prefix
-            sys.stdout.write(f"\033[{hint_visible}D")
-        sys.stdout.flush()
+        has_hint[0] = bool(hint)
+        _redraw(text, hint)
 
     def _clear_hint(current_buf: list):
-        """Xóa phần hint inline khỏi màn hình."""
-        if has_hint[0]:
-            sys.stdout.write(f"\r\033[K{prompt}{''.join(current_buf)}")
-            sys.stdout.flush()
+        """Xóa hint, giữ text."""
         has_hint[0] = False
+        _redraw("".join(current_buf))
 
     # ── main raw loop ─────────────────────────────────────────────────────────
     try:
@@ -208,7 +224,9 @@ def _multiline_input_with_hint(prompt: str) -> str | None:
 
             # Enter
             if ch in ("\r", "\n"):
-                _clear_hint(buf)
+                # chỉ xoá hint, không redraw toàn bộ (tránh cursor nhảy lên)
+                if has_hint[0]:
+                    _render("".join(buf))   # vẽ lại không hint
                 sys.stdout.write("\r\n")
                 sys.stdout.flush()
                 line = "".join(buf).strip()
@@ -224,7 +242,8 @@ def _multiline_input_with_hint(prompt: str) -> str | None:
 
             # Ctrl-C / Ctrl-D
             if ch in ("\x03", "\x04"):
-                _clear_hint(buf)
+                if has_hint[0]:
+                    _render("".join(buf))
                 sys.stdout.write("\r\n")
                 sys.stdout.flush()
                 return None
