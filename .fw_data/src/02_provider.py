@@ -321,6 +321,34 @@ PROVIDERS = {
         "parse_models":     lambda data: [],
         "rate_limit_delay": 0.0,
     },
+    "aws_bedrock": {
+        "name":         "AWS Bedrock",
+        # Bedrock dùng Bedrock API Key (Bearer token, tạo trong Console →
+        # Bedrock → API keys) — vẫn đi qua aws.build_request() vì URL
+        # endpoint khác hẳn OpenAI-style (phụ thuộc region + model_id nằm
+        # trong path). base_url/models_url ở đây chỉ là cờ hiệu cho
+        # _provider_request() nhận biết, không phải URL thật.
+        "base_url":     "aws_bedrock",
+        "models_url":   "list_models",
+        "key_check_url":"list_models",
+        # Lưu dạng "{region}|{api_key}" vào đúng 1 field string này —
+        # aws.parse_credentials() tự tách ra. Ví dụ: us-east-1|bedrock-api-key-xxxx
+        "env_key":      "AWS_BEDROCK_API_KEY",
+        "config_key":   "aws_bedrock_api_key",
+        "fallback_models": [
+            "anthropic.claude-sonnet-4-6-v1:0",
+            "anthropic.claude-haiku-4-5-v1:0",
+            "meta.llama3-3-70b-instruct-v1:0",
+        ],
+        "context_limits": {
+            "claude-sonnet": 200_000,
+            "claude-haiku":  200_000,
+            "claude-opus":   200_000,
+            "llama3":        128_000,
+        },
+        "parse_models":     lambda data: parse_models(data),
+        "rate_limit_delay": 0.0,
+    },
 }
 
 # ── Active provider (set khi startup qua choose_provider()) ───────────────────
@@ -378,6 +406,19 @@ def _provider_request(path: str, api_key: str, payload: dict | None = None,
     payload=None → GET, payload=dict → POST JSON.
     Trả về urllib.request.Request — caller tự urlopen.
     """
+    if _active_provider == "aws_bedrock":
+        # Bedrock: auth SigV4 + Converse API hoàn toàn khác OpenAI-style.
+        # Toàn bộ phần đó nằm trong 01b_aws.py — ở đây chỉ chuyển tiếp.
+        # path == "list_models" (cờ hiệu, không phải URL thật) → list model.
+        # path == "/chat/completions" → chat turn, model lấy từ payload.
+        bedrock_payload = dict(payload) if payload else {}
+        if path == "list_models":
+            bedrock_path = "list_models"
+        else:
+            bedrock_path = "converse"
+        return build_request(bedrock_path, api_key, bedrock_payload,
+                              extra_headers=extra_headers)
+
     base = _base_url()
     url  = path if path.startswith("http") else f"{base}{path}"
     headers = {

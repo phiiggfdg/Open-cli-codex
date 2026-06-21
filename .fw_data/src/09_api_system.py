@@ -55,9 +55,14 @@ def get_api_key():
         "commandcode": "https://commandcode.ai/studio",
         "mimo":      "https://xiaomimimo.com",
         "mercury":   "https://platform.inceptionlabs.ai/dashboard/api-keys",
+        "aws_bedrock": "https://console.aws.amazon.com/bedrock/home#/api-keys",
     }.get(_active_provider, "")
     if key_url:
         print(f"{DIM}Lấy key tại: {key_url}{R}\n")
+
+    region = None
+    if _active_provider == "aws_bedrock":
+        region = choose_region()
 
     while True:
         try:
@@ -66,6 +71,10 @@ def get_api_key():
             print(f"\n{RED}Huỷ.{R}"); sys.exit(0)
         if not key:
             print(f"{RED}Key không được để trống.{R}"); continue
+
+        # Bedrock: ghép region đã chọn + key thành format nội bộ "region|key"
+        if region is not None:
+            key = f"{region}|{key}"
 
         # Quick validate (skip nếu provider không có key_check_url)
         if p.get("key_check_url"):
@@ -80,6 +89,11 @@ def get_api_key():
                     print(f"\r{RED}✗ Key không hợp lệ (401). Thử lại.{R}")
                     continue
                 print(f"\r{YELLOW}⚠ Không thể xác nhận (HTTP {e.code}), tiếp tục.{R}")
+            except ValueError as e:
+                # Lỗi format credentials (vd parse_credentials của aws.py) —
+                # đây là lỗi rõ ràng, không phải lỗi mạng, không cho qua.
+                print(f"\r{RED}✗ {e}{R}")
+                continue
             except Exception:
                 print(f"\r{YELLOW}⚠ Không thể kết nối để xác nhận, tiếp tục.{R}")
         else:
@@ -248,9 +262,17 @@ def _call_simple(messages, model, api_key):
         _rate_limit_wait()
         req = _provider_request("/chat/completions", api_key, payload)
         try:
-            with urllib.request.urlopen(req, timeout=120) as resp:
+            if _active_provider == "aws_bedrock":
+                resp_cm = urlopen_smart(req, api_key, payload, timeout=120)
+            else:
+                resp_cm = urllib.request.urlopen(req, timeout=120)
+            with resp_cm as resp:
                 body = json.loads(resp.read())
                 _rate_limit_mark()
+                if _active_provider == "aws_bedrock":
+                    # Response Converse (non-stream) có schema khác OpenAI —
+                    # dịch lại qua aws.py thay vì parse trực tiếp ở đây.
+                    return parse_converse_response(body)
                 msg = body["choices"][0]["message"]
                 return {"text": msg.get("content", ""), "tool_calls": []}
         except urllib.error.HTTPError as e:
@@ -382,9 +404,15 @@ def call_api_stream(messages, model, api_key, tool_choice="auto", session_id=Non
         req = _provider_request("/chat/completions", api_key, payload,
                                 extra_headers=extra_hdrs)
         try:
-            with urllib.request.urlopen(req, timeout=180) as resp:
+            if _active_provider == "aws_bedrock":
+                resp_cm = urlopen_smart(req, api_key, payload, timeout=180)
+            else:
+                resp_cm = urllib.request.urlopen(req, timeout=180)
+            with resp_cm as resp:
+                stream_src = (wrap_stream_response(resp)
+                              if _active_provider == "aws_bedrock" else resp)
                 finish_reason = _stream_response(
-                    resp, text_parts, tc_raw, usage, spinner_ref)
+                    stream_src, text_parts, tc_raw, usage, spinner_ref)
             _rate_limit_mark()
             break   # thành công — thoát retry loop
 
