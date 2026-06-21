@@ -33,6 +33,7 @@ _SRC_DIR = _find_src_dir()
 
 _MODULES = [
     "01_ui.py",
+    "01b_aws.py",
     "02_provider.py",
     "03_mcp.py",
     "04_agent_cache.py",
