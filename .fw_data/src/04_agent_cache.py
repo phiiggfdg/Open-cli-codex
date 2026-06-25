@@ -561,6 +561,9 @@ def _ensure_project_dir(requested_path: str) -> Path:
 
     _project_dir = proj
     _project_dir_is_placeholder = False
+    # Invalidate system prompt cache — proj_key vừa đổi từ "" → path thật,
+    # buộc build_system() build lại với sandbox section đúng ở step tiếp theo.
+    _system_full_cache.clear()
     if _project_dir_conn and _project_dir_sid:
         session_update(_project_dir_conn, _project_dir_sid,
                        project_dir=str(proj.resolve()))

@@ -321,6 +321,75 @@ PROVIDERS = {
         "parse_models":     lambda data: [],
         "rate_limit_delay": 0.0,
     },
+    "requesty": {
+        "name":         "Requesty AI",
+        # OpenAI-compatible gateway — route tới 550+ model từ nhiều provider.
+        # Model ID dạng: provider/model-name  (vd: anthropic/claude-sonnet-4-6)
+        "base_url":     "https://router.requesty.ai/v1",
+        "models_url":   "https://router.requesty.ai/v1/models",
+        "key_check_url":"https://router.requesty.ai/v1/models",
+        "env_key":      "REQUESTY_API_KEY",
+        "config_key":   "requesty_api_key",
+        # Các free model (200 req/day) — xếp đầu danh sách
+        # Model ID đầy đủ tra tại: https://requesty.ai/models
+        "free_models": [
+            "google/gemma-4-31b-it",
+            "nvidia/nemotron-3-ultra-550b-a55b",
+            "nvidia/nemotron-3-super-120b-a12b",
+            "nvidia/nemotron-nano-omni-30b-a3b-reasoning",
+            "nvidia/nemotron-3-nano-30b-a3b",
+            "nvidia/nemotron-3.5-content-safety",
+            "poolside/laguna-m.1",
+            "poolside/laguna-xs.2",
+        ],
+        # Vùng hỗ trợ của từng free model (None = Global)
+        "free_model_regions": {
+            "google/gemma-4-31b-it":                        None,       # Global
+            "nvidia/nemotron-3-ultra-550b-a55b":            "US",
+            "nvidia/nemotron-3-super-120b-a12b":            "US",
+            "nvidia/nemotron-nano-omni-30b-a3b-reasoning":  "US",
+            "nvidia/nemotron-3-nano-30b-a3b":               "US",
+            "nvidia/nemotron-3.5-content-safety":           "US",
+            "poolside/laguna-m.1":                          "US",
+            "poolside/laguna-xs.2":                         "US",
+        },
+        # Vùng khả dụng khi người dùng chọn model có region_hint
+        "regions": ["Global", "US", "EU"],
+        "fallback_models": [
+            "google/gemma-4-31b-it",
+            "nvidia/nemotron-3-ultra-550b-a55b",
+            "nvidia/nemotron-3-super-120b-a12b",
+            "anthropic/claude-sonnet-4-6",
+            "openai/gpt-4o",
+            "google/gemini-2.5-pro",
+            "deepseek/deepseek-v3",
+        ],
+        "context_limits": {
+            "claude-sonnet":    200_000,
+            "claude-opus":      200_000,
+            "claude-haiku":     200_000,
+            "gpt-4o":           128_000,
+            "gpt-4":            128_000,
+            "gemini-2.5":     1_000_000,
+            "gemini-1.5":     1_000_000,
+            "deepseek-v3":      128_000,
+            "deepseek-r1":      128_000,
+            "nemotron":       1_000_000,
+            "gemma-4":          262_000,
+            "llama":            128_000,
+            "qwen":             128_000,
+            "laguna":            33_000,
+        },
+        # /v1/models trả về OpenAI-compatible {data: [{id, ...}]}
+        # Lọc bỏ embed/rerank/moderation
+        "parse_models": lambda data: [
+            m["id"] for m in data.get("data", [])
+            if m.get("id") and not any(x in m["id"].lower() for x in (
+                "embed", "rerank", "moderation", "whisper", "tts", "dall-e",
+            ))
+        ],
+        "rate_limit_delay": 0.0,
+    },
     "aws_bedrock": {
         "name":         "AWS Bedrock",
         # Bedrock dùng Bedrock API Key (Bearer token, tạo trong Console →
@@ -432,6 +501,22 @@ def _provider_request(path: str, api_key: str, payload: dict | None = None,
         data = json.dumps(payload).encode()
     if extra_headers:
         headers.update(extra_headers)
+
+    # Requesty: gắn region header nếu đã chọn vùng
+    if _active_provider == "requesty" and payload is not None:
+        try:
+            import json as _json
+            _cfg_path = Path(__file__).resolve().parent.parent / "config.json"
+            if not _cfg_path.exists():
+                _cfg_path = Path.home() / ".fw_data" / "config.json"
+            _region = ""
+            if _cfg_path.exists():
+                _region = _json.loads(_cfg_path.read_text()).get("requesty_region", "")
+            if _region and _region.lower() != "global":
+                headers["x-requesty-region"] = _region.lower()
+        except Exception:
+            pass
+
     return urllib.request.Request(url, data=data, headers=headers)
 
 # ── Provider selector (gọi 1 lần khi startup) ────────────────────────────────

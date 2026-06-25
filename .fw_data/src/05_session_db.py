@@ -65,8 +65,6 @@ def compact_messages(messages, model, api_key, mode: str = "soft"):
     recent = messages[-keep:]
     label  = "nhẹ" if mode == "soft" else "mạnh"
     print(f"\n{YELLOW}[compact/{label}] Tóm tắt {len(old)} messages...{R}")
-    # Context bị xoá — AI không còn "nhớ" file nào đã inject
-    _session_injected.clear()
     hist = ""
     for m in old:
         role = m["role"].upper()

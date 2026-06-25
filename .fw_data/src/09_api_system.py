@@ -121,9 +121,23 @@ def fetch_models(api_key):
         with urllib.request.urlopen(req, timeout=8) as resp:
             data = json.loads(resp.read())
             ids  = p["parse_models"](data)
-            return ids or (_load_extra_models() + p["fallback_models"])
+            if not ids:
+                ids = _load_extra_models() + p["fallback_models"]
     except Exception:
-        return p["fallback_models"] + _load_extra_models()
+        ids = p["fallback_models"] + _load_extra_models()
+
+    # Requesty: xếp free models lên đầu, đánh dấu rõ
+    if _active_provider == "requesty":
+        free_set   = set(p.get("free_models", []))
+        free_first = [m for m in ids if m in free_set]
+        paid_rest  = [m for m in ids if m not in free_set]
+        # Thêm free model từ config nếu API không trả về
+        for fm in p.get("free_models", []):
+            if fm not in ids:
+                free_first.append(fm)
+        ids = free_first + paid_rest
+
+    return ids
 
 def _load_extra_models() -> list[str]:
     """Load danh sách model user tự thêm (lưu trong config theo provider)."""
@@ -141,22 +155,226 @@ def _save_extra_model(model_id: str):
         cfg[key] = lst
         save_config(cfg)
 
+def _model_search_input(prompt: str, models: list, is_requesty: bool, free_set: set):
+    """
+    UI tách 2 vùng bằng dấu /:
+      Trên /  — danh sách kết quả filter (tối đa 5)
+      Dưới /  — ô tìm kiếm + ô chọn số
+    Trả về tuple (raw: str, lines_drawn: int).
+    lines_drawn = số dòng UI này đã in (để choose_model xoá đúng khi redraw trang).
+    """
+    import sys
+
+    if not sys.stdin.isatty():
+        val = input(prompt).strip()
+        return val, 0
+    try:
+        import termios, tty as _tty
+        fd  = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+    except Exception:
+        val = input(prompt).strip()
+        return val, 0
+
+    SEP   = f"{DIM}{'─' * 34}{R}"
+    MAX_R = 10
+
+    def _search(q: str) -> list[str]:
+        if not q:
+            return []
+        matched = [m for m in models if q.lower() in m.lower()]
+        if is_requesty:
+            matched = ([m for m in matched if m in free_set] +
+                       [m for m in matched if m not in free_set])
+        return matched[:MAX_R]
+
+    search_buf: list[str] = []
+    num_buf:    list[str] = []
+    results:    list[str] = []
+    drawn = [0]   # số dòng UI này đang chiếm
+
+    def _draw():
+        if drawn[0]:
+            sys.stdout.write(f"\033[{drawn[0]}A\033[J")
+
+        lines = 0
+        q = "".join(search_buf)
+
+        # Trên /: kết quả
+        if q:
+            if results:
+                for i, m in enumerate(results, 1):
+                    badge = f" {GREEN}🆓{R}" if (is_requesty and m in free_set) else ""
+                    sys.stdout.write(f"  {YELLOW}{i}.{R} {m}{badge}\r\n")
+                    lines += 1
+            else:
+                sys.stdout.write(f"  {DIM}(không tìm thấy){R}\r\n")
+                lines += 1
+        else:
+            sys.stdout.write(f"  {DIM}Gõ chữ để tìm, hoặc nhập số/P/N/T/0{R}\r\n")
+            lines += 1
+
+        # Dấu /
+        sys.stdout.write(SEP + "\r\n"); lines += 1
+
+        # Dưới /: ô search
+        q_display = f"{CYAN}{q}{R}_" if q else f"{DIM}(tìm model...){R}"
+        sys.stdout.write(f"  🔍 {q_display}\r\n"); lines += 1
+
+        # Dưới /: ô chọn
+        num = "".join(num_buf)
+        if num:
+            sys.stdout.write(f"  {GREEN}Chọn:{R} {BOLD}{num}{R}_\r\n")
+        else:
+            nav = f"{CYAN}P{R} trước  {CYAN}N{R} sau  {YELLOW}T{R} thêm  {RED}0{R} thoát"
+            sys.stdout.write(f"  {DIM}Chọn số →{R}  {nav}\r\n")
+        lines += 1
+
+        sys.stdout.flush()
+        drawn[0] = lines
+
+    def _exit_raw():
+        try: termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        except Exception: pass
+
+    try:
+        _tty.setraw(fd)
+        _draw()
+
+        while True:
+            ch = sys.stdin.read(1)
+
+            if ch in ("\x03", "\x04"):
+                sys.stdout.write("\r\n"); sys.stdout.flush()
+                _exit_raw()
+                raise KeyboardInterrupt
+
+            if ch == "\x1b":
+                sys.stdin.read(2)
+                continue
+
+            if ch in ("\x7f", "\x08"):
+                if num_buf:
+                    num_buf.pop()
+                elif search_buf:
+                    search_buf.pop()
+                    results[:] = _search("".join(search_buf))
+                _draw()
+                continue
+
+            if ch in ("\r", "\n"):
+                num = "".join(num_buf)
+                q   = "".join(search_buf)
+                sys.stdout.write("\r\n"); sys.stdout.flush()
+                _exit_raw()
+                total_drawn = drawn[0]
+
+                if num:
+                    idx = int(num) - 1
+                    # Ada kết quả search → chọn từ results
+                    if results and 0 <= idx < len(results):
+                        try:
+                            gi = models.index(results[idx]) + 1
+                            return str(gi), total_drawn
+                        except ValueError:
+                            return results[idx], total_drawn
+                    # Không search → số toàn cục
+                    return num, total_drawn
+
+                # Không số, không search → P/N/T/0 nếu chưa nhập gì
+                return "", total_drawn
+
+            # P/N/T/0 khi chưa nhập gì trong cả 2 buf
+            if not search_buf and not num_buf and ch.lower() in ("p","n","t","0"):
+                sys.stdout.write(ch + "\r\n"); sys.stdout.flush()
+                _exit_raw()
+                return ch.lower(), drawn[0]
+
+            if ch.isdigit():
+                num_buf.append(ch)
+                _draw()
+                continue
+
+            if ch.isprintable():
+                num_buf.clear()
+                search_buf.append(ch)
+                results[:] = _search("".join(search_buf))
+                _draw()
+                continue
+
+    except Exception:
+        _exit_raw()
+        try:
+            val = input(prompt).strip()
+            return val, 0
+        except Exception:
+            return "", 0
+
+
+def _requesty_choose_region(model_id: str) -> str:
+    """Hỏi user chọn vùng cho paid model Requesty. Trả về 'US'/'EU'/'Global'/''."""
+    p            = _prov()
+    regions      = p.get("regions", ["Global", "US", "EU"])
+    free_regions = p.get("free_model_regions", {})
+    suggested    = free_regions.get(model_id)
+
+    print(f"\n{BOLD}{CYAN}╔══ Chọn vùng cho model ══╗{R}")
+    if suggested is not None:
+        hint = suggested if suggested else "Global"
+        print(f"  {DIM}Model free — vùng khuyến nghị: {GREEN}{hint}{R}")
+    else:
+        print(f"  {DIM}Model trả phí — chọn vùng tối ưu latency{R}")
+
+    for i, r in enumerate(regions, 1):
+        marker = ""
+        if suggested is not None:
+            want = suggested if suggested else "Global"
+            if r == want:
+                marker = f" {GREEN}← khuyến nghị{R}"
+        print(f"  {YELLOW}{i}.{R} {r}{marker}")
+    print(f"  {DIM}0. Bỏ qua (không gắn vùng){R}\n")
+
+    while True:
+        try:
+            raw = input(f"{CYAN}Vùng (1–{len(regions)} / 0 bỏ qua): {R}").strip()
+        except (KeyboardInterrupt, EOFError):
+            return ""
+        if not raw or raw == "0":
+            return ""
+        try:
+            idx = int(raw) - 1
+            if 0 <= idx < len(regions):
+                chosen = regions[idx]
+                print(f"  {GREEN}✓ Vùng: {chosen}{R}\n")
+                return chosen
+        except ValueError:
+            pass
+        print(f"  {RED}Không hợp lệ.{R}")
+
+
 def choose_model(api_key):
     p = _prov()
+    is_requesty = (_active_provider == "requesty")
+    free_set    = set(p.get("free_models", [])) if is_requesty else set()
+
     print(f"\n{BOLD}{CYAN}╔══ Chọn model [{p['name']}] ══╗{R}")
+    if is_requesty:
+        print(f"  {DIM}🆓 = free model (200 req/day){R}")
     print(f"{DIM}  Đang tải...{R}", end="\r")
     models = fetch_models(api_key)
     print(" "*30, end="\r")
     PAGE_SIZE = 10
     page = 0
-    _last_lines = 0   # số dòng đã in lần trước để xoá đúng
+    page_lines       = [0]   # dòng từ _print_page (dùng print, cần +1)
+    search_lines_ref = [0]   # dòng từ _model_search_input (raw mode, đã đủ)
     _first_draw = True
 
-    def _clear_last(n):
-        """Xoá n dòng vừa in (cursor lên rồi xoá từ đó xuống)."""
-        if n > 0:
-            # +1 để tính luôn dòng input prompt
-            print(f"\033[{n+1}A\033[J", end="", flush=True)
+    def _clear_last():
+        total = page_lines[0] + search_lines_ref[0]
+        if total > 0:
+            # page dùng print() → cursor ở dòng sau cùng → cần lên thêm 1
+            up = total + (1 if page_lines[0] > 0 else 0)
+            print(f"\033[{up}A\033[J", end="", flush=True)
 
     def _print_page(page, models):
         total = len(models)
@@ -169,7 +387,13 @@ def choose_model(api_key):
         print(f"{BOLD}{CYAN}╔══ Trang {page+1}/{total_pages}  [{start+1}–{end}/{total} model] ══╗{R}")
         lines += 1
         for i, m in enumerate(page_models, start + 1):
-            print(f"  {YELLOW}{i:>3}.{R} {m.split('/')[-1]}")
+            if is_requesty and m in free_set:
+                badge = f" {GREEN}🆓{R}"
+            else:
+                badge = ""
+            # Hiện tên ngắn (sau /) nhưng giữ prefix provider nếu Requesty
+            display = m if is_requesty else m.split("/")[-1]
+            print(f"  {YELLOW}{i:>3}.{R} {display}{badge}")
             lines += 1
         print()
         lines += 1
@@ -191,11 +415,14 @@ def choose_model(api_key):
         if _first_draw:
             _first_draw = False
         else:
-            _clear_last(_last_lines)
-        _last_lines = _print_page(page, models)
+            _clear_last()
+        page_lines[0] = _print_page(page, models)
+        search_lines_ref[0] = 0
 
+        PROMPT = f"{CYAN}Chọn (số / tìm / P N T 0): {R}"
         try:
-            raw = input(f"{CYAN}Chọn (số / P / N / T / 0): {R}").strip()
+            raw, s_lines = _model_search_input(PROMPT, models, is_requesty, free_set)
+            search_lines_ref[0] = s_lines
         except (KeyboardInterrupt, EOFError):
             print(f"\n{RED}Huỷ.{R}"); sys.exit(0)
         if not raw:
@@ -220,18 +447,49 @@ def choose_model(api_key):
                 total_pages = max(1, (len(models) + PAGE_SIZE - 1) // PAGE_SIZE)
                 print(f"{GREEN}✓ Đã thêm: {new_model}{R}")
             # reset để vẽ lại từ đầu, không xoá nhầm
-            _last_lines = 0
+            page_lines[0] = 0
+            search_lines_ref[0] = 0
             _first_draw = True
             continue
         try:
-            n = int(raw)
-            if n == 0:
-                print(f"\n{RED}Huỷ.{R}"); sys.exit(0)
-            elif 1 <= n <= total:
-                return models[n-1]
+            # raw có thể là số (index) hoặc model ID string (từ search)
+            if not raw.isdigit() and raw not in ("p","n","t","0"):
+                # Model ID string trực tiếp — đã validate trong _model_search_input
+                chosen_model = raw
             else:
-                print(f"{RED}  Số không hợp lệ (1–{total}).{R}")
-                __import__("time").sleep(1)   # cho đọc kịp rồi mới xoá
+                n = int(raw)
+                if n == 0:
+                    print(f"\n{RED}Huỷ.{R}"); sys.exit(0)
+                elif 1 <= n <= total:
+                    chosen_model = models[n-1]
+                else:
+                    print(f"{RED}  Số không hợp lệ (1–{total}).{R}")
+                    __import__("time").sleep(1)
+                    continue
+            # Xử lý region cho Requesty
+            if is_requesty:
+                free_regions = p.get("free_model_regions", {})
+                cfg = load_config()
+                if chosen_model in free_set:
+                    auto_region = free_regions.get(chosen_model)
+                    if auto_region:
+                        cfg["requesty_region"] = auto_region
+                        print(f"  {GREEN}✓ Vùng tự động: {auto_region} (free model){R}\n")
+                    else:
+                        cfg.pop("requesty_region", None)
+                        print(f"  {GREEN}✓ Vùng: Global (free model){R}\n")
+                    save_config(cfg)
+                else:
+                    if "@" in chosen_model:
+                        cfg.pop("requesty_region", None)
+                    else:
+                        region = _requesty_choose_region(chosen_model)
+                        if region and region.lower() != "global":
+                            cfg["requesty_region"] = region
+                        else:
+                            cfg.pop("requesty_region", None)
+                    save_config(cfg)
+            return chosen_model
         except (ValueError, KeyboardInterrupt):
             print(f"\n{RED}Huỷ.{R}"); sys.exit(0)
 
@@ -241,7 +499,8 @@ _RETRY_MAX     = 5          # số lần retry tối đa
 _RETRY_CODES   = {429, 500, 502, 503, 504}   # HTTP codes đáng retry
 _RETRY_DELAYS  = [5, 15, 25, 30, 30]         # backoff (giây) sau mỗi attempt
 _COST_PROVIDERS  = {"fireworks"}              # providers có bảng giá hiển thị
-_CACHE_PROVIDERS = {"fireworks", "qwen", "cerebras"}  # providers trả về cached_tokens thật
+_CACHE_PROVIDERS = {"fireworks", "qwen", "cerebras", "requesty"}  # providers trả về cached_tokens thật
+# Requesty trả về cost USD trong usage.cost và cache qua header x-requesty-cache
 
 def _parse_retry_after(e: "urllib.error.HTTPError") -> float | None:
     """Đọc Retry-After header nếu có, trả về số giây cần chờ (tối đa 30s)."""
@@ -253,9 +512,18 @@ def _parse_retry_after(e: "urllib.error.HTTPError") -> float | None:
         pass
     return None
 
+def _no_temperature(model: str) -> bool:
+    """Claude 4+ deprecated temperature. Detect bằng tên model."""
+    # Lấy phần sau @ nếu có (vd vertex/claude-opus-4-7@eu → claude-opus-4-7)
+    base = model.lower().split("@")[0].split("/")[-1]
+    return bool(re.search(r"claude-\w+-4", base))
+
+
 def _call_simple(messages, model, api_key):
     payload = {"model": model, "messages": messages,
-               "max_tokens": 4096, "temperature": 0.3, "stream": False}
+               "max_tokens": 4096, "stream": False}
+    if not _no_temperature(model):
+        payload["temperature"] = 0.3
     if _active_provider == "mercury":
         payload["reasoning_effort"] = "low"
     for attempt in range(_RETRY_MAX):
@@ -373,10 +641,12 @@ def call_api_stream(messages, model, api_key, tool_choice="auto", session_id=Non
         "model": model, "messages": messages,
         "tools": api_tools, "tool_choice": tool_choice,
         "max_tokens": _known_max_tokens.get(model, 32768),
-        "temperature": 0.3, "stream": True,
+        "stream": True,
         "stream_options": {"include_usage": True},
         "parallel_tool_calls": True,
     }
+    if not _no_temperature(model):
+        payload["temperature"] = 0.3
     if _active_provider == "mercury":
         payload["reasoning_effort"] = "low"
     if _active_provider in ("cohere", "cerebras"):
@@ -770,11 +1040,8 @@ def _inject_git_context_once(messages: list) -> list:
     ]
     return inject + messages
 
-# Session-level file inject tracking — reset khi compact (context bị xoá)
-_session_injected: set = set()
-
 def agent_turn(messages, model, api_key, conn, sid, max_steps=20, agent=AGENT_BUILD):
-    global _current_agent, _active_tools, _todowrite_calls_this_turn, _session_injected, _current_sid
+    global _current_agent, _active_tools, _todowrite_calls_this_turn, _current_sid
     _current_agent    = agent
     _current_sid      = sid
     _active_tools     = None   # không còn dùng cho API payload, giữ để tương thích
@@ -786,6 +1053,7 @@ def agent_turn(messages, model, api_key, conn, sid, max_steps=20, agent=AGENT_BU
     # Inject git context 1 lần — dùng messages pattern, không phá system prompt cache
     messages = _inject_git_context_once(messages)
     total_in = total_out = total_cached = 0
+    _requesty_turn_cost = 0.0   # Requesty: tích luỹ usage.cost (USD) qua các step
     steps    = 0
     _read_this_turn: set = set()  # track files read this turn to avoid re-reads
     _seen_calls_this_turn: set = set()   # dedup: block identical tool calls
@@ -811,6 +1079,10 @@ def agent_turn(messages, model, api_key, conn, sid, max_steps=20, agent=AGENT_BU
             _cache_validate_all()
             _had_writes_last_step = False
         messages = maybe_compact(messages, model, api_key, conn, sid)
+        # Bug C fix: sau compact, marker AGENTS.md + git bị xoá khỏi history
+        # → phải inject lại để prefix cache không bị phá ở step tiếp theo.
+        messages = _inject_agents_md_once(messages)
+        messages = _inject_git_context_once(messages)
         # Lazy prune: chỉ prune khi ctx > 45% để giữ prefix stable cho cache
         _, hard_thresh = _compact_threshold(model)
         if estimate_tokens(messages) > hard_thresh * 0.45:
@@ -889,6 +1161,8 @@ def agent_turn(messages, model, api_key, conn, sid, max_steps=20, agent=AGENT_BU
             total_out    += result2["usage"].get("completion_tokens", 0)
             if _active_provider in _CACHE_PROVIDERS:
                 total_cached += (result2["usage"].get("prompt_tokens_details") or {}).get("cached_tokens", 0)
+            if _active_provider == "requesty":
+                _requesty_turn_cost += float(result2["usage"].get("cost") or 0)
             continue_count += 1
         if result.get("interrupted") or (truncated and continue_count < 3 and not tcs):
             break
@@ -897,6 +1171,8 @@ def agent_turn(messages, model, api_key, conn, sid, max_steps=20, agent=AGENT_BU
         total_out    += usage.get("completion_tokens", 0)
         if _active_provider in _CACHE_PROVIDERS:
             total_cached += (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
+        if _active_provider == "requesty":
+            _requesty_turn_cost += float(usage.get("cost") or 0)
 
         if text or tcs:
             if tcs:
@@ -989,7 +1265,15 @@ def agent_turn(messages, model, api_key, conn, sid, max_steps=20, agent=AGENT_BU
 
         # Cost: chỉ tính khi là provider có giá rõ ràng (Fireworks/DeepSeek)
         # Provider khác (NVIDIA, Mistral, OpenRouter...) giá khác nhau → bỏ qua cost display
-        if _active_provider in _COST_PROVIDERS:
+        if _active_provider == "requesty":
+            # Requesty trả về usage.cost (USD) trực tiếp trong response
+            cost_total = _requesty_turn_cost
+            if cost_total:
+                _add_session_cost(cost_total)
+                cost_str = f"${cost_total:.6f}  tổng {_session_cost_str()}"
+            else:
+                cost_str = f"{DIM}(free / cost n/a){R}"
+        elif _active_provider in _COST_PROVIDERS:
             cost_in      = uncached_in  * 0.14 / 1_000_000
             cost_cached  = total_cached * 0.03 / 1_000_000
             cost_out     = total_out    * 0.28 / 1_000_000
