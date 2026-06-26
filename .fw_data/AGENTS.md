@@ -36,4 +36,3 @@ File mới >80 dòng dùng pattern: `# ##== NAME ==##`. Ví dụ:
 - Không emoji trong output của agent.
 - Tóm tắt sau task: files đã thay đổi + cách chạy/verify. Ngắn gọn.
 - Không giải thích lại những gì đã rõ.
-p theo).
