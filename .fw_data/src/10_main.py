@@ -24,14 +24,19 @@ def _auto_rename_session(conn, sid, messages, model, api_key):
         return
 
     def _do_rename():
-        try:
-            result = _call_simple(
+        import concurrent.futures as _cf
+        def _api_call():
+            return _call_simple(
                 [{"role": "user", "content":
                     f"Đặt tên ngắn (tối đa 5 từ tiếng Việt, không dấu chấm) "
                     f"cho cuộc hội thoại bắt đầu bằng:\n\n{first_user}\n\n"
                     f"Chỉ trả lời tên, không giải thích."}],
                 model, api_key
             )
+        try:
+            with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
+                fut = _ex.submit(_api_call)
+                result = fut.result(timeout=15)  # timeout 15s — tránh zombie thread
             new_title = result.get("text", "").strip().strip('"').strip("'")
             # Sanity: không dài hơn 60 ký tự, không chứa newline
             new_title = new_title.splitlines()[0][:60].strip()
@@ -300,8 +305,11 @@ def pick_session(conn, api_key):
 
                 print(f"  {GREEN}✓{R} {DIM}Resumed{R} {WHITE}{s['title']}{R} {DIM}— {len(msgs)} messages{R}\n")
                 return s, s["model"], msgs
-        except (ValueError, KeyboardInterrupt):
+        except KeyboardInterrupt:
             print(f"\n  {DIM}Bye.{R}"); sys.exit(0)
+        except ValueError:
+            print(f"  {RED}Nhập số hợp lệ (0–{len(sessions)}).{R}")
+            continue
 
 def choose_agent():
     print(f"\n  {GRAY}agent mode{R}")
@@ -1178,14 +1186,13 @@ Write the AGENTS.md content directly. Be concise but complete."""
                 arg_parts = cmd_args.split() if cmd_args else []
                 for idx, part in enumerate(arg_parts, 1):
                     template = template.replace(f"${idx}", part)
-                # !`shell` → run and inject output
+                # !`shell` → giữ cú pháp nhưng KHÔNG thực thi (an toàn mặc định)
+                # Trả về warning để user biết command đã bị vô hiệu hoá.
                 def _shell_inject(m):
-                    try:
-                        r = subprocess.run(m.group(1), shell=True, capture_output=True,
-                                           text=True, timeout=15, cwd=os.getcwd())
-                        return r.stdout.strip() or "(no output)"
-                    except Exception as e:
-                        return f"[error: {e}]"
+                    cmd = (m.group(1) or "").strip()
+                    cmd = cmd[:200] + ("…" if len(cmd) > 200 else "")
+                    return ("[shell disabled] '!`...`' is disabled by default for safety. "
+                            "Run this manually if you trust it. cmd=" + cmd)
                 template = re.sub(r"!`([^`]+)`", _shell_inject, template)
                 # @file references
                 template = _expand_at_mentions(template)

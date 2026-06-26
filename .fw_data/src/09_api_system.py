@@ -1218,27 +1218,33 @@ def agent_turn(messages, model, api_key, conn, sid, max_steps=20, agent=AGENT_BU
                 continue
             _seen_calls_this_turn.add(_call_sig)
             # Track files read this turn
-            if name == "read" and not Path(args.get("path","")).is_dir():
-                p_str = str(Path(args.get("path","")).expanduser().resolve())
-                _read_this_turn.add(p_str)
-                _cache_touch(p_str)   # LRU: file này vừa được access
-                # Reset dedup sau read — cho phép model retry edit với old_str mới
-                _seen_calls_this_turn.clear()
+            if name == "read":
+                try:
+                    _p = Path(args.get("path",""))
+                    _is_dir = _p.is_dir()
+                except Exception:
+                    _is_dir = False
+                if not _is_dir:
+                    try:
+                        p_str = str(Path(args.get("path","")).expanduser().resolve())
+                        _read_this_turn.add(p_str)
+                        _cache_touch(p_str)   # LRU: file này vừa được access
+                    except Exception:
+                        pass
+                # Reset dedup sau read chỉ cho edit-related signatures là quá khó ở đây;
+                # ít nhất không clear toàn bộ giữa step — giữ guard.
             elif name in ("write", "edit", "multiedit", "view_symbol"):
                 _cache_touch(str(Path(args.get("path","")).expanduser().resolve()))
                 _had_writes_last_step = True  # lazy validate: validate lần sau
             elif name == "bash":
-                # Chỉ set flag khi lệnh có khả năng ghi file — tránh validate không cần thiết
-                # khi bash là read-only (git status, python -c, echo, grep, v.v.)
-                _BASH_WRITE_PATTERNS = re.compile(
-                    r"\b(write|tee|mv|cp|rm|touch|mkdir|chmod|chown|sed\s+-i|"
-                    r"awk\s+.*>|git\s+(?:add|commit|reset|checkout|merge|rebase|apply)|"
-                    r"pip\s+install|npm\s+install|apt|yum|wget|curl\s+.*-[oO])\b"
-                    r"|\s*>(?!=)",  # redirect > (but not >=, !=, =>)
+                # Cache correctness: bash mặc định là "dirty" trừ một số lệnh chắc chắn read-only.
+                cmd = (args.get("command", "") or "").strip()
+                _BASH_READONLY = re.compile(
+                    r"^(git\s+(status|diff|log|show)(\b|$)|\
+?ls\b|pwd\b|whoami\b|python(3)?\s+-V\b)",
                     re.IGNORECASE
                 )
-                cmd = args.get("command", "")
-                if _BASH_WRITE_PATTERNS.search(cmd):
+                if not _BASH_READONLY.search(cmd):
                     _had_writes_last_step = True
             out_model, out_history = run_tool(name, args, model, api_key, conn, sid)
             _seen_calls_result[_call_sig] = out_model  # store for dedup context

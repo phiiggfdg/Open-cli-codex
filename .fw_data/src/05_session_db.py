@@ -75,9 +75,17 @@ def compact_messages(messages, model, api_key, mode: str = "soft"):
         char_limit = 400 if mode == "hard" else 600
         hist += f"\n[{role}]: {json.dumps(str(c), ensure_ascii=False)[:char_limit]}\n"
     detail = "Be concise." if mode == "hard" else ""
-    summary = _call_simple(
-        [{"role":"user","content": COMPACT_PROMPT+detail+"\n\n<conversation>"+hist+"</conversation>"}],
-        model, api_key).get("text","(unavailable)")
+    try:
+        summary = _call_simple(
+            [{"role":"user","content": COMPACT_PROMPT+detail+"\n\n<conversation>"+hist+"</conversation>"}],
+            model, api_key).get("text","")
+        if not summary:
+            raise ValueError("empty summary")
+    except Exception as _ce:
+        # Fallback: nếu API fail khi compact, giữ nguyên recent messages
+        # thay vì crash — tránh mất context hoàn toàn.
+        print(f"{RED}[compact/{label}] API lỗi ({_ce}), giữ nguyên {keep} messages gần nhất.{R}")
+        return recent
     print(f"{DIM}[compact/{label}] Done. {len(old)} → 1 summary.{R}\n")
     # Không inject cache_block vào summary — nội dung thay đổi mỗi lần phá prefix cache.
     # File context sẽ được re-read bình thường khi AI cần.
@@ -123,7 +131,15 @@ def maybe_compact(messages, model, api_key, conn, sid):
         return messages
     print(f"{color}[compact/{mode}] Context {current:,} tok ({pct}% of limit)...{R}")
     c = compact_messages(messages, model, api_key, mode=mode)
-    messages_replace_all(conn, sid, c)
+    # Chỉ ghi DB nếu compact thực sự xảy ra (tức là c là danh sách summary+recent,
+    # không phải `recent` thuần — trường hợp fallback do API lỗi).
+    # Phân biệt: compact thành công → c[0]["content"] bắt đầu bằng "[SUMMARY"
+    if c is not messages and len(c) > 0 and str(c[0].get("content","")).startswith("[SUMMARY"):
+        messages_replace_all(conn, sid, c)
+    elif c is not messages:
+        # Fallback: API lỗi, compact_messages trả về recent.
+        # Không ghi DB để tránh mất message cũ vĩnh viễn — giữ nguyên messages trong RAM.
+        pass
     return c
 
 def _context_bar(messages, model: str) -> str:

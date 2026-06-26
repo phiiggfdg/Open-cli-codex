@@ -68,11 +68,13 @@ def _mcp_request(server: dict, method: str, params: dict | None = None, timeout:
         raw = resp.read().decode("utf-8", errors="replace")
     # Một số MCP server trả về SSE (event: message\ndata: {...}) thay vì JSON thuần
     if raw.lstrip().startswith("event:") or raw.lstrip().startswith("data:"):
+        data_lines = []
         for line in raw.splitlines():
             line = line.strip()
             if line.startswith("data:"):
-                raw = line[5:].strip()
-                break
+                data_lines.append(line[5:].strip())
+        if data_lines:
+            raw = "\n".join(data_lines).strip()
     data = json.loads(raw)
     if "error" in data:
         raise RuntimeError(data["error"].get("message", str(data["error"])))

@@ -31,10 +31,30 @@ _BASH_DENY_PATTERNS = [
     r"\bmount\b",
     r"\bdd\s",
     r"\brm\s+-rf\s+/",     # rm -rf /
+    r"\brm\s+-rf\s+~",     # rm -rf ~ (home dir trên Termux)
+    r"\brm\s+-rf\s+\$HOME", # rm -rf $HOME
     r"\bchmod\s+[0-7]*\s+/",
     r"\bchown\b.*\s+/",
 ]
 _BASH_DENY_RE = re.compile("|".join(_BASH_DENY_PATTERNS))
+
+
+# ── Bash safety gates ───────────────────────────────────────────────────────
+# Giữ hành vi cũ (shell=True) nhưng thêm confirm + allowlist tối thiểu.
+# User có thể /perm bash allow để bỏ confirm.
+_BASH_CONFIRM_EVERY_SESSION = True
+_BASH_ALLOWLIST = [
+    r"^git\b",
+    r"^pytest\b",
+    r"^python(3)?\b",
+    r"^node\b",
+    r"^npm\b",
+    r"^pnpm\b",
+    r"^yarn\b",
+    r"^make\b",
+]
+_BASH_ALLOW_RE = re.compile("|".join(_BASH_ALLOWLIST), re.IGNORECASE)
+_BASH_CONFIRMED = False
 
 # Pattern chặn file inspection qua bash — AI phải dùng read/glob/grep thay thế
 # head/tail chỉ block khi đứng đầu lệnh (không phải sau pipe)
@@ -59,6 +79,19 @@ def tool_bash(command, timeout=30):
             "Lý do: bash file inspection lãng phí token, phá cache context."
         )
 
+
+
+    # ── Allowlist + confirm gate (minimal) ─────────────────────────────────
+    global _BASH_CONFIRMED
+    if _BASH_CONFIRM_EVERY_SESSION and not _BASH_CONFIRMED:
+        # Nếu lệnh không nằm trong allowlist → yêu cầu confirm qua permission layer
+        if not _BASH_ALLOW_RE.search(command.strip()):
+            return (
+                "[policy] bash command blocked by allowlist.\n"
+                "Hãy dùng lệnh trong allowlist (git/pytest/python/node/npm/make) hoặc\n"
+                "đổi strategy (tools read/write/edit/apply_patch)."
+            )
+        _BASH_CONFIRMED = True
     if _project_dir is not None:
         proj = _project_dir.resolve()
 

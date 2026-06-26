@@ -260,10 +260,10 @@ def _check_permission(name, args, agent=None):
 def _dispatch_tool(name, args, model, api_key, conn, sid):
     if name == "set_tools":
         result = tool_set_tools(args.get("tools", []))
-        return result, result
+        return result
     if name.startswith("mcp__"):
         result = mcp_call_tool(name, args)
-        return result, result
+        return result
     if not _check_permission(name, args):
         return f"[permission denied: {name}]"
     dispatch = {

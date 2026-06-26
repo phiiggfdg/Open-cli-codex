@@ -171,11 +171,27 @@ _MEM_COOLDOWN = 5.0   # giây giữa 2 lần evict liên tiếp
 _mem_last_evict: float = 0.0
 
 def _mem_ratio() -> float:
-    """RSS / total RAM. Trả về 0.0 nếu không đọc được."""
+    """RSS hiện tại / total RAM. Trả về 0.0 nếu không đọc được.
+    Dùng /proc/self/status (VmRSS) thay vì ru_maxrss để lấy RSS thực tại,
+    không phải peak — tránh evict cache quá sớm trên Android/Termux.
+    """
+    try:
+        # Ưu tiên /proc/self/status (Linux/Android/Termux) — RSS thực tại
+        rss_kb = 0
+        with open("/proc/self/status") as _f:
+            for _line in _f:
+                if _line.startswith("VmRSS:"):
+                    rss_kb = int(_line.split()[1])
+                    break
+        if rss_kb > 0:
+            total = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+            return (rss_kb * 1024) / total if total > 0 else 0.0
+    except Exception:
+        pass
+    # Fallback: ru_maxrss (macOS hoặc hệ thống không có /proc)
     try:
         import resource as _res
         rss   = _res.getrusage(_res.RUSAGE_SELF).ru_maxrss
-        # Linux: KB, macOS: bytes
         rss_bytes = rss * 1024 if sys.platform != "darwin" else rss
         total = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
         return rss_bytes / total if total > 0 else 0.0
@@ -739,7 +755,11 @@ def messages_load(conn, sid):
         (sid,)).fetchall()
     result = []
     for r in rows:
-        raw = json.loads(r["content"])
+        try:
+            raw = json.loads(r["content"])
+        except (json.JSONDecodeError, TypeError):
+            # DB row corrupt — skip thay vì crash toàn app khi resume session
+            continue
         msg = _normalize_message(r["role"], raw)
         result.append(msg)
     return result
