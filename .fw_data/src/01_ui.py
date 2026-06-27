@@ -94,7 +94,7 @@ SLASH_COMMANDS = [
     "/model", "/agent", "/session", "/sessions", "/todos", "/compact",
     "/clear", "/delete", "/deleteall", "/cd", "/title", "/tokens",
     "/undo", "/redo", "/diff", "/sandbox", "/export", "/cache", "/checkpoint",
-    "/perm", "/perms", "/skills", "/setkey", "/init", "/rules",
+    "/perm", "/perms", "/skills", "/setkey", "/deletekey", "/init", "/rules",
     "/commands", "/sequential", "/batch", "/commit", "/review", "/help", "/mcp",
 ]
 
@@ -122,6 +122,7 @@ SLASH_DESC = {
     "/perms":      "xem permission hiện tại",
     "/skills":     "liệt kê skills",
     "/setkey":     "đổi API key",
+    "/deletekey":  "xoá API key đã lưu",
     "/init":       "tạo AGENTS.md cho project",
     "/rules":      "xem AGENTS.md đang active",
     "/commands":   "liệt kê custom commands",

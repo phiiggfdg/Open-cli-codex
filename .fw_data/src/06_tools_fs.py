@@ -115,7 +115,7 @@ def tool_bash(command, timeout=30):
                            text=True, timeout=int(timeout), cwd=run_cwd)
         elapsed = time.time() - started
         return _format_bash_result(command, r.returncode, r.stdout, r.stderr,
-                                   elapsed, timed_out=False)
+                                   elapsed, timed_out=False, run_cwd=run_cwd)
     except subprocess.TimeoutExpired as e:
         elapsed = time.time() - started
         stdout = e.stdout or ""
@@ -123,7 +123,7 @@ def tool_bash(command, timeout=30):
         if isinstance(stdout, bytes): stdout = stdout.decode("utf-8", errors="replace")
         if isinstance(stderr, bytes): stderr = stderr.decode("utf-8", errors="replace")
         return _format_bash_result(command, 124, stdout, stderr, elapsed,
-                                   timed_out=True, timeout=timeout)
+                                   timed_out=True, timeout=timeout, run_cwd=run_cwd)
     except Exception as e:
         return f"[error: {e}]"
 
@@ -159,7 +159,7 @@ def _classify_bash_error(code: int, stderr: str, stdout: str,
 
 def _format_bash_result(command: str, code: int, stdout: str, stderr: str,
                         elapsed: float, timed_out: bool = False,
-                        timeout: int | None = None) -> str:
+                        timeout: int | None = None, run_cwd: str | None = None) -> str:
     error_class, retry_hint = _classify_bash_error(code, stderr, stdout, timed_out)
     status = "timeout" if timed_out else ("ok" if code == 0 else "error")
     lines = [
@@ -167,7 +167,7 @@ def _format_bash_result(command: str, code: int, stdout: str, stderr: str,
         f"status: {status}",
         f"exit_code: {code}",
         f"duration: {elapsed:.2f}s",
-        f"cwd: {os.getcwd()}",
+        f"cwd: {run_cwd or os.getcwd()}",
         f"error_class: {error_class}",
         f"retry_hint: {retry_hint}",
     ]
@@ -372,8 +372,9 @@ def _prune_tool_results(messages: list) -> list:
 
 # ── Per-session file index ───────────────────────────────────────────────────
 def _index_key() -> str:
-    """Key cho index = tên thư mục project (cwd). Persist qua nhiều session."""
-    return Path.cwd().name
+    """Key cho index = absolute path của cwd để tránh xung đột giữa các project
+    cùng tên folder (C36 FIX: Path.cwd().name → str(Path.cwd().resolve()))."""
+    return str(Path.cwd().resolve())
 
 def _fw_data_dir() -> Path:
     """
@@ -410,10 +411,16 @@ def _index_update(abs_path: str, content: str, symbols: dict):
     """Thêm/update entry cho file vào index của project."""
     index = _index_load()
     rel = abs_path
+    # C37 FIX: dùng _workspace_root() thay vì Path.cwd() để key index không có sid/ prefix
+    # khi sandbox enforce — tránh AI thấy key "sid/foo.py" mà gọi path sai.
+    root = _workspace_root()
     try:
-        rel = str(Path(abs_path).relative_to(Path.cwd()))
+        rel = str(Path(abs_path).resolve().relative_to(root))
     except ValueError:
-        pass
+        try:
+            rel = str(Path(abs_path).relative_to(Path.cwd()))
+        except ValueError:
+            pass
     sym_map = {name: s["line"] for name, s in list(symbols.items())[:40]}
     index[rel] = {
         "path": abs_path,
@@ -575,8 +582,8 @@ def _workspace_references(name: str, seed_file: str | None = None,
 
 def tool_read(path, offset=1, limit=READ_DEFAULT_LIMIT, depth=4):
 
-    # Auto-resolve vào sandbox nếu path nằm ngoài (giống tool_write)
-    if _project_dir is not None:
+    # Auto-resolve vào sandbox chỉ khi sandbox đã enforce (không phải placeholder)
+    if _project_dir is not None and not _project_dir_is_placeholder:
         resolved_p = Path(path).expanduser()
         try:
             resolved_p.resolve().relative_to(_project_dir.resolve())
@@ -590,7 +597,7 @@ def tool_read(path, offset=1, limit=READ_DEFAULT_LIMIT, depth=4):
     p = Path(path).expanduser()
     if not p.exists(): return f"[not found: {path}]"
     if p.is_dir():
-        # Nếu đang read dir ngoài sandbox thật → redirect về project_dir
+        # Redirect về project_dir chỉ khi sandbox đã enforce
         if _project_dir is not None and not _project_dir_is_placeholder:
             try:
                 p.resolve().relative_to(_project_dir.resolve())
@@ -601,6 +608,33 @@ def tool_read(path, offset=1, limit=READ_DEFAULT_LIMIT, depth=4):
         count = sum(1 for l in lines if not l.endswith("/") and "..." not in l)
         lines.append(f"\n({count} files shown, depth={depth})")
         return "\n".join(lines)
+
+    # B4 FIX: _recent_writes trước đây chỉ được .add()/.clear(), không bao giờ
+    # được đọc — comment "block read-after-write" không có tác dụng thật.
+    # Enforce mềm: nếu file vừa được write/edit trong turn này (đã có sẵn
+    # trong _file_cache, đúng nội dung mới nhất), trả thẳng từ cache kèm
+    # cảnh báo, không đọc lại disk — tiết kiệm 1 tool-call thật như rule
+    # "Re-read after edit = FORBIDDEN" trong system prompt đã yêu cầu.
+    resolved_key = str(p.resolve())
+    if resolved_key in _recent_writes and resolved_key in _file_cache:
+        cached = _file_cache[resolved_key]
+        cached_lines = cached["content"].splitlines()
+        ctotal = len(cached_lines)
+        start  = max(0, int(offset) - 1)
+        end    = start + int(limit)
+        sliced = cached_lines[start:end]
+        out = (
+            f"[policy] '{path}' đã được write/edit trong turn này — trả từ cache, "
+            f"không đọc lại disk (content đã biết, xem rule re-read).\n"
+            f"File: {p}\nLines {start+1}-{min(end, ctotal)} of {ctotal}\n"
+            + "─" * 60 + "\n"
+            + "\n".join(f"{start+1+i}\t{l}" for i, l in enumerate(sliced))
+        )
+        remaining = ctotal - end
+        if remaining > 0:
+            out += f"\n\n(+{remaining} more lines — call read with offset={end+1} if truly needed)"
+        return out
+
     try:
         all_lines = p.read_text(errors="replace").splitlines()
         total     = len(all_lines)
@@ -700,8 +734,8 @@ def _check_sandbox_read(path: str) -> str | None:
     if p == fw_py:
         return f"[not found: {path}]"
 
-    if _project_dir is None:
-        return None  # chưa init, chưa cần giới hạn
+    if _project_dir is None or _project_dir_is_placeholder:
+        return None  # chua enforce sandbox read — AI doc duoc project co san o cwd
     proj = _project_dir.resolve()
     try:
         p.relative_to(proj)
@@ -798,6 +832,11 @@ def tool_extract(src, start, end, dst, mode="move", conn=None, sid=None):
         _cache_put(str(dp), dst_after, _current_sid)
         _file_read_time[str(dp.resolve())] = time.time()
         _recent_writes.add(str(dp.resolve()))
+        # C11/C27 FIX: save snapshot cho dst để /undo restore được dst (cả copy lẫn move)
+        if conn and sid:
+            snapshot_save(conn, sid, str(dp.resolve()), dst_before or "", dst_after)
+            _undo_stack.append({"path": str(dp.resolve()), "before": dst_before or "", "after": dst_after})
+            _redo_stack.clear()
 
         result = f"Extracted lines {start}-{end} of {sp} → {dp} ({len(chunk)} lines)"
 
@@ -812,7 +851,7 @@ def tool_extract(src, start, end, dst, mode="move", conn=None, sid=None):
             if conn and sid:
                 snapshot_save(conn, sid, str(sp.resolve()), src_before, src_after)
                 _undo_stack.append({"path": str(sp.resolve()), "before": src_before, "after": src_after})
-                _redo_stack.clear()
+                # Note: _redo_stack already cleared above for dst snapshot
             result += f"\n[removed from {sp}, {len(new_src_lines)} lines remain]"
 
         return result

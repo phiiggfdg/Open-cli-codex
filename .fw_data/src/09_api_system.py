@@ -47,16 +47,20 @@ def get_api_key():
     # 3. First-run wizard
     pname = p["name"]
     print(f"\n{YELLOW}Chưa tìm thấy {pname} API key.{R}")
-    key_url = {
-        "fireworks": "https://fireworks.ai/account/api-keys",
-        "cohere":    "https://dashboard.cohere.com/api-keys",
-        "cerebras":  "https://cloud.cerebras.ai/platform/apikeys",
-        "mistral":   "https://console.mistral.ai/api-keys",
+    # Ưu tiên key_url từ provider dict (custom providers lưu ở đây),
+    # fallback về bảng cứng cho built-in providers.
+    _builtin_key_urls = {
+        "fireworks":   "https://fireworks.ai/account/api-keys",
+        "cohere":      "https://dashboard.cohere.com/api-keys",
+        "cerebras":    "https://cloud.cerebras.ai/platform/apikeys",
+        "mistral":     "https://console.mistral.ai/api-keys",
         "commandcode": "https://commandcode.ai/studio",
-        "mimo":      "https://xiaomimimo.com",
-        "mercury":   "https://platform.inceptionlabs.ai/dashboard/api-keys",
+        "mimo":        "https://xiaomimimo.com",
+        "mara":        "https://cloud.mara.com/dashboard",
+        "mercury":     "https://platform.inceptionlabs.ai/dashboard/api-keys",
         "aws_bedrock": "https://console.aws.amazon.com/bedrock/home#/api-keys",
-    }.get(_active_provider, "")
+    }
+    key_url = p.get("key_url") or _builtin_key_urls.get(_active_provider, "")
     if key_url:
         print(f"{DIM}Lấy key tại: {key_url}{R}\n")
 
@@ -110,6 +114,40 @@ def get_api_key():
             print(f"{GREEN}✓ Đã lưu → {CONFIG_PATH}{R}")
         return key
 
+def _patch_context_limits_from_api(data: dict):
+    """
+    Tự động cập nhật context_limits của provider active từ raw API response.
+    Hỗ trợ 2 format phổ biến:
+      - OpenAI-compat : {"data": [{"id": "...", "context_length": N, ...}]}
+      - Fireworks/Cohere: {"models": [{"name": "...", "contextLength": N, ...}]}
+    Fallback mặc định nếu không có gì: 128_000.
+    Không phá context_limits đã ghi cứng — chỉ bổ sung / ghi đè khi API trả về.
+    """
+    p = _prov()
+    limits = p.setdefault("context_limits", {})
+
+    # Thử lấy list model từ cả 2 format
+    entries = data.get("data") or data.get("models") or []
+    if not entries:
+        return
+
+    for m in entries:
+        if not isinstance(m, dict):
+            continue
+        # Lấy ID model
+        mid = m.get("id") or m.get("name") or ""
+        if not mid:
+            continue
+        # Lấy context length — thử các field name phổ biến
+        ctx = (m.get("context_length")
+               or m.get("context_window")
+               or m.get("contextLength")
+               or m.get("max_context_length")
+               or 0)
+        if ctx and isinstance(ctx, int) and ctx > 0:
+            # Dùng model ID đầy đủ làm key để match chính xác hơn substring
+            limits[mid] = ctx
+
 def fetch_models(api_key):
     p = _prov()
     # Qwen: dùng workspace-specific URL nếu có QWEN_WORKSPACE_ID
@@ -121,6 +159,8 @@ def fetch_models(api_key):
         with urllib.request.urlopen(req, timeout=8) as resp:
             data = json.loads(resp.read())
             ids  = p["parse_models"](data)
+            # Tự học context limit từ API nếu có trả về
+            _patch_context_limits_from_api(data)
             if not ids:
                 ids = _load_extra_models() + p["fallback_models"]
     except Exception:
@@ -957,27 +997,26 @@ def build_mode_hint(agent=AGENT_BUILD) -> str:
 
 
 
-def build_system(cwd, agent=AGENT_BUILD, read_files: set = None):
-    """System prompt = static + cwd + sandbox.
-    read_files KHÔNG inject vào đây — thay đổi mỗi step sẽ phá cache prefix.
-    Cache theo (cwd, agent, project_dir) — ổn định suốt session sau turn đầu."""
-    proj_key = str(_project_dir) if (_project_dir and not _project_dir_is_placeholder) else ""
-    cache_key = (cwd, agent, proj_key)
+def build_system(agent=AGENT_BUILD):
+    """System prompt = header (Workspace+Agent+Sandbox) + static rules.
+    Header 3 dong o DAU, lay tu _project_dir_str() — bat bien suot session.
+    Cache key = (proj_key, agent) — stable sau session_create(), khong phu thuoc cwd.
+    read_files KHONG inject vao day — thay doi moi step se pha cache prefix."""
+    proj_key = _project_dir_str()
+    cache_key = (proj_key, agent)
     if cache_key in _system_full_cache:
         return _system_full_cache[cache_key]
 
     static = build_system_static(agent)
 
-    if _project_dir and not _project_dir_is_placeholder:
-        sandbox_section = f"\n\nSandbox: all reads/writes/bash MUST stay inside `{_project_dir}`."
-    else:
-        sandbox_section = (
-            "\n\nFirst file write auto-creates a project subdir under cwd. "
-            "Use `<project_name>/<file>` paths. Do NOT write directly into cwd."
-        )
+    # Header: Workspace + Agent + Sandbox — o DAU, luon giong nhau suot session
+    header = (
+        f"Workspace: {proj_key}\n"
+        f"Agent: {agent}\n"
+        f"Sandbox: all reads/writes/bash MUST stay inside `{proj_key}`.\n\n"
+    )
 
-    dynamic = f"\n\nCurrent directory: {cwd}\nAgent: {agent}" + sandbox_section
-    result = static + dynamic
+    result = header + static
     _system_full_cache[cache_key] = result
     return result
 
@@ -1048,7 +1087,9 @@ def _inject_git_context_once(messages: list) -> list:
     return inject + messages
 
 def agent_turn(messages, model, api_key, conn, sid, max_steps=20, agent=AGENT_BUILD):
-    global _current_agent, _active_tools, _todowrite_calls_this_turn, _current_sid
+    # C1 FIX: thêm _large_read_credits vào global declaration.
+    # Tất cả modules exec() vào cùng một namespace → global ở đây là đúng.
+    global _current_agent, _active_tools, _todowrite_calls_this_turn, _current_sid, _large_read_credits
     _current_agent    = agent
     _current_sid      = sid
     _active_tools     = None   # không còn dùng cho API payload, giữ để tương thích
@@ -1115,7 +1156,7 @@ def agent_turn(messages, model, api_key, conn, sid, max_steps=20, agent=AGENT_BU
                     break
 
         messages_with_cache = _sanitize_tool_turns(messages_with_cache)
-        full = [{"role":"system","content":build_system(os.getcwd(), agent)}] + messages_with_cache
+        full = [{"role":"system","content":build_system(agent)}] + messages_with_cache
 
         # ── Step log ─────────────────────────────────────────────────────────
         ctx_est = estimate_tokens(full)
@@ -1147,7 +1188,7 @@ def agent_turn(messages, model, api_key, conn, sid, max_steps=20, agent=AGENT_BU
                 messages.append({"role": "assistant", "content": text})
                 message_save(conn, sid, "assistant", {"role": "assistant", "content": text})
             messages.append({"role": "user", "content": "continue"})
-            full2   = [{"role":"system","content":build_system(os.getcwd(), agent)}] + messages
+            full2   = [{"role":"system","content":build_system(agent)}] + messages
             result2 = call_api_stream(full2, model, api_key, tool_choice="auto", session_id=sid, tools=_turn_api_tools)
             text2   = result2["text"]
             tcs2    = result2["tool_calls"]

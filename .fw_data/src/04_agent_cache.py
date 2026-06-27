@@ -329,9 +329,12 @@ def _cache_log(op: str, path: str, extra: str = ""):
         return
     rel = path
     try:
-        rel = str(Path(path).relative_to(Path.cwd()))
+        rel = str(Path(path).resolve().relative_to(_workspace_root()))
     except ValueError:
-        pass
+        try:
+            rel = str(Path(path).relative_to(Path.cwd()))
+        except ValueError:
+            pass
     icons = {"+": GREEN, "-": RED, "~": YELLOW, "?": CYAN}
     color = icons.get(op, DIM)
     extra_str = f"  {DIM}{extra}{R}" if extra else ""
@@ -425,86 +428,14 @@ def _cache_validate_all():
     for key in list(_file_cache.keys()):
         _cache_invalidate(key)
 
-def _build_cache_block(turn_files: set = None, prev_injected: set = None) -> tuple:
-    """
-    Inject file context vào user message.
-    - batch mode: delta — chỉ inject file MỚI, file cũ list tên ngắn
-    - sequential mode: inject tất cả file turn này (1 step nên không cần delta)
-    Trả về (block_str, new_prev_injected).
-    """
-    if not _file_cache:
-        return "", prev_injected or set()
-
-    prev = prev_injected or set()
-
-    turn_keys = set()
-    if turn_files:
-        for p in turn_files:
-            turn_keys.add(str(Path(p).expanduser().resolve()))
-
-    # Delta: chỉ inject file chưa inject step nào trước đó
-    new_keys = turn_keys - prev
-    old_keys = turn_keys & prev
-
-    new_entries = [(k, _file_cache[k]) for k in new_keys if k in _file_cache]
-    new_entries.sort(key=lambda kv: kv[1]["access"], reverse=True)
-
-    if not new_entries and not old_keys:
-        return "", prev
-
-    lines = ["\n\n# File context:"]
-    total_chars = 0
-
-    for abs_path, info in new_entries[:CACHE_MAX_FILES]:
-        content  = info["content"]
-        symbols  = info["symbols"]
-        rel      = abs_path
-        try:
-            rel = str(Path(abs_path).relative_to(Path.cwd()))
-        except ValueError:
-            pass
-
-        lines_list = content.splitlines()
-        line_count = len(lines_list)
-        char_count = len(content)
-        header     = f"\n## {rel}  ({line_count} lines)"
-
-        if char_count <= 200:
-            block = f"```\n{content}\n```"
-        elif symbols:
-            sym_lines = [f"  - {name} @ line {s['line']}: {s['snippet']}"
-                         for name, s in list(symbols.items())[:25]]
-            if len(symbols) > 25:
-                sym_lines.append(f"  ... (+{len(symbols)-25} more)")
-            block = "Symbol map:\n" + "\n".join(sym_lines)
-        else:
-            preview = "\n".join(f"  {l}" for l in lines_list[:5])
-            tail    = f"\n  ... (+{line_count - 5} more lines)" if line_count > 5 else ""
-            block   = f"Preview ({line_count} lines):\n{preview}{tail}"
-
-        entry_chars = len(header) + len(block)
-        if total_chars + entry_chars > CACHE_MAX_CHARS:
-            break
-        lines.append(header)
-        lines.append(block)
-        total_chars += entry_chars
-
-    # File đã inject rồi: chỉ list tên (batch mode)
-    if old_keys:
-        old_lines = ["\n# Already in context:"]
-        for k in old_keys:
-            if k not in _file_cache:
-                continue
-            rel = k
-            try:
-                rel = str(Path(k).relative_to(Path.cwd()))
-            except ValueError:
-                pass
-            lc = len(_file_cache[k]["content"].splitlines())
-            old_lines.append(f"  {rel} ({lc} lines)")
-        lines.extend(old_lines)
-
-    return "\n".join(lines), prev | new_keys
+# B5 FIX: _build_cache_block() (inject file content vào user message mỗi turn)
+# đã bị xóa — không còn nơi nào gọi nó từ khi agent_turn() chuyển sang giữ
+# prefix cache ổn định (xem comment "cache_block bỏ" trong 09_api_system.py,
+# agent_turn()). Cơ chế hiện tại: _cache_put()/_cache_touch() cập nhật
+# _file_cache ngay sau mỗi write/edit/read, model biết content mới nhất qua
+# tool result trả về trực tiếp, không cần block riêng inject vào message.
+# CACHE_MAX_FILES/CACHE_MAX_CHARS phía trên vẫn giữ — dùng làm số hiển thị
+# tham khảo trong lệnh /cache (xem 10_main.py).
 
 # ── Project dir sandbox ──────────────────────────────────────────────────────
 # Stores the project directory for the current session.
@@ -514,76 +445,71 @@ _project_dir_conn = None
 _project_dir_sid  = ""
 _project_dir_is_placeholder: bool = False  # True khi set là cwd eager-init, chưa tạo subdir thật
 
+def _project_dir_str() -> str:
+    """Tra ve full absolute path cua project_dir hien tai.
+    Luon dung _project_dir neu co (ke ca placeholder) — dam bao cache key
+    on dinh tu turn 0, khong doi sau write dau tien."""
+    if _project_dir is not None:
+        return str(_project_dir.resolve())
+    return str(Path.cwd().resolve())
+
 def _sandbox_init(conn, sid, project_dir_str: str | None):
     """Called at session start to restore or reset the sandbox.
-    Eager init: gán _project_dir ngay từ đầu để system prompt ổn định từ turn 1,
-    tránh cache miss lần đầu khi _project_dir được set muộn (sau write đầu tiên).
+    project_dir luon co san tu session_create() — path stable cho cache tu turn 0.
+    is_placeholder=True: tools_fs chua enforce sandbox read (AI doc duoc project co san).
+    is_placeholder=False: sau write dau tien, sandbox enforce day du.
     """
     global _project_dir, _project_dir_conn, _project_dir_sid, _project_dir_is_placeholder
     _project_dir_conn = conn
     _project_dir_sid  = sid
     if project_dir_str:
-        # Có từ session đã lưu — dùng luôn
         _project_dir = Path(project_dir_str)
-        _project_dir_is_placeholder = False
+        _project_dir.mkdir(parents=True, exist_ok=True)
+        # Kiem tra xem session nay da tung write chua (co file trong sid/)
+        # Neu chua co file → placeholder (cho phep read rong hon)
+        # Neu da co file → sandbox that (restore dung trang thai)
+        # C10 FIX: rglob("*") match cả directory rỗng → dùng is_file() để chỉ đếm file thật
+        has_files = any(p for p in _project_dir.rglob("*") if p.is_file())
+        _project_dir_is_placeholder = not has_files
     else:
-        # Session mới: pre-set bằng cwd để system prompt cache ổn định ngay turn 1.
-        # _ensure_project_dir vẫn tạo subdir thực sự lúc write đầu tiên,
-        # nhưng proj_key đã stable từ đây → không phá cache prefix.
-        _project_dir = Path.cwd()
+        # Fallback legacy session chua co project_dir → tao ngay, bat dau nhu moi
+        proj = Path.cwd().resolve() / sid
+        proj.mkdir(parents=True, exist_ok=True)
+        _project_dir = proj
         _project_dir_is_placeholder = True
+        session_update(conn, sid, project_dir=str(proj))
 
 def _ensure_project_dir(requested_path: str) -> Path:
     """
-    On the FIRST write of a session, auto-create a project subdir inside cwd.
-    The name is derived from the requested path's top-level component.
-    Returns the resolved Path (may differ from original).
+    Tra ve project_dir va dam bao sandbox duoc enforce (is_placeholder=False).
+    Goi khi AI write lan dau — flip placeholder → real sandbox.
+    project_dir luon co san tu session_create(), chi can flip flag.
     """
     global _project_dir, _project_dir_is_placeholder
-    # Nếu đã có project_dir thật (không phải placeholder cwd), dùng luôn
     if _project_dir is not None and not _project_dir_is_placeholder:
         return _project_dir
 
-    p = Path(requested_path)
+    if _project_dir is not None and _project_dir_is_placeholder:
+        # path da co san tu session_create() — chi flip flag
+        # Khong clear _system_full_cache vi cache key (sid/) khong doi
+        _project_dir_is_placeholder = False
+        if _project_dir_conn and _project_dir_sid:
+            session_update(_project_dir_conn, _project_dir_sid,
+                           project_dir=str(_project_dir))
+        print(f"  {GREEN}[sandbox]{R} enforced: {DIM}{_project_dir}{R}")
+        return _project_dir
 
-    # Ưu tiên: lấy component đầu tiên của path gốc (relative hay absolute)
-    # myapp/utils.py → myapp
-    # /abs/path/myapp/utils.py → thử relative_to cwd trước
-    folder_name = ""
-
-    # Nếu path có nhiều hơn 1 component → lấy component đầu
-    # (cả relative lẫn absolute đều xử lý được)
-    try:
-        rel = p.relative_to(Path.cwd())
-        folder_name = rel.parts[0] if len(rel.parts) > 1 else ""
-    except ValueError:
-        pass
-
-    if not folder_name:
-        # Path relative không qua cwd: lấy parts[0] trực tiếp
-        parts = p.parts
-        if len(parts) > 1:
-            # Bỏ qua '/' nếu absolute
-            folder_name = parts[1] if p.is_absolute() else parts[0]
-        else:
-            # File không có thư mục cha → dùng stem làm folder
-            folder_name = p.stem or "project"
-
-    # Sanitise: only keep alphanumeric, dash, underscore, dot
-    folder_name = re.sub(r"[^\w.\-]", "_", folder_name) or "project"
-
-    proj = Path.cwd() / folder_name
+    # Fallback legacy session chua co project_dir (rat hiem)
+    sid = _project_dir_sid or "project"
+    proj = Path.cwd().resolve() / sid
     proj.mkdir(parents=True, exist_ok=True)
-
     _project_dir = proj
     _project_dir_is_placeholder = False
-    # Invalidate system prompt cache — proj_key vừa đổi từ "" → path thật,
-    # buộc build_system() build lại với sandbox section đúng ở step tiếp theo.
     _system_full_cache.clear()
     if _project_dir_conn and _project_dir_sid:
         session_update(_project_dir_conn, _project_dir_sid,
-                       project_dir=str(proj.resolve()))
-    print(f"  {GREEN}[sandbox]{R} project_dir gán: {DIM}{proj}{R}")
+                       project_dir=str(proj))
+    print(f"  {GREEN}[sandbox]{R} project_dir (fallback): {DIM}{proj}{R}")
     return proj
 
 def _resolve_to_sandbox(path: str) -> Path:
@@ -688,11 +614,19 @@ def session_create(conn, model, title="", agent=AGENT_BUILD):
     now = int(time.time())
     if not title:
         title = f"Session {datetime.fromtimestamp(now).strftime('%m-%d %H:%M')}"
-    conn.execute("INSERT INTO session VALUES (?,?,?,?,?,?,?,0,0,0,NULL,?)",
-                 (sid, title, os.getcwd(), model, agent, now, now, _active_provider))
+
+    # Tạo thư mục sandbox ngay — full absolute path, stable suốt session cho cache.
+    # is_placeholder=True: path đã có nhưng tools_fs chưa enforce sandbox read
+    # cho đến khi AI write file đầu tiên (giữ nguyên hành vi đọc project có sẵn).
+    project_dir = Path.cwd().resolve() / sid
+    project_dir.mkdir(parents=True, exist_ok=True)
+    project_dir_str = str(project_dir)
+
+    conn.execute("INSERT INTO session VALUES (?,?,?,?,?,?,?,0,0,0,?,?)",
+                 (sid, title, os.getcwd(), model, agent, now, now, project_dir_str, _active_provider))
     conn.commit()
     return {"id": sid, "title": title, "directory": os.getcwd(),
-            "model": model, "agent": agent, "project_dir": None,
+            "model": model, "agent": agent, "project_dir": project_dir_str,
             "provider": _active_provider}
 
 def session_list(conn):

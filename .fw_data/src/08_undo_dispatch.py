@@ -129,6 +129,42 @@ def tool_task(description, tools=None, model=None, api_key=None, conn=None, sid=
     sub_sys = f"""You are a focused subagent. Complete the given task and return a clear result.
 Be concise. Current directory: {os.getcwd()}"""
 
+    # C29 FIX: check _no_temperature() thay vì hardcode temperature=0.3
+    # C33 FIX: truyền x-session-affinity header như call_api_stream để Requesty cache hit
+    _sub_extra_hdrs = {}
+    if sid and _active_provider == "requesty":
+        _sub_extra_hdrs["x-session-affinity"] = sid
+
+    def _sub_urlopen(payload, timeout=60):
+        """C30 FIX: retry 429/5xx + C32 FIX: handle aws_bedrock response format."""
+        _RETRY_CODES_SUB = {429, 500, 502, 503, 504}
+        _RETRY_DELAYS_SUB = [2, 5, 10]
+        for attempt in range(3):
+            req = _provider_request("/chat/completions", api_key, payload,
+                                    extra_headers=_sub_extra_hdrs or None)
+            try:
+                if _active_provider == "aws_bedrock":
+                    resp_cm = urlopen_smart(req, api_key, payload, timeout=timeout)
+                else:
+                    resp_cm = urllib.request.urlopen(req, timeout=timeout)
+                with resp_cm as resp:
+                    body = json.loads(resp.read())
+                    if _active_provider == "aws_bedrock":
+                        # C32 FIX: parse Bedrock Converse format
+                        parsed = parse_converse_response(body)
+                        return parsed.get("text", ""), []
+                    msg = body["choices"][0]["message"]
+                    return msg.get("content", "") or "", msg.get("tool_calls") or []
+            except urllib.error.HTTPError as e:
+                if e.code in _RETRY_CODES_SUB and attempt < 2:
+                    import time as _t
+                    wait = _RETRY_DELAYS_SUB[attempt]
+                    print(f"  {YELLOW}[subagent] HTTP {e.code} — retry {attempt+1}/2 sau {wait}s...{R}", flush=True)
+                    _t.sleep(wait)
+                    continue
+                raise
+        raise RuntimeError("subagent: max retries exceeded")
+
     steps = 0
     final_text = ""
     while steps < 10:
@@ -136,15 +172,14 @@ Be concise. Current directory: {os.getcwd()}"""
         payload = {
             "model": model, "messages": [{"role":"system","content":sub_sys}]+sub_messages,
             "tools": sub_tools, "tool_choice": tc_mode,
-            "max_tokens": 8192, "temperature": 0.3, "stream": False,
+            "max_tokens": 8192, "stream": False,
         }
-        req = _provider_request("/chat/completions", api_key, payload)
+        # C29 FIX: không gửi temperature với Claude 4+
+        if not _no_temperature(model or ""):
+            payload["temperature"] = 0.3
+
         try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                body       = json.loads(resp.read())
-                msg        = body["choices"][0]["message"]
-                text       = msg.get("content","") or ""
-                tool_calls = msg.get("tool_calls") or []
+            text, tool_calls = _sub_urlopen(payload)
         except Exception as e:
             return f"[subagent error: {e}]"
 
@@ -152,12 +187,7 @@ Be concise. Current directory: {os.getcwd()}"""
         if steps == 0 and not tool_calls:
             try:
                 payload2 = dict(payload); payload2["tool_choice"] = "required"
-                req2 = _provider_request("/chat/completions", api_key, payload2)
-                with urllib.request.urlopen(req2, timeout=60) as resp2:
-                    body2      = json.loads(resp2.read())
-                    msg2       = body2["choices"][0]["message"]
-                    text2      = msg2.get("content","") or ""
-                    tool_calls2 = msg2.get("tool_calls") or []
+                text2, tool_calls2 = _sub_urlopen(payload2)
                 if tool_calls2:
                     text, tool_calls = text2, tool_calls2
             except Exception:
@@ -262,6 +292,11 @@ def _dispatch_tool(name, args, model, api_key, conn, sid):
         result = tool_set_tools(args.get("tools", []))
         return result
     if name.startswith("mcp__"):
+        # B3 FIX: trước đây return ngay tại đây, bỏ qua _check_permission()
+        # hoàn toàn — /perm mcp__server_* deny/ask không có tác dụng gì dù
+        # docstring _check_permission đã nói rõ hỗ trợ wildcard cho ca này.
+        if not _check_permission(name, args):
+            return f"[permission denied: {name}]"
         result = mcp_call_tool(name, args)
         return result
     if not _check_permission(name, args):

@@ -95,12 +95,24 @@ def compact_messages(messages, model, api_key, mode: str = "soft"):
     ] + recent
 
 def _compact_threshold(model: str) -> tuple[int, int]:
-    """Trả về (soft_threshold, hard_threshold) theo context window của model."""
+    """Trả về (soft_threshold, hard_threshold) theo context window của model.
+    Ưu tiên: exact match ID → substring match → fallback 128_000.
+    context_limits được bổ sung động từ API khi fetch_models (xem _patch_context_limits_from_api).
+    """
+    limits = _context_limits()
     model_short = model.split("/")[-1].lower()
-    for key, limit in _context_limits().items():
-        if key in model_short:
+
+    # 1. Exact match (ID đầy đủ — do _patch_context_limits_from_api ghi vào)
+    if model in limits:
+        return int(limits[model] * COMPACT_RATIO_SOFT), int(limits[model] * COMPACT_RATIO_HARD)
+
+    # 2. Substring match (key ghi cứng dạng ngắn, vd "deepseek-v3")
+    for key, limit in limits.items():
+        if key.lower() in model_short or key.lower() in model.lower():
             return int(limit * COMPACT_RATIO_SOFT), int(limit * COMPACT_RATIO_HARD)
-    return int(COMPACT_THRESHOLD * COMPACT_RATIO_SOFT), int(COMPACT_THRESHOLD * COMPACT_RATIO_HARD)
+
+    # 3. Fallback — 128K là context window phổ biến nhất hiện tại
+    return int(128_000 * COMPACT_RATIO_SOFT), int(128_000 * COMPACT_RATIO_HARD)
 
 COMPACT_TURN_THRESHOLD = 25  # compact chủ động khi history dài hơn N turns
 
@@ -146,14 +158,11 @@ def _context_bar(messages, model: str) -> str:
     """
     Render thanh context: ctx ▓▓▓▓▓░░░░░ 42%  27,420 / 65,000
     Màu: teal < 50%, vàng 50-80%, đỏ > 80%.
+    Dùng chung _compact_threshold để đảm bảo exact/substring/fallback nhất quán.
     """
     _, hard_thresh = _compact_threshold(model)
-    model_short = model.split("/")[-1].lower()
-    limit = COMPACT_THRESHOLD
-    for key, lim in _context_limits().items():
-        if key in model_short:
-            limit = lim
-            break
+    # hard_thresh = limit * COMPACT_RATIO_HARD → chia ngược ra context window thật
+    limit = int(hard_thresh / COMPACT_RATIO_HARD) if COMPACT_RATIO_HARD else 128_000
     current = estimate_tokens(messages)
     pct     = min(current / limit, 1.0) if limit else 0
     filled  = int(pct * 12)

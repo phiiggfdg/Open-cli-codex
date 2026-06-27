@@ -479,7 +479,10 @@ def _multiline_input(prompt):
     return "\n".join(lines).strip()
 
 def main():
-    global _input_history, _tool_mode
+    # B2 FIX: thiếu global cho 2 biến này khiến các lần "reset" ở /sessions
+    # và /perm bash ask (xem dưới) chỉ tạo biến local trong main(), không
+    # đụng tới biến module-level thật mà tool_bash()/_check_permission() đọc.
+    global _input_history, _tool_mode, _BASH_CONFIRMED, _bash_allow_all
     _input_history = history_load()
     choose_provider()
     api_key = get_api_key()
@@ -674,6 +677,14 @@ def main():
             _todos_init(conn, sid)
             _sandbox_init(conn, sid, session.get("project_dir"))
             _undo_stack.clear(); _redo_stack.clear()
+            # C8/C14/C26 FIX: reset session-scoped globals khi switch session
+            # Không reset → bash không cần confirm, allow-all vẫn on, file timestamps sai
+            # B2 FIX: cần "global _BASH_CONFIRMED, _bash_allow_all" ở đầu main() để
+            # 2 dòng dưới đụng đúng biến module-level (trước đây chỉ tạo local var,
+            # reset không có tác dụng — xem khai báo global ở đầu hàm main()).
+            _BASH_CONFIRMED = False
+            _bash_allow_all = False
+            _file_read_time.clear()
             print(f"{GREEN}✓ [{sid}]{R}\n"); continue
 
         if user.lower() == "/model":
@@ -691,14 +702,14 @@ def main():
 
         if user.lower() == "/sequential":
             _tool_mode = "sequential"
-            _system_static_cache.clear(); _system_full_cache.clear()  # force rebuild system prompt
+            _system_static_cache.clear()  # rebuild vì _tool_mode ko còn trong static, nhưng giữ để safe
             print(f"{YELLOW}✓ Sequential mode — từng bước, verify mỗi bước.")
             print(f"{DIM}  Tốn token hơn nhưng an toàn hơn cho project lớn.{R}")
             print(f"{DIM}  Gõ /batch để về mặc định.{R}\n"); continue
 
         if user.lower() == "/batch":
             _tool_mode = "batch"
-            _system_static_cache.clear(); _system_full_cache.clear()  # force rebuild system prompt
+            _system_static_cache.clear()  # rebuild vì _tool_mode ko còn trong static, nhưng giữ để safe
             print(f"{GREEN}✓ Batch mode — gộp tool calls, tiết kiệm token. {DIM}(mặc định){R}\n"); continue
 
         if user.lower() == "/clear":
@@ -779,15 +790,16 @@ def main():
         if user.lower() == "/sandbox":
             if _project_dir:
                 print(f"\n{BOLD}Project sandbox:{R}")
-                print(f"  {GREEN}{_project_dir}{R}")
+                print(f"  {GREEN}{_project_dir.resolve()}{R}")
                 try:
                     files = list(_project_dir.rglob("*"))
                     fcount = sum(1 for f in files if f.is_file())
-                    print(f"  {DIM}{fcount} file(s){R}")
+                    dcount = sum(1 for f in files if f.is_dir())
+                    print(f"  {DIM}{fcount} file(s), {dcount} dir(s){R}")
                 except Exception:
                     pass
             else:
-                print(f"{DIM}  (chưa có project_dir — sẽ tự tạo khi AI write lần đầu){R}")
+                print(f"{DIM}  (sandbox chua khoi tao){R}")
             print(); continue
 
         if user.lower() == "/export":
@@ -1054,7 +1066,8 @@ Write the AGENTS.md content directly. Be concise but complete."""
             print(f"{YELLOW}  Lệnh /mcp con không hợp lệ. Dùng: list, add, remove, refresh{R}\n")
             continue
 
-
+        # C4 FIX: /commit handler was dead code (after /mcp continue). Moved here.
+        if user.lower() == "/commit":
             diff = ""
             try:
                 r = subprocess.run(

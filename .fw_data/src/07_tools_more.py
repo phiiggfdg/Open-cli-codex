@@ -104,6 +104,14 @@ def _explain_tool_action(name: str, args: dict) -> str:
         if name == "task":
             return f"{YELLOW}Spawn subagent:{R} {BOLD}{args.get('description','?')[:120]}{R}"
 
+        if name.startswith("mcp__"):
+            parts = name.split("__", 2)
+            server   = parts[1] if len(parts) > 1 else "?"
+            mcp_tool = parts[2] if len(parts) > 2 else "?"
+            preview  = json.dumps(args, ensure_ascii=False)[:200]
+            return (f"{YELLOW}MCP call:{R} {BOLD}{server}.{mcp_tool}{R}\n"
+                    f"  {DIM}{preview}{R}")
+
     except Exception:
         pass  # fallback below
 
@@ -116,6 +124,11 @@ def _explain_tool_action(name: str, args: dict) -> str:
 def _sandbox_resolve_read(path: str) -> str:
     """Auto-redirect relative/outside path vào sandbox nếu file tồn tại ở đó."""
     if _project_dir is None:
+        return path
+    # C13 FIX: khi sandbox còn là placeholder (chưa có write đầu tiên),
+    # KHÔNG redirect — _resolve_to_sandbox() sẽ gọi _ensure_project_dir()
+    # và flip is_placeholder=False chỉ vì AI glob/grep.
+    if _project_dir_is_placeholder:
         return path
     p = Path(path).expanduser()
     try:
@@ -416,6 +429,12 @@ def tool_todoread():
 def tool_question(question, options=None):
     """AI hỏi user — hỗ trợ options list (opencode-style)."""
     print(f"\n{BOLD}{BLUE}❓ AI hỏi:{R} {question}")
+    # B7 FIX: model đôi khi generate options toàn chuỗi rỗng (vd ["", "", "", ""])
+    # — đã thấy thật trong session live, ra menu "1. 2. 3. 4." không có nội dung
+    # để chọn. Lọc bỏ option rỗng/chỉ-khoảng-trắng trước khi hiển thị; nếu lọc
+    # xong không còn gì, coi như không có options (rơi về free-form input).
+    if options and isinstance(options, list):
+        options = [o.strip() for o in options if isinstance(o, str) and o.strip()]
     if options and isinstance(options, list) and len(options) > 0:
         for i, opt in enumerate(options, 1):
             print(f"  {YELLOW}{i}.{R} {opt}")
@@ -427,7 +446,7 @@ def tool_question(question, options=None):
         if raw.isdigit():
             idx = int(raw) - 1
             if 0 <= idx < len(options):
-                return options[idx]
+                return options[idx]  # đã lọc rỗng ở trên, option[idx] luôn có nội dung
         return raw if raw else "(no answer)"
     try:
         answer = input(f"{CYAN}Trả lời: {R}").strip()

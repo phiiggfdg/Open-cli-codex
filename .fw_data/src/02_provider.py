@@ -321,6 +321,44 @@ PROVIDERS = {
         "parse_models":     lambda data: [],
         "rate_limit_delay": 0.0,
     },
+    "mara": {
+        "name":         "Mara Cloud",
+        # OpenAI-compatible inference API — powered by SambaNova hardware.
+        # Endpoint: https://api.cloud.mara.com/v1
+        # Model ID dạng plain string (ví dụ: "DeepSeek-V3.1", "gpt-oss-120b")
+        # Trả về token usage chuẩn OpenAI (prompt_tokens / completion_tokens).
+        # Không có cached_tokens riêng → không cần thêm vào _CACHE_PROVIDERS.
+        "base_url":     "https://api.cloud.mara.com/v1",
+        "models_url":   "https://api.cloud.mara.com/v1/models",
+        "key_check_url":"https://api.cloud.mara.com/v1/models",
+        "env_key":      "MARA_API_KEY",
+        "config_key":   "mara_api_key",
+        "fallback_models": [
+            "DeepSeek-V3.1",
+            "gpt-oss-120b",
+            "MiniMax-M2.5",
+            "MiniMax-M2.7",
+        ],
+        "context_limits": {
+            "DeepSeek-V3.1":  128_000,
+            "DeepSeek-R1":    128_000,
+            "gpt-oss-120b":   128_000,
+            "gpt-oss-20b":    128_000,
+            "MiniMax-M2.5":   128_000,
+            "MiniMax-M2.7":   128_000,
+            "Llama":          128_000,
+            "Qwen":           128_000,
+        },
+        # /v1/models trả về OpenAI-compatible format: {"data": [{"id": ...}]}
+        # Lọc bỏ embed / moderation / tts / vision / rerank
+        "parse_models": lambda data: [
+            m["id"] for m in data.get("data", [])
+            if m.get("id") and not any(x in m["id"].lower() for x in (
+                "embed", "moderation", "tts", "whisper", "dall-e", "rerank",
+            ))
+        ],
+        "rate_limit_delay": 0.0,
+    },
     "requesty": {
         "name":         "Requesty AI",
         # OpenAI-compatible gateway — route tới 550+ model từ nhiều provider.
@@ -503,45 +541,207 @@ def _provider_request(path: str, api_key: str, payload: dict | None = None,
         headers.update(extra_headers)
 
     # Requesty: gắn region header nếu đã chọn vùng
+    # B1 FIX: code cũ tự build path qua Path(__file__).parent.parent — sai vì
+    # sau khi tách module, __file__ trong namespace exec luôn là đường dẫn
+    # fw.py (loader), KHÔNG phải đường dẫn của module này. Dùng load_config()
+    # thật (CONFIG_PATH = cwd/.fw_data/config.json) — đúng nơi save_config()
+    # ghi, và load_config() đã tự bắt Exception nên không cần try/except riêng.
     if _active_provider == "requesty" and payload is not None:
-        try:
-            import json as _json
-            _cfg_path = Path(__file__).resolve().parent.parent / "config.json"
-            if not _cfg_path.exists():
-                _cfg_path = Path.home() / ".fw_data" / "config.json"
-            _region = ""
-            if _cfg_path.exists():
-                _region = _json.loads(_cfg_path.read_text()).get("requesty_region", "")
-            if _region and _region.lower() != "global":
-                headers["x-requesty-region"] = _region.lower()
-        except Exception:
-            pass
+        _region = load_config().get("requesty_region", "")
+        if _region and _region.lower() != "global":
+            headers["x-requesty-region"] = _region.lower()
 
     return urllib.request.Request(url, data=data, headers=headers)
+
+# ── Custom provider (lưu/load từ config.json) ────────────────────────────────
+def _load_custom_providers() -> dict:
+    """Load custom providers đã lưu từ config.json → {key: provider_dict}."""
+    try:
+        cfg = load_config()
+        return cfg.get("custom_providers", {})
+    except Exception:
+        return {}
+
+def _save_custom_providers(custom: dict):
+    """Ghi custom providers vào config.json."""
+    try:
+        cfg = load_config()
+        cfg["custom_providers"] = custom
+        save_config(cfg)
+    except Exception:
+        pass
+
+def _sync_custom_providers():
+    """Nạp custom providers từ config vào PROVIDERS (gọi mỗi lần cần)."""
+    custom = _load_custom_providers()
+    for k, v in custom.items():
+        PROVIDERS[k] = v
+
+def _add_custom_provider():
+    """
+    Wizard thêm provider OpenAI-compatible mới.
+    Hỏi: tên, base_url, api_key env var, models_url (auto/manual/none).
+    Lưu vào config.json và inject vào PROVIDERS ngay.
+    """
+    print(f"\n  {CYAN}{BOLD}Thêm Provider OpenAI-Compatible{R}")
+    print(f"  {DIM}Chỉ hỗ trợ format /v1/chat/completions chuẩn OpenAI.{R}\n")
+
+    def _ask(prompt, default=""):
+        hint = f" {DIM}[{default}]{R}" if default else ""
+        try:
+            val = input(f"  {YELLOW}❯{R} {prompt}{hint}: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print(); return default
+        return val or default
+
+    # ── 1. Tên hiển thị ──────────────────────────────────────────────────────
+    name = ""
+    while not name:
+        name = _ask("Tên provider (vd: My API)")
+        if not name:
+            print(f"  {RED}Bắt buộc nhập tên.{R}")
+
+    # ── 2. Base URL ───────────────────────────────────────────────────────────
+    base_url = ""
+    while not base_url:
+        base_url = _ask("Base URL (vd: https://api.example.com/v1)")
+        if not base_url:
+            print(f"  {RED}Bắt buộc nhập base URL.{R}")
+    base_url = base_url.rstrip("/")
+
+    # ── 3. Link lấy API key ───────────────────────────────────────────────────
+    print(f"\n  {DIM}Link trang lấy API key (hiện khi hỏi key lần đầu).{R}")
+    print(f"  {DIM}Bỏ trống / none nếu không có.{R}\n")
+    key_url_raw = _ask("Link API key", "none").strip()
+    key_url = "" if key_url_raw.lower() in ("none", "no", "") else key_url_raw
+
+    # ── 4. API Key env var ────────────────────────────────────────────────────
+    # Tự gợi ý từ tên (MY_API → MY_API_KEY)
+    suggested_env = name.upper().replace(" ", "_").replace("-", "_") + "_API_KEY"
+    env_key = _ask(f"Tên biến môi trường API key", suggested_env)
+
+    # config_key: lowercase slug
+    import re as _re
+    config_key = _re.sub(r"[^a-z0-9_]", "_",
+                         name.lower().replace(" ", "_")) + "_api_key"
+
+    # ── 5. Models URL ─────────────────────────────────────────────────────────
+    print(f"\n  {DIM}Models URL — nhập một trong ba:{R}")
+    print(f"  {DIM}  • URL endpoint GET /models  (vd: https://api.example.com/v1/models){R}")
+    print(f"  {DIM}  • {CYAN}auto{R}{DIM}  — tự ghép base_url + /models{R}")
+    print(f"  {DIM}  • {CYAN}none{R}{DIM}  — không có endpoint, tự nhập model bằng tay{R}\n")
+    models_url_raw = _ask("Models URL", "auto").lower()
+    if models_url_raw in ("", "auto"):
+        models_url = base_url + "/models"
+    elif models_url_raw in ("none", "không", "ko", "no"):
+        models_url = None
+    else:
+        models_url = models_url_raw
+
+    # ── 6. Fallback models ────────────────────────────────────────────────────
+    print(f"\n  {DIM}Fallback models — dùng khi không fetch được danh sách.{R}")
+    print(f"  {DIM}Nhập {CYAN}auto{R}{DIM} để tự fetch khi chọn, hoặc nhập tên model cách nhau dấu phẩy.{R}\n")
+    fb_raw = _ask("Fallback models", "auto")
+    if fb_raw.strip().lower() in ("", "auto"):
+        fallback_models = []
+    else:
+        fallback_models = [m.strip() for m in fb_raw.split(",") if m.strip()]
+
+    # ── 7. Tạo key (slug) cho PROVIDERS dict ─────────────────────────────────
+    base_key = _re.sub(r"[^a-z0-9]", "_", name.lower())[:20].strip("_")
+    # Tránh trùng với key đã có
+    prov_key = base_key
+    suffix = 2
+    while prov_key in PROVIDERS:
+        prov_key = f"{base_key}_{suffix}"; suffix += 1
+
+    # ── 8. Xây provider dict ──────────────────────────────────────────────────
+    new_prov = {
+        "name":             name,
+        "base_url":         base_url,
+        "models_url":       models_url,
+        "key_check_url":    models_url,
+        "env_key":          env_key,
+        "config_key":       config_key,
+        "fallback_models":  fallback_models,
+        "context_limits":   {},
+        "parse_models":     lambda data: [          # chuẩn OpenAI {data:[{id}]}
+            m["id"] for m in data.get("data", [])
+            if m.get("id") and not any(x in m["id"].lower() for x in (
+                "embed", "moderation", "tts", "whisper", "dall-e", "rerank",
+            ))
+        ],
+        "rate_limit_delay": 0.0,
+        "key_url":          key_url,  # link lấy key — hiện trong get_api_key wizard
+        "_custom":          True,     # đánh dấu để phân biệt
+    }
+
+    # ── 9. Lưu và inject ─────────────────────────────────────────────────────
+    PROVIDERS[prov_key] = new_prov
+    custom = _load_custom_providers()
+    # Serialise: bỏ lambda (không JSON-able), sẽ rebuild khi load lại
+    serial = {k: v for k, v in new_prov.items() if k != "parse_models"}
+    custom[prov_key] = serial
+    _save_custom_providers(custom)
+
+    print(f"\n  {GREEN}✓ Đã thêm provider:{R} {WHITE}{name}{R}"
+          f"  {DIM}(key: {prov_key}){R}\n")
+    return prov_key
+
+def _rebuild_custom_parse(prov_dict: dict) -> dict:
+    """Thêm lại parse_models lambda cho custom provider load từ JSON."""
+    if "_custom" in prov_dict and "parse_models" not in prov_dict:
+        prov_dict["parse_models"] = lambda data: [
+            m["id"] for m in data.get("data", [])
+            if m.get("id") and not any(x in m["id"].lower() for x in (
+                "embed", "moderation", "tts", "whisper", "dall-e", "rerank",
+            ))
+        ]
+    return prov_dict
 
 # ── Provider selector (gọi 1 lần khi startup) ────────────────────────────────
 def choose_provider() -> str:
     """Hiện menu chọn provider. Trả về key (vd 'fireworks', 'mistral')."""
     global _active_provider
-    keys = list(PROVIDERS.keys())
-    w = shutil.get_terminal_size((80, 20)).columns
-    box_w = min(w - 2, 56)
 
-    print()
-    print(f"  {CYAN}{BOLD}Open CLI Codex{R}  {DIM}— select provider{R}")
-    print(f"  {DIM}{'─' * box_w}{R}")
-    for i, k in enumerate(keys, 1):
-        p = PROVIDERS[k]
-        env_hint = f"{GRAY}  {p['env_key']}{R}"
-        print(f"  {YELLOW}{BOLD}{i}{R}  {WHITE}{p['name']}{R}{env_hint}")
-    print(f"  {DIM}{'─' * box_w}{R}")
-    print()
+    # Nạp custom providers đã lưu vào PROVIDERS trước khi hiện menu
+    for k, v in _load_custom_providers().items():
+        if k not in PROVIDERS:
+            PROVIDERS[k] = _rebuild_custom_parse(dict(v))
+
+    w = shutil.get_terminal_size((80, 20)).columns
+    box_w = min(w - 2, 60)
+
+    def _print_menu():
+        keys = list(PROVIDERS.keys())
+        print()
+        print(f"  {CYAN}{BOLD}Open CLI Codex{R}  {DIM}— select provider{R}")
+        print(f"  {DIM}{'─' * box_w}{R}")
+        for i, k in enumerate(keys, 1):
+            p = PROVIDERS[k]
+            tag = f" {DIM}[custom]{R}" if p.get("_custom") else ""
+            env_hint = f"{GRAY}  {p['env_key']}{R}"
+            print(f"  {YELLOW}{BOLD}{i}{R}  {WHITE}{p['name']}{R}{tag}{env_hint}")
+        print(f"  {DIM}{'─' * box_w}{R}")
+        print(f"  {YELLOW}T{R}{DIM}  Thêm provider OpenAI-compatible mới{R}")
+        print()
+        return keys
+
+    keys = _print_menu()
 
     while True:
         try:
             n = input(f"  {CYAN}❯ {DIM}[1]{R} ").strip()
             if not n:
                 n = "1"
+
+            # ── T: thêm provider mới ─────────────────────────────────────────
+            if n.lower() == "t":
+                new_key = _add_custom_provider()
+                # Vẽ lại menu (có provider mới)
+                keys = _print_menu()
+                continue
+
             idx = int(n) - 1
             if 0 <= idx < len(keys):
                 _active_provider = keys[idx]
