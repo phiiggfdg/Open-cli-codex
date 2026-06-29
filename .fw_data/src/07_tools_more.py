@@ -326,62 +326,170 @@ def tool_webfetch(url):
         return f"[error: {e}]"
 
 def tool_websearch(query, num=5):
-    """Exa AI search (no API key) — fallback to DuckDuckGo HTML scrape."""
+    """SearXNG HTML scrape (multi-instance fallback) — fallback to DuckDuckGo HTML scrape."""
     import urllib.parse
-    # ── Try Exa MCP ──────────────────────────────────────────────────────────
-    try:
-        payload = json.dumps({
-            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-            "params": {
-                "name": "search",
-                "arguments": {"query": query, "numResults": int(num)}
-            }
-        }).encode()
-        req = urllib.request.Request(
-            EXA_MCP_URL,
-            data=payload,
-            headers={"Content-Type": "application/json", "Accept": "application/json"}
-        )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read())
-            results_raw = (data.get("result") or {}).get("content") or []
-            if results_raw:
-                out = []
-                for item in results_raw[:int(num)]:
-                    if isinstance(item, dict):
-                        title   = item.get("title","")
-                        url_r   = item.get("url","")
-                        snippet = item.get("text","")[:300]
-                        out.append(f"**{title}**\n{url_r}\n{snippet}")
-                    elif isinstance(item, str):
-                        out.append(item[:400])
-                if out:
-                    return "\n\n".join(out)
-    except Exception:
-        pass
-    # ── Fallback: DuckDuckGo HTML scrape ─────────────────────────────────────
+    errors = []  # thu thập lỗi từng nhánh để debug khi cả 2 fail
+
+    # ── Nhánh 1: SearXNG public instances — scrape HTML ──────────────────────
+    # JSON API bị tắt trên hầu hết public instance nên scrape HTML.
+    # Thử từng instance theo thứ tự, dùng kết quả đầu tiên thành công.
+    # Instance list từ pwilkin/mcp-searxng-public (uptime tốt, verified 2025).
+    _SEARXNG_INSTANCES = [
+        "https://metacat.online",
+        "https://nyc1.sx.ggtyler.dev",
+        "https://ooglester.com",
+        "https://search.080609.xyz",
+        "https://search.canine.tools",
+        "https://search.catboy.house",
+        "https://search.im-in.space",
+        "https://search.indst.eu",
+    ]
+    _SEARXNG_UA = (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    )
+    q_enc = urllib.parse.quote_plus(query)
+
+    for base in _SEARXNG_INSTANCES:
+        try:
+            url = f"{base}/search?q={q_enc}&language=en&safesearch=0"
+            req = urllib.request.Request(url, headers={
+                "User-Agent": _SEARXNG_UA,
+                "Accept-Language": "en-US,en;q=0.9",
+            })
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                html = resp.read().decode("utf-8", errors="replace")
+
+            results = []
+            seen_urls = set()
+
+            # SearXNG HTML markup: <article class="result"> chứa
+            # <h3><a href="...">title</a></h3> và <p class="content">snippet</p>
+            for m in re.finditer(
+                r'<article[^>]+class="[^"]*result[^"]*"[^>]*>.*?'
+                r'<h3[^>]*>.*?<a[^>]+href="(https?://[^"]+)"[^>]*>(.*?)</a>.*?</h3>'
+                r'(?:.*?<p[^>]+class="[^"]*content[^"]*"[^>]*>(.*?)</p>)?',
+                html, re.DOTALL
+            ):
+                url_r   = m.group(1)
+                title   = re.sub(r"<[^>]+>", "", m.group(2)).strip()
+                snippet = re.sub(r"<[^>]+>", "", m.group(3) or "").strip()[:250]
+                if url_r not in seen_urls and title:
+                    seen_urls.add(url_r)
+                    results.append(f"**{title}**\n{url_r}\n{snippet}" if snippet
+                                   else f"**{title}**\n{url_r}")
+                if len(results) >= int(num):
+                    break
+
+            # Fallback pattern nếu markup khác: tìm link h3 trực tiếp
+            if not results:
+                for m in re.finditer(
+                    r'<h3[^>]*>.*?<a[^>]+href="(https?://[^"#][^"]+)"[^>]*>(.*?)</a>',
+                    html, re.DOTALL
+                ):
+                    url_r = m.group(1)
+                    title = re.sub(r"<[^>]+>", "", m.group(2)).strip()
+                    if url_r not in seen_urls and title and len(title) > 5:
+                        seen_urls.add(url_r)
+                        results.append(f"**{title}**\n{url_r}")
+                    if len(results) >= int(num):
+                        break
+
+            if results:
+                return "\n\n".join(results)
+            errors.append(f"SearXNG {base}: HTML ok ({len(html)}b) nhưng không parse được")
+        except Exception as e:
+            errors.append(f"SearXNG {base}: {type(e).__name__}: {e}")
+            continue
+
+    # ── Nhánh 2: DuckDuckGo HTML scrape ──────────────────────────────────────
+    # Scrape html.duckduckgo.com — không cần API key, không JS.
+    # DDG thay đổi markup theo thời gian — thử nhiều pattern theo thứ tự:
+    #   Pattern A: class="result__a" + class="result__snippet" (markup cũ)
+    #   Pattern B: data-testid hoặc class chứa "result" (markup mới hơn)
+    #   Pattern C: extract từ uddg= redirect link (robust hơn, ít bị break)
+    # Fail hoặc 0 kết quả → trả "(no results)" kèm debug info.
     try:
         q   = urllib.parse.quote_plus(query)
         url = f"https://html.duckduckgo.com/html/?q={q}"
         req = urllib.request.Request(url, headers={
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
         })
         with urllib.request.urlopen(req, timeout=10) as resp:
             html = resp.read().decode("utf-8", errors="replace")
+
         results = []
+        seen_urls = set()
+
+        # Pattern A: markup cũ — result__a + result__snippet
         for m in re.finditer(
-            r'<a[^>]+class="result__a"[^>]*href="([^"]+)"[^>]*>([^<]+)</a>.*?'
-            r'<a[^>]+class="result__snippet"[^>]*>([^<]*)</a>',
+            r'<a[^>]+class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>.*?'
+            r'class="result__snippet"[^>]*>(.*?)</(?:a|span)>',
             html, re.DOTALL
         ):
-            url_r, title, snippet = m.group(1), m.group(2), m.group(3)
-            title   = re.sub(r"<[^>]+>","",title).strip()
-            snippet = re.sub(r"<[^>]+>","",snippet).strip()
-            results.append(f"**{title}**\n{url_r}\n{snippet}")
-            if len(results) >= int(num): break
-        return "\n\n".join(results) if results else f"(no results for: {query})"
+            url_r   = urllib.parse.unquote(m.group(1))
+            title   = re.sub(r"<[^>]+>", "", m.group(2)).strip()
+            snippet = re.sub(r"<[^>]+>", "", m.group(3)).strip()
+            if url_r not in seen_urls and url_r.startswith("http"):
+                seen_urls.add(url_r)
+                results.append(f"**{title}**\n{url_r}\n{snippet}")
+            if len(results) >= int(num):
+                break
+
+        # Pattern B: markup mới — block result giới hạn 2000 chars tránh greedy
+        if not results:
+            for m in re.finditer(
+                r'<(?:h2|h3)[^>]*>.*?<a[^>]+href="(https?://[^"]+)"[^>]*>'
+                r'(.*?)</a>.*?</(?:h2|h3)>(.{0,500}?)'
+                r'(?=<(?:h2|h3)|<div[^>]+class="result|$)',
+                html, re.DOTALL
+            ):
+                url_r   = m.group(1)
+                title   = re.sub(r"<[^>]+>", "", m.group(2)).strip()
+                snippet = re.sub(r"<[^>]+>", "", m.group(3)).strip()[:200]
+                if url_r not in seen_urls and title:
+                    seen_urls.add(url_r)
+                    results.append(f"**{title}**\n{url_r}\n{snippet}")
+                if len(results) >= int(num):
+                    break
+
+        # Pattern C: uddg= redirect links — robust nhất khi markup thay đổi
+        if not results:
+            for m in re.finditer(
+                r'>([^<]{5,80})</[^>]+>\s*(?:<[^>]+>\s*)*'
+                r'<a[^>]+uddg=(https?%3A%2F%2F[^&"]+)',
+                html
+            ):
+                title = m.group(1).strip()
+                url_r = urllib.parse.unquote(m.group(2))
+                if url_r not in seen_urls:
+                    seen_urls.add(url_r)
+                    results.append(f"**{title}**\n{url_r}")
+                if len(results) >= int(num):
+                    break
+            # fallback: chỉ URL nếu vẫn không có title
+            if not results:
+                for m in re.finditer(r'uddg=(https?%3A%2F%2F[^&"]+)', html):
+                    url_r = urllib.parse.unquote(m.group(1))
+                    if url_r not in seen_urls:
+                        seen_urls.add(url_r)
+                        results.append(url_r)
+                    if len(results) >= int(num):
+                        break
+
+        if results:
+            return "\n\n".join(results)
+        errors.append(f"DDG: HTML ok ({len(html)} bytes) nhưng regex không match")
     except Exception as e:
-        return f"[error: {e}]"
+        errors.append(f"DDG: {e}")
+
+    # Cả 2 nhánh fail — trả debug info để biết nguyên nhân
+    debug = " | ".join(errors) if errors else "unknown"
+    return f"(no results for: {query}) [debug: {debug}]"
 
 # Global todo state per session (in-memory, backed by DB)
 _todos: list = []

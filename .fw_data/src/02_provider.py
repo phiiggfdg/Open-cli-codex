@@ -2,8 +2,6 @@
 # Tất cả config liên quan đến AI provider tập trung tại đây.
 # Để thêm provider mới: thêm 1 entry vào PROVIDERS dict bên dưới.
 
-EXA_MCP_URL = "https://mcp.exa.ai/mcp"
-
 # ── Provider registry ─────────────────────────────────────────────────────────
 # Mỗi provider là 1 dict với các keys bắt buộc:
 #   name          : tên hiển thị
@@ -526,6 +524,25 @@ def _provider_request(path: str, api_key: str, payload: dict | None = None,
         return build_request(bedrock_path, api_key, bedrock_payload,
                               extra_headers=extra_headers)
 
+    # Anthropic Messages API format (custom provider với format_anthropic=True)
+    if _prov().get("format_anthropic"):
+        # path vào đây là:
+        #   - URL đầy đủ (key_check_url, models_url): "https://...../models"
+        #   - path tương đối từ call_api_stream: "/chat/completions"
+        # build_anthropic_request đã tự handle startswith("http"):
+        #   - URL đầy đủ → dùng trực tiếp
+        #   - path tương đối → ghép base_url + path
+        # Chỉ cần dịch "/chat/completions" → "/messages" cho chat.
+        anth_path = "/messages" if path == "/chat/completions" else path
+        return build_anthropic_request(
+            anth_path, api_key,
+            payload=payload,
+            extra_headers=extra_headers,
+            base_url=_prov().get("base_url", "https://api.anthropic.com/v1"),
+            anthropic_version=_prov().get("anthropic_version", ANTHROPIC_DEFAULT_VERSION),
+            auth_mode=_prov().get("anthropic_auth_mode", "x-api-key"),
+        )
+
     base = _base_url()
     url  = path if path.startswith("http") else f"{base}{path}"
     headers = {
@@ -571,20 +588,14 @@ def _save_custom_providers(custom: dict):
     except Exception:
         pass
 
-def _sync_custom_providers():
-    """Nạp custom providers từ config vào PROVIDERS (gọi mỗi lần cần)."""
-    custom = _load_custom_providers()
-    for k, v in custom.items():
-        PROVIDERS[k] = v
-
 def _add_custom_provider():
     """
     Wizard thêm provider OpenAI-compatible mới.
     Hỏi: tên, base_url, api_key env var, models_url (auto/manual/none).
     Lưu vào config.json và inject vào PROVIDERS ngay.
     """
-    print(f"\n  {CYAN}{BOLD}Thêm Provider OpenAI-Compatible{R}")
-    print(f"  {DIM}Chỉ hỗ trợ format /v1/chat/completions chuẩn OpenAI.{R}\n")
+    print(f"\n  {CYAN}{BOLD}Thêm Provider OpenAI-Compatible / Anthropic{R}")
+    print(f"  {DIM}Hỗ trợ: format OpenAI (/v1/chat/completions) và Anthropic Messages API.{R}\n")
 
     def _ask(prompt, default=""):
         hint = f" {DIM}[{default}]{R}" if default else ""
@@ -602,6 +613,17 @@ def _add_custom_provider():
             print(f"  {RED}Bắt buộc nhập tên.{R}")
 
     # ── 2. Base URL ───────────────────────────────────────────────────────────
+    # Nhận diện thông minh: nếu user dán URL có endpoint path, tự strip về base
+    # và gợi ý format phù hợp làm default cho bước kế tiếp.
+    #
+    # Ví dụ:
+    #   https://api.openmodel.ai/v1/messages      → base: .../v1  | suggest: anthropic
+    #   https://api.openmodel.ai/v1/chat/completions → base: .../v1 | suggest: openai
+    #   https://api.openmodel.ai/v1               → base: .../v1  | suggest: không đổi
+    _ANTHROPIC_SUFFIXES = ("/messages", "/v1/messages")
+    _OPENAI_SUFFIXES    = ("/chat/completions", "/v1/chat/completions")
+    _fmt_suggest = None   # None = chưa đủ thông tin để gợi ý
+
     base_url = ""
     while not base_url:
         base_url = _ask("Base URL (vd: https://api.example.com/v1)")
@@ -609,7 +631,41 @@ def _add_custom_provider():
             print(f"  {RED}Bắt buộc nhập base URL.{R}")
     base_url = base_url.rstrip("/")
 
-    # ── 3. Link lấy API key ───────────────────────────────────────────────────
+    # Detect và strip endpoint suffix nếu có
+    _stripped = False
+    for _sfx in _ANTHROPIC_SUFFIXES:
+        if base_url.endswith(_sfx):
+            base_url = base_url[:-len(_sfx)].rstrip("/")
+            _fmt_suggest = "anthropic"
+            _stripped = True
+            break
+    if not _stripped:
+        for _sfx in _OPENAI_SUFFIXES:
+            if base_url.endswith(_sfx):
+                base_url = base_url[:-len(_sfx)].rstrip("/")
+                _fmt_suggest = "openai"
+                _stripped = True
+                break
+
+    if _stripped:
+        _suggest_label = "Anthropic" if _fmt_suggest == "anthropic" else "OpenAI"
+        print(f"  {GREEN}✓ Base URL:{R} {WHITE}{base_url}{R}"
+              f"  {DIM}(đã strip endpoint path, gợi ý format: {_suggest_label}){R}")
+
+    # ── 3. Format API ─────────────────────────────────────────────────────────
+    # Default gợi ý từ URL nếu detect được, không thì mặc định openai (1)
+    _fmt_default = "2" if _fmt_suggest == "anthropic" else "1"
+    print(f"\n  {DIM}Format API:{R}")
+    print(f"  {YELLOW}1{R}  OpenAI-compatible  {DIM}(/v1/chat/completions){R}")
+    print(f"  {YELLOW}2{R}  Anthropic Messages API  {DIM}(/v1/messages, SSE Anthropic-style){R}\n")
+    fmt_raw = _ask("Chọn format", _fmt_default).strip()
+    use_anthropic_format = (fmt_raw == "2")
+    if use_anthropic_format:
+        print(f"  {GREEN}✓ Dùng Anthropic Messages API format.{R}\n")
+    else:
+        print(f"  {GREEN}✓ Dùng OpenAI-compatible format.{R}\n")
+
+    # ── 4. Link lấy API key ───────────────────────────────────────────────────
     print(f"\n  {DIM}Link trang lấy API key (hiện khi hỏi key lần đầu).{R}")
     print(f"  {DIM}Bỏ trống / none nếu không có.{R}\n")
     key_url_raw = _ask("Link API key", "none").strip()
@@ -656,6 +712,17 @@ def _add_custom_provider():
         prov_key = f"{base_key}_{suffix}"; suffix += 1
 
     # ── 8. Xây provider dict ──────────────────────────────────────────────────
+    # parse_models mặc định theo format
+    if use_anthropic_format:
+        _default_parse = lambda data: parse_anthropic_models(data)  # noqa: E731
+    else:
+        _default_parse = lambda data: [          # chuẩn OpenAI {data:[{id}]}  # noqa: E731
+            m["id"] for m in data.get("data", [])
+            if m.get("id") and not any(x in m["id"].lower() for x in (
+                "embed", "moderation", "tts", "whisper", "dall-e", "rerank",
+            ))
+        ]
+
     new_prov = {
         "name":             name,
         "base_url":         base_url,
@@ -665,15 +732,11 @@ def _add_custom_provider():
         "config_key":       config_key,
         "fallback_models":  fallback_models,
         "context_limits":   {},
-        "parse_models":     lambda data: [          # chuẩn OpenAI {data:[{id}]}
-            m["id"] for m in data.get("data", [])
-            if m.get("id") and not any(x in m["id"].lower() for x in (
-                "embed", "moderation", "tts", "whisper", "dall-e", "rerank",
-            ))
-        ],
+        "parse_models":     _default_parse,
         "rate_limit_delay": 0.0,
         "key_url":          key_url,  # link lấy key — hiện trong get_api_key wizard
         "_custom":          True,     # đánh dấu để phân biệt
+        "format_anthropic": use_anthropic_format,  # True → dùng Anthropic Messages API
     }
 
     # ── 9. Lưu và inject ─────────────────────────────────────────────────────
@@ -691,12 +754,15 @@ def _add_custom_provider():
 def _rebuild_custom_parse(prov_dict: dict) -> dict:
     """Thêm lại parse_models lambda cho custom provider load từ JSON."""
     if "_custom" in prov_dict and "parse_models" not in prov_dict:
-        prov_dict["parse_models"] = lambda data: [
-            m["id"] for m in data.get("data", [])
-            if m.get("id") and not any(x in m["id"].lower() for x in (
-                "embed", "moderation", "tts", "whisper", "dall-e", "rerank",
-            ))
-        ]
+        if prov_dict.get("format_anthropic"):
+            prov_dict["parse_models"] = lambda data: parse_anthropic_models(data)
+        else:
+            prov_dict["parse_models"] = lambda data: [
+                m["id"] for m in data.get("data", [])
+                if m.get("id") and not any(x in m["id"].lower() for x in (
+                    "embed", "moderation", "tts", "whisper", "dall-e", "rerank",
+                ))
+            ]
     return prov_dict
 
 # ── Provider selector (gọi 1 lần khi startup) ────────────────────────────────

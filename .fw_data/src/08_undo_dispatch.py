@@ -136,7 +136,31 @@ Be concise. Current directory: {os.getcwd()}"""
         _sub_extra_hdrs["x-session-affinity"] = sid
 
     def _sub_urlopen(payload, timeout=60):
-        """C30 FIX: retry 429/5xx + C32 FIX: handle aws_bedrock response format."""
+        # Gọi API non-stream và trả về (text, tool_calls) chuẩn hoá.
+        # 3 nhánh parse response, khớp đúng với 3 nhánh request trong _provider_request:
+        #
+        #   Nhánh 1 — aws_bedrock:
+        #     _provider_request → build Converse API request (urlopen_smart)
+        #     response format  → Converse JSON (khác OpenAI hoàn toàn)
+        #     parse            → parse_converse_response() → (text, [])
+        #     tool_calls       → [] — subagent Bedrock không dùng tool (giới hạn hiện tại)
+        #
+        #   Nhánh 2 — format_anthropic (custom provider dùng Anthropic Messages API):
+        #     _provider_request → build_anthropic_request, dịch payload qua _to_anthropic_payload
+        #                         "/chat/completions" → "/messages" tự động
+        #     response format  → {"content": [{"type":"text",...}, {"type":"tool_use",...}]}
+        #     parse            → extract text + convert tool_use → OpenAI tool_calls format
+        #     tool_calls       → list OpenAI-style để loop tool_task xử lý bình thường
+        #     sub_messages     → append OpenAI-style; lần gọi sau _to_anthropic_payload convert lại
+        #
+        #   Nhánh 3 — OpenAI-compat (tất cả provider còn lại):
+        #     _provider_request → standard Bearer request
+        #     response format  → {"choices": [{"message": {"content":..., "tool_calls":[...]}}]}
+        #     parse            → choices[0]["message"] trực tiếp
+        #
+        # C30 FIX: retry 429/5xx
+        # C32 FIX: handle aws_bedrock Converse format (nhánh 1)
+        # C3X FIX: handle format_anthropic tool_calls (nhánh 2) — trước chỉ parse text, bỏ tool_use
         _RETRY_CODES_SUB = {429, 500, 502, 503, 504}
         _RETRY_DELAYS_SUB = [2, 5, 10]
         for attempt in range(3):
@@ -149,10 +173,39 @@ Be concise. Current directory: {os.getcwd()}"""
                     resp_cm = urllib.request.urlopen(req, timeout=timeout)
                 with resp_cm as resp:
                     body = json.loads(resp.read())
+
+                    # Nhánh 1: AWS Bedrock — Converse API format
                     if _active_provider == "aws_bedrock":
-                        # C32 FIX: parse Bedrock Converse format
                         parsed = parse_converse_response(body)
-                        return parsed.get("text", ""), []
+                        return parsed.get("text", ""), parsed.get("tool_calls", [])
+
+                    # Nhánh 2: Anthropic Messages API (custom provider format_anthropic=True)
+                    # response: {"content": [{"type":"text","text":"..."},
+                    #                        {"type":"tool_use","id":"...","name":"...","input":{}}]}
+                    if _prov().get("format_anthropic"):
+                        content_blocks = body.get("content", [])
+                        text = "".join(
+                            b.get("text", "") for b in content_blocks
+                            if b.get("type") == "text"
+                        )
+                        # Convert tool_use → OpenAI tool_calls format
+                        # để loop tool_task và _dispatch_tool xử lý bình thường.
+                        # sub_messages lưu OpenAI-style; _to_anthropic_payload sẽ
+                        # convert lại sang tool_use khi gọi API vòng tiếp theo.
+                        tool_calls_sub = []
+                        for b in content_blocks:
+                            if b.get("type") == "tool_use":
+                                tool_calls_sub.append({
+                                    "id": b.get("id", ""),
+                                    "type": "function",
+                                    "function": {
+                                        "name": b.get("name", ""),
+                                        "arguments": json.dumps(b.get("input", {})),
+                                    },
+                                })
+                        return text, tool_calls_sub
+
+                    # Nhánh 3: OpenAI-compat (tất cả provider còn lại)
                     msg = body["choices"][0]["message"]
                     return msg.get("content", "") or "", msg.get("tool_calls") or []
             except urllib.error.HTTPError as e:

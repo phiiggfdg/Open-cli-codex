@@ -15,12 +15,9 @@ def mcp_is_active() -> bool:
     """MCP chỉ dùng khi provider active hỗ trợ (commandcode)."""
     return bool(_prov().get("mcp_capable"))
 
-# Default MCP servers — tự động thêm vào config lần đầu nếu user chưa cấu hình
-# gì, để người mới không cần biết cú pháp /mcp add vẫn có sẵn web search.
-_DEFAULT_MCP_SERVERS = {
-    "exa": {"transport": "http", "url": "https://mcp.exa.ai/mcp",
-            "headers": {}, "enabled": True},
-}
+# Default MCP servers — rỗng. Web search đã có sẵn qua tool nội bộ `websearch`
+# (SearXNG HTML scrape + fallback DDG), không cần MCP server mặc định nào.
+_DEFAULT_MCP_SERVERS: dict = {}
 
 def mcp_servers_load() -> dict:
     cfg = load_config()

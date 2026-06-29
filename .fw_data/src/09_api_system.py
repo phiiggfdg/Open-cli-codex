@@ -90,9 +90,33 @@ def get_api_key():
                 print(f"\r{GREEN}✓ Key hợp lệ!{R}           ")
             except urllib.error.HTTPError as e:
                 if e.code == 401:
-                    print(f"\r{RED}✗ Key không hợp lệ (401). Thử lại.{R}")
-                    continue
-                print(f"\r{YELLOW}⚠ Không thể xác nhận (HTTP {e.code}), tiếp tục.{R}")
+                    # Một số gateway custom dùng format_anthropic cho /messages
+                    # nhưng endpoint /models (key_check_url) lại chỉ chấp nhận
+                    # Authorization: Bearer thay vì x-api-key (vd: OpenModel.ai).
+                    # Thử lại 1 lần với Bearer; nếu đúng, LƯU LẠI vào provider
+                    # dict (anthropic_auth_mode) để mọi request sau (chat,
+                    # fetch_models...) dùng đúng ngay từ đầu — không cần
+                    # thử-sai lại mỗi lần gọi.
+                    if p.get("format_anthropic"):
+                        try:
+                            req2 = build_anthropic_request(
+                                p["key_check_url"], key, payload=None,
+                                base_url=p.get("base_url", "https://api.anthropic.com/v1"),
+                                anthropic_version=p.get("anthropic_version", ANTHROPIC_DEFAULT_VERSION),
+                                auth_mode="bearer",
+                            )
+                            with urllib.request.urlopen(req2, timeout=8):
+                                pass
+                            p["anthropic_auth_mode"] = "bearer"
+                            print(f"\r{GREEN}✓ Key hợp lệ!{R}           ")
+                        except Exception:
+                            print(f"\r{RED}✗ Key không hợp lệ (401). Thử lại.{R}")
+                            continue
+                    else:
+                        print(f"\r{RED}✗ Key không hợp lệ (401). Thử lại.{R}")
+                        continue
+                else:
+                    print(f"\r{YELLOW}⚠ Không thể xác nhận (HTTP {e.code}), tiếp tục.{R}")
             except ValueError as e:
                 # Lỗi format credentials (vd parse_credentials của aws.py) —
                 # đây là lỗi rõ ràng, không phải lỗi mạng, không cho qua.
@@ -112,6 +136,15 @@ def get_api_key():
             cfg[p["config_key"]] = key
             save_config(cfg)
             print(f"{GREEN}✓ Đã lưu → {CONFIG_PATH}{R}")
+        # Custom provider + vừa xác định auth_mode (bearer) qua fallback ở
+        # trên → lưu lại vào custom_providers để lần load sau (qua
+        # _rebuild_custom_parse/choose_provider) không bị mất, không phải
+        # thử-sai lại mỗi lần.
+        if p.get("_custom") and p.get("anthropic_auth_mode"):
+            custom = _load_custom_providers()
+            if _active_provider in custom:
+                custom[_active_provider]["anthropic_auth_mode"] = p["anthropic_auth_mode"]
+                _save_custom_providers(custom)
         return key
 
 def _patch_context_limits_from_api(data: dict):
@@ -581,6 +614,18 @@ def _call_simple(messages, model, api_key):
                     # Response Converse (non-stream) có schema khác OpenAI —
                     # dịch lại qua aws.py thay vì parse trực tiếp ở đây.
                     return parse_converse_response(body)
+                if _prov().get("format_anthropic"):
+                    # Anthropic non-stream: {"content": [{"type":"text","text":"..."},
+                    #                                    {"type":"tool_use",...}]}
+                    # _call_simple chỉ dùng cho text-only tasks (compact, rename,
+                    # commit, review) — không cần tool_calls, bỏ tool_use blocks.
+                    # Nếu cần tool_calls từ Anthropic non-stream, xem _sub_urlopen
+                    # trong 08_undo_dispatch.py — parse đầy đủ cả tool_use.
+                    text = "".join(
+                        b.get("text", "") for b in body.get("content", [])
+                        if b.get("type") == "text"
+                    )
+                    return {"text": text, "tool_calls": []}
                 msg = body["choices"][0]["message"]
                 return {"text": msg.get("content", ""), "tool_calls": []}
         except urllib.error.HTTPError as e:
@@ -689,7 +734,7 @@ def call_api_stream(messages, model, api_key, tool_choice="auto", session_id=Non
         payload["temperature"] = 0.3
     if _active_provider == "mercury":
         payload["reasoning_effort"] = "low"
-    if _active_provider in ("cohere", "cerebras"):
+    if _active_provider in ("cohere", "cerebras", "upstage"):
         # Cohere + Cerebras không hỗ trợ parallel_tool_calls → trả 422 nếu gửi.
         del payload["parallel_tool_calls"]
     if _active_provider == "cerebras":
@@ -720,7 +765,10 @@ def call_api_stream(messages, model, api_key, tool_choice="auto", session_id=Non
                 resp_cm = urllib.request.urlopen(req, timeout=180)
             with resp_cm as resp:
                 stream_src = (wrap_stream_response(resp)
-                              if _active_provider == "aws_bedrock" else resp)
+                              if _active_provider == "aws_bedrock"
+                              else wrap_anthropic_stream(resp)
+                              if _prov().get("format_anthropic")
+                              else resp)
                 finish_reason = _stream_response(
                     stream_src, text_parts, tc_raw, usage, spinner_ref)
             _rate_limit_mark()

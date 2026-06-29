@@ -41,7 +41,13 @@ _BASH_DENY_RE = re.compile("|".join(_BASH_DENY_PATTERNS))
 
 # ── Bash safety gates ───────────────────────────────────────────────────────
 # Giữ hành vi cũ (shell=True) nhưng thêm confirm + allowlist tối thiểu.
-# User có thể /perm bash allow để bỏ confirm.
+# Có 2 lớp permission độc lập:
+#   Lớp 1 — _check_permission() trong 10_main.py: hỏi "Allow? [y/N/a]"
+#            /perm bash allow chỉ ảnh hưởng lớp này (bỏ câu hỏi confirm).
+#   Lớp 2 — allowlist dưới đây (_BASH_ALLOW_RE / _BASH_CONFIRMED): chặn
+#            lệnh không nằm trong danh sách (git/pytest/python/node/npm/make).
+#            /perm bash allow KHÔNG tắt lớp này — 2 lớp hoàn toàn độc lập.
+#            _BASH_CONFIRMED chỉ tự set True khi 1 lệnh hợp lệ đã chạy qua.
 _BASH_CONFIRM_EVERY_SESSION = True
 _BASH_ALLOWLIST = [
     r"^git\b",

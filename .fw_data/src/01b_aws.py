@@ -250,23 +250,41 @@ def _to_converse_payload(payload: dict) -> dict:
     system_blocks = []
     converse_messages = []
 
+    # Gom consecutive role=tool vào 1 message user duy nhất.
+    # Bedrock Converse yêu cầu tất cả toolResult liên tiếp nằm trong
+    # 1 message user với nhiều toolResult blocks — không được tách thành
+    # nhiều message user riêng lẻ (sẽ gây HTTP 400 "messages must alternate").
+    # OpenAI-compat giữ chúng là nhiều message role=tool riêng → cần gom ở đây.
+    # Thuật toán: buffer các tool message liên tiếp, flush thành 1 message
+    # khi gặp message không phải tool.
+    pending_tool_results: list = []
+
+    def _flush_tool_results():
+        if pending_tool_results:
+            converse_messages.append({
+                "role": "user",
+                "content": list(pending_tool_results),
+            })
+            pending_tool_results.clear()
+
     for m in messages:
         role = m.get("role")
         if role == "system":
+            _flush_tool_results()
             system_blocks.append({"text": m.get("content", "")})
             continue
         if role == "tool":
-            converse_messages.append({
-                "role": "user",
-                "content": [{
-                    "toolResult": {
-                        "toolUseId": m.get("tool_call_id", ""),
-                        "content": [{"text": m.get("content", "")}],
-                    }
-                }],
+            # Buffer — chưa flush, chờ gom đủ các tool results liên tiếp
+            pending_tool_results.append({
+                "toolResult": {
+                    "toolUseId": m.get("tool_call_id", ""),
+                    "content": [{"text": m.get("content", "")}],
+                }
             })
             continue
 
+        # Gặp message không phải tool → flush buffer trước
+        _flush_tool_results()
         content = []
         if m.get("content"):
             content.append({"text": m["content"]})
@@ -286,6 +304,9 @@ def _to_converse_payload(payload: dict) -> dict:
             "role": "assistant" if role == "assistant" else "user",
             "content": content or [{"text": ""}],
         })
+
+    # Flush tool results còn lại cuối list
+    _flush_tool_results()
 
     out = {
         "messages": converse_messages,
@@ -529,10 +550,21 @@ def parse_converse_response(body: dict) -> dict:
     """
     msg = body.get("output", {}).get("message", {})
     text = ""
+    tool_calls = []
     for block in msg.get("content", []):
         if "text" in block:
             text += block["text"]
-    return {"text": text, "tool_calls": []}
+        elif "toolUse" in block:
+            tu = block["toolUse"]
+            tool_calls.append({
+                "id": tu.get("toolUseId", ""),
+                "type": "function",
+                "function": {
+                    "name": tu.get("name", ""),
+                    "arguments": json.dumps(tu.get("input", {})),
+                },
+            })
+    return {"text": text, "tool_calls": tool_calls}
 
 
 # ── Models list (ListFoundationModels) ─────────────────────────────────────
