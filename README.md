@@ -26,6 +26,68 @@
 
 ---
 
+<div align="center">
+
+## 📖 Documentation
+
+**Full guides live on the [project Wiki](https://github.com/phiiggfdg/Open-cli-codex/wiki)** — click any card below.
+
+</div>
+
+<table>
+<tr>
+<td width="33%" valign="top">
+
+### 🚀 Getting Started
+
+- 🏠 **[Wiki Home](https://github.com/phiiggfdg/Open-cli-codex/wiki/Home)**
+  Overview, quick start, navigation
+- 📦 **[Installation](https://github.com/phiiggfdg/Open-cli-codex/wiki/Installation)**
+  pip install, run directly, Termux/Android
+- 🔌 **[Providers](https://github.com/phiiggfdg/Open-cli-codex/wiki/Providers)**
+  12 built-in providers + custom provider wizard
+
+</td>
+<td width="33%" valign="top">
+
+### 🧠 Core Concepts
+
+- 🏗️ **[Architecture](https://github.com/phiiggfdg/Open-cli-codex/wiki/Architecture)**
+  Module map, shared `exec()` namespace, load order
+- 🛠️ **[Agent Tools](https://github.com/phiiggfdg/Open-cli-codex/wiki/Agent-Tools)**
+  All 20 built-in tools, grouped by category
+- 🔒 **[Permissions & Sandbox](https://github.com/phiiggfdg/Open-cli-codex/wiki/Permissions-&-Sandbox)**
+  Agent modes, per-tool permissions, sandboxing
+
+</td>
+<td width="33%" valign="top">
+
+### ⚙️ Usage & Config
+
+- ⌨️ **[Slash Commands](https://github.com/phiiggfdg/Open-cli-codex/wiki/Slash-Commands)**
+  Every `/` command in the REPL
+- 🧩 **[Custom Commands](https://github.com/phiiggfdg/Open-cli-codex/wiki/Custom-Commands)**
+  Build your own slash commands
+- 🔗 **[MCP Integration](https://github.com/phiiggfdg/Open-cli-codex/wiki/MCP-Integration)**
+  Model Context Protocol support
+- 🗂️ **[Configuration](https://github.com/phiiggfdg/Open-cli-codex/wiki/Configuration)**
+  config.json, AGENTS.md, checkpoints, cache
+- ❓ **[FAQ & Troubleshooting](https://github.com/phiiggfdg/Open-cli-codex/wiki/FAQ-&-Troubleshooting)**
+  Common issues and fixes
+
+</td>
+</tr>
+</table>
+
+<div align="center">
+
+[![Wiki](https://img.shields.io/badge/docs-wiki-blueviolet?logo=githubpages&logoColor=white)](https://github.com/phiiggfdg/Open-cli-codex/wiki)
+[![Pages](https://img.shields.io/badge/pages-11-informational)](https://github.com/phiiggfdg/Open-cli-codex/wiki)
+
+</div>
+
+---
+
 ## Table of Contents
 
 - [Ownership](#ownership)
