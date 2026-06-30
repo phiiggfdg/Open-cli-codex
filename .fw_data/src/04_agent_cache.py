@@ -29,7 +29,7 @@ DEFAULT_PERMS = {
 
 # Plan-mode overrides (read-only)
 PLAN_PERMS = {
-    "bash":        PERM_ASK,
+    "bash":        PERM_DENY,
     "write":       PERM_DENY,
     "extract":     PERM_DENY,
     "edit":        PERM_DENY,
@@ -547,6 +547,7 @@ def db_connect():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS session (
             id           TEXT PRIMARY KEY,
@@ -583,7 +584,8 @@ def db_connect():
             path        TEXT NOT NULL,
             before      TEXT,
             after       TEXT NOT NULL,
-            created_at  INTEGER NOT NULL
+            created_at  INTEGER NOT NULL,
+            undone      INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS checkpoint (
             id          TEXT PRIMARY KEY,
@@ -606,6 +608,12 @@ def db_connect():
     if "provider" not in cols:
         conn.execute("ALTER TABLE session ADD COLUMN provider TEXT DEFAULT ''")
         conn.commit()
+    snapshot_cols = [r[1] for r in conn.execute(
+        "PRAGMA table_info(file_snapshot)").fetchall()]
+    if "undone" not in snapshot_cols:
+        conn.execute(
+            "ALTER TABLE file_snapshot ADD COLUMN undone INTEGER NOT NULL DEFAULT 0")
+        conn.commit()
     conn.commit()
     return conn
 
@@ -622,8 +630,13 @@ def session_create(conn, model, title="", agent=AGENT_BUILD):
     project_dir.mkdir(parents=True, exist_ok=True)
     project_dir_str = str(project_dir)
 
-    conn.execute("INSERT INTO session VALUES (?,?,?,?,?,?,?,0,0,0,?,?)",
-                 (sid, title, os.getcwd(), model, agent, now, now, project_dir_str, _active_provider))
+    conn.execute("""
+        INSERT INTO session
+            (id,title,directory,model,agent,created_at,updated_at,
+             token_input,token_output,token_cached,project_dir,provider)
+        VALUES (?,?,?,?,?,?,?,0,0,0,?,?)
+    """, (sid, title, os.getcwd(), model, agent, now, now,
+          project_dir_str, _active_provider))
     conn.commit()
     return {"id": sid, "title": title, "directory": os.getcwd(),
             "model": model, "agent": agent, "project_dir": project_dir_str,
@@ -685,7 +698,7 @@ def _normalize_message(role, raw):
 
 def messages_load(conn, sid):
     rows = conn.execute(
-        "SELECT role,content FROM message WHERE session_id=? ORDER BY created_at",
+        "SELECT role,content FROM message WHERE session_id=? ORDER BY created_at, rowid",
         (sid,)).fetchall()
     result = []
     for r in rows:
@@ -734,8 +747,8 @@ def messages_replace_all(conn, sid, messages):
     conn.execute("DELETE FROM message WHERE session_id=?", (sid,))
     ts = int(time.time())
     for i, m in enumerate(messages):
+        stored = m if isinstance(m, dict) else {"role": "user", "content": str(m)}
         conn.execute("INSERT INTO message VALUES (?,?,?,?,?)",
-                     (str(uuid.uuid4()), sid, m["role"],
-                      json.dumps(m["content"], ensure_ascii=False), ts + i))
+                     (str(uuid.uuid4()), sid, stored["role"],
+                      json.dumps(stored, ensure_ascii=False), ts + i))
     conn.commit()
-

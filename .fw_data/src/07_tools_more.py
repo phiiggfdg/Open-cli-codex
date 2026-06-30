@@ -658,9 +658,28 @@ def tool_lsp(operation, file=None, line=None, character=None, query=None):
     import ast as _ast
 
     # ── helpers ──────────────────────────────────────────────────────────────
+    def _resolve_lsp_file(path):
+        if not path:
+            return None, "[lsp] file required"
+        p = Path(path).expanduser()
+        if _project_dir is not None and not _project_dir_is_placeholder:
+            try:
+                p.resolve().relative_to(_project_dir.resolve())
+            except ValueError:
+                sandbox_p = _resolve_to_sandbox(path)
+                if sandbox_p.exists():
+                    p = sandbox_p
+        err = _check_sandbox_read(str(p))
+        if err:
+            return None, err
+        return p, None
+
     def _read(path):
+        p, err = _resolve_lsp_file(path)
+        if err:
+            return None
         try:
-            return Path(path).expanduser().read_text(errors="replace")
+            return p.read_text(errors="replace")
         except Exception as e:
             return None
 
@@ -731,6 +750,10 @@ def tool_lsp(operation, file=None, line=None, character=None, query=None):
     if operation == "documentSymbol":
         if not file:
             return "[lsp] documentSymbol requires file"
+        file_path, err = _resolve_lsp_file(file)
+        if err:
+            return err
+        file = str(file_path)
         src = _read(file)
         if src is None:
             return f"[lsp] Cannot read {file}"
@@ -758,6 +781,10 @@ def tool_lsp(operation, file=None, line=None, character=None, query=None):
     if operation == "hover":
         if not file:
             return "[lsp] hover requires file"
+        file_path, err = _resolve_lsp_file(file)
+        if err:
+            return err
+        file = str(file_path)
         src = _read(file)
         if src is None:
             return f"[lsp] Cannot read {file}"
@@ -786,6 +813,10 @@ def tool_lsp(operation, file=None, line=None, character=None, query=None):
         name = query
         src_lines = []
         if file:
+            file_path, err = _resolve_lsp_file(file)
+            if err:
+                return err
+            file = str(file_path)
             src = _read(file)
             if src is None:
                 return f"[lsp] Cannot read {file}"
@@ -822,6 +853,10 @@ def tool_lsp(operation, file=None, line=None, character=None, query=None):
             return "[lsp] references requires file (or query to search by name)"
         name = query
         if file:
+            file_path, err = _resolve_lsp_file(file)
+            if err:
+                return err
+            file = str(file_path)
             src = _read(file)
             if src is None:
                 return f"[lsp] Cannot read {file}"
@@ -844,4 +879,3 @@ def tool_lsp(operation, file=None, line=None, character=None, query=None):
         return result[:1500] if result else "[lsp] No matches"
 
     return f"[lsp] Unknown operation: {operation}. Supported: documentSymbol, hover, definition, references, workspace_symbol"
-

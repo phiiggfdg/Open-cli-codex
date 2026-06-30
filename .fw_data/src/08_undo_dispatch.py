@@ -1,4 +1,19 @@
 # ── Undo / Redo helpers ───────────────────────────────────────────────────────
+def _sync_file_state_after_restore(path: "Path", content: str | None) -> None:
+    """Keep cache/read-time consistent after undo/redo mutates disk directly."""
+    try:
+        resolved = str(path.resolve())
+        if content is None:
+            _file_cache.pop(resolved, None)
+            _file_read_time.pop(resolved, None)
+            _recent_writes.discard(resolved)
+            return
+        _cache_put(str(path), content, _current_sid)
+        _file_read_time[resolved] = time.time()
+        _recent_writes.add(resolved)
+    except Exception:
+        pass
+
 def do_undo():
     if not _undo_stack:
         return "Nothing to undo."
@@ -7,10 +22,17 @@ def do_undo():
     try:
         if snap["before"] is None:
             p.unlink(missing_ok=True)
+            _sync_file_state_after_restore(p, None)
             msg = f"Undo: deleted {snap['path']}"
         else:
             p.write_text(snap["before"])
+            _sync_file_state_after_restore(p, snap["before"])
             msg = f"Undo: restored {snap['path']}"
+        if _project_dir_conn and snap.get("id"):
+            _project_dir_conn.execute(
+                "UPDATE file_snapshot SET undone=1 WHERE id=?", (snap["id"],))
+            _project_dir_conn.commit()
+        snap["undone"] = 1
         _redo_stack.append(snap)
         return msg
     except Exception as e:
@@ -23,6 +45,12 @@ def do_redo():
     p = Path(snap["path"])
     try:
         p.write_text(snap["after"])
+        _sync_file_state_after_restore(p, snap["after"])
+        if _project_dir_conn and snap.get("id"):
+            _project_dir_conn.execute(
+                "UPDATE file_snapshot SET undone=0 WHERE id=?", (snap["id"],))
+            _project_dir_conn.commit()
+        snap["undone"] = 0
         _undo_stack.append(snap)
         return f"Redo: applied {snap['path']}"
     except Exception as e:
@@ -71,8 +99,8 @@ def tool_apply_patch(path, patch, conn=None, sid=None):
                 _file_read_time[str(p.resolve())] = time.time()
                 _cache_put(str(p), after, _current_sid)
                 if conn and sid:
-                    snapshot_save(conn, sid, str(p.resolve()), before, after)
-                    _undo_stack.append({"path": str(p.resolve()), "before": before, "after": after})
+                    _undo_stack.append(snapshot_save(
+                        conn, sid, str(p.resolve()), before, after))
                     _redo_stack.clear()
                 return f"Patch applied to {path}\n" + _patch_snippet(after, patch)
             else:
@@ -108,8 +136,8 @@ def tool_apply_patch(path, patch, conn=None, sid=None):
         _file_read_time[str(p.resolve())] = time.time()
         _cache_put(str(p), after, _current_sid)
         if conn and sid:
-            snapshot_save(conn, sid, str(p.resolve()), before, after)
-            _undo_stack.append({"path": str(p.resolve()), "before": before, "after": after})
+            _undo_stack.append(snapshot_save(
+                conn, sid, str(p.resolve()), before, after))
             _redo_stack.clear()
         return f"Patch applied to {path}\n" + _patch_snippet(after, patch)
     except Exception as e:
@@ -120,8 +148,18 @@ def tool_task(description, tools=None, model=None, api_key=None, conn=None, sid=
     Subagent: chạy một mini agentic loop độc lập.
     Kết quả trả về là text output của subagent.
     """
-    allowed = set(tools) if tools else {"bash","read","write","edit","glob","grep","webfetch","websearch","todoread"}
+    _DEFAULT_SUB_TOOLS = {"bash","read","write","edit","glob","grep","webfetch","websearch","todoread"}
+    allowed = set(tools) if tools else _DEFAULT_SUB_TOOLS
     sub_tools = [t for t in get_active_tools() if t["function"]["name"] in allowed]
+
+    # Guard: nếu model truyền `tools` toàn tên không tồn tại (vd ảo giác/gõ sai),
+    # sub_tools rỗng nhưng tc_mode="required" ở step 0 (xem dưới) vẫn được set —
+    # API (mọi format: OpenAI/Anthropic/Bedrock) từ chối ngay "tool_choice
+    # required nhưng tools rỗng" với HTTP 400, subagent fail oan dù lẽ ra việc
+    # này chỉ là 1 tham số sai vô hại. Fallback về default tool set thay vì để
+    # rỗng — "subagent không tool nào cả" chưa bao giờ là ý định hợp lý.
+    if not sub_tools:
+        sub_tools = [t for t in get_active_tools() if t["function"]["name"] in _DEFAULT_SUB_TOOLS]
 
     print(f"\n{BLUE}{BOLD}[subagent]{R} {description[:80]}")
 
@@ -142,8 +180,10 @@ Be concise. Current directory: {os.getcwd()}"""
         #   Nhánh 1 — aws_bedrock:
         #     _provider_request → build Converse API request (urlopen_smart)
         #     response format  → Converse JSON (khác OpenAI hoàn toàn)
-        #     parse            → parse_converse_response() → (text, [])
-        #     tool_calls       → [] — subagent Bedrock không dùng tool (giới hạn hiện tại)
+        #     parse            → parse_converse_response() → (text, tool_calls)
+        #     tool_calls       → parse đầy đủ từ block "toolUse" (giống nhánh
+        #                        2/3) — subagent Bedrock DÙNG ĐƯỢC tool bình
+        #                        thường, không có giới hạn nào ở đây
         #
         #   Nhánh 2 — format_anthropic (custom provider dùng Anthropic Messages API):
         #     _provider_request → build_anthropic_request, dịch payload qua _to_anthropic_payload
@@ -221,7 +261,12 @@ Be concise. Current directory: {os.getcwd()}"""
     steps = 0
     final_text = ""
     while steps < 10:
-        tc_mode = "required" if steps == 0 else "auto"
+        # tool_choice="required" chỉ hợp lệ khi có ít nhất 1 tool — nếu sub_tools
+        # rỗng (không nên xảy ra sau fallback ở trên, nhưng giữ guard tại đây để
+        # không phụ thuộc 1 điểm duy nhất), ép "required" sẽ gây HTTP 400 ở mọi
+        # format (OpenAI/Anthropic/Bedrock đều từ chối tool_choice required kèm
+        # tools rỗng).
+        tc_mode = "required" if (steps == 0 and sub_tools) else "auto"
         payload = {
             "model": model, "messages": [{"role":"system","content":sub_sys}]+sub_messages,
             "tools": sub_tools, "tool_choice": tc_mode,
@@ -231,13 +276,27 @@ Be concise. Current directory: {os.getcwd()}"""
         if not _no_temperature(model or ""):
             payload["temperature"] = 0.3
 
+        # FIX (bug #6): trước đây subagent KHÔNG BAO GIỜ gửi field "thinking"
+        # dù "/mode on" đang bật cho phiên chính — inconsistency không
+        # document (subagent luôn chạy non-thinking âm thầm). Giờ tái dùng
+        # đúng cache _thinking_support_get() mà agent chính đã probe sẵn
+        # cho cặp (provider, model) này — KHÔNG tự probe mới ở đây (tránh
+        # tốn thêm 1 request riêng cho subagent). Nếu model chưa từng được
+        # biết là có support thinking (None hoặc False), không gửi gì —
+        # giữ nguyên hành vi an toàn cũ, không gây 400/422 cho model lạ.
+        if _thinking_mode == "on" and _thinking_support_get(model) is True:
+            if _prov().get("format_anthropic") or _active_provider == "aws_bedrock":
+                payload["thinking"] = {"type": "enabled", "budget_tokens": 8000}
+            else:
+                payload["thinking"] = {"type": "enabled"}
+
         try:
             text, tool_calls = _sub_urlopen(payload)
         except Exception as e:
             return f"[subagent error: {e}]"
 
         # Retry if step 0 returned no tool calls
-        if steps == 0 and not tool_calls:
+        if steps == 0 and not tool_calls and sub_tools:
             try:
                 payload2 = dict(payload); payload2["tool_choice"] = "required"
                 text2, tool_calls2 = _sub_urlopen(payload2)
@@ -337,6 +396,9 @@ def _check_permission(name, args, agent=None):
             return True
         print(f"\n  {YELLOW}{'─'*56}{R}")
         explanation = _explain_tool_action(name, args)
+        if name == "bash":
+            explanation += ("\nBash có quyền của tiến trình hiện tại và có thể truy cập "
+                            "ngoài project_dir; cwd không phải sandbox bảo mật.")
         for line in explanation.splitlines():
             print(f"  {line}")
         print(f"  {YELLOW}{'─'*56}{R}")
@@ -437,4 +499,3 @@ def run_tool(name, args, model, api_key, conn, sid):
 # ════════════════════════════════════════════════════════════════════════════
 # FIREWORKS API
 # ════════════════════════════════════════════════════════════════════════════
-

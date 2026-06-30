@@ -48,6 +48,21 @@ def _auto_rename_session(conn, sid, messages, model, api_key):
     threading.Thread(target=_do_rename, daemon=True).start()
 
 
+def _delete_session_project_dir(session: dict) -> bool:
+    """Delete only the generated cwd/<sid> directory owned by a session."""
+    raw = session.get("project_dir")
+    sid = session.get("id", "")
+    if not raw or not sid:
+        return False
+    path = Path(raw).expanduser().resolve()
+    expected = (Path(session.get("directory") or Path.cwd()) / sid).resolve()
+    if path != expected or path.name != sid:
+        return False
+    if path.is_dir():
+        shutil.rmtree(path)
+    return True
+
+
 # ════════════════════════════════════════════════════════════════════════════
 
 def _print_welcome_banner():
@@ -413,18 +428,28 @@ def _expand_at_mentions(text: str) -> str:
     @path/to/file  →  inline file content block.
     Uses fuzzy glob if exact path not found.
     """
-    import fnmatch as _fnmatch
+    def _at_path_allowed(p: Path) -> bool:
+        try:
+            return _check_sandbox_read(str(p)) is None
+        except Exception:
+            return False
+
+    def _at_candidate_files(raw: str) -> list[Path]:
+        p = Path(raw).expanduser()
+        if p.exists() and p.is_file() and _at_path_allowed(p):
+            return [p]
+        try:
+            matches = sorted(Path.cwd().rglob(f"*{raw}*"))
+        except Exception:
+            return []
+        return [x for x in matches if x.is_file() and _at_path_allowed(x)]
+
     def _replace(m):
         raw = m.group(1)
-        # Try exact path first
-        p = Path(raw).expanduser()
-        if not p.exists():
-            # Fuzzy: glob from cwd
-            matches = sorted(Path.cwd().rglob(f"*{raw}*"))
-            matches = [x for x in matches if x.is_file()]
-            if not matches:
-                return m.group(0)  # keep as-is
-            p = matches[0]
+        matches = _at_candidate_files(raw)
+        if not matches:
+            return m.group(0)  # keep as-is
+        p = matches[0]
         try:
             body = p.read_text(errors="replace")
             rel  = p.relative_to(Path.cwd()) if p.is_relative_to(Path.cwd()) else p
@@ -436,8 +461,20 @@ def _expand_at_mentions(text: str) -> str:
 
 def _at_file_complete(prefix: str) -> list[str]:
     """List files matching prefix for @-autocomplete hint."""
-    matches = sorted(Path.cwd().rglob(f"*{prefix}*"))
-    return [str(m.relative_to(Path.cwd())) for m in matches if m.is_file()][:8]
+    try:
+        matches = sorted(Path.cwd().rglob(f"*{prefix}*"))
+    except Exception:
+        return []
+    out = []
+    for m in matches:
+        if not m.is_file():
+            continue
+        if _check_sandbox_read(str(m)) is not None:
+            continue
+        out.append(str(m.relative_to(Path.cwd())))
+        if len(out) >= 8:
+            break
+    return out
 
 def _multiline_input(prompt):
     """
@@ -502,6 +539,7 @@ def main():
 
     _todos_init(conn, sid)
     _sandbox_init(conn, sid, session.get("project_dir"))
+    undo_state_load(conn, sid)
 
     ag_cl = BLUE if agent == AGENT_PLAN else GREEN
     tm_cl = YELLOW if _tool_mode == "sequential" else TEAL
@@ -678,7 +716,7 @@ def main():
             _current_agent = agent
             _todos_init(conn, sid)
             _sandbox_init(conn, sid, session.get("project_dir"))
-            _undo_stack.clear(); _redo_stack.clear()
+            undo_state_load(conn, sid)
             # C8/C14/C26 FIX: reset session-scoped globals khi switch session
             # Không reset → allow-all vẫn on, file timestamps sai
             # B2 FIX: cần "global _bash_allow_all" ở đầu main() để dòng dưới
@@ -787,6 +825,8 @@ def main():
                 except (EOFError, KeyboardInterrupt):
                     print(); continue
                 if confirm == "yes":
+                    for old in sessions_all:
+                        _delete_session_project_dir(old)
                     conn.execute("DELETE FROM session")
                     conn.commit()
                     print(f"{RED}✓ Đã xoá tất cả session. Thoát...{R}")
@@ -806,6 +846,7 @@ def main():
                 print(); continue
             if confirm not in ("y", "yes"):
                 print(f"{DIM}Huỷ.{R}\n"); continue
+            _delete_session_project_dir(dict(target))
             conn.execute("DELETE FROM session WHERE id=?", (target_id,))
             conn.commit()
             print(f"{GREEN}✓ Đã xoá [{target_id}]{R}")

@@ -40,7 +40,8 @@ _BASH_DENY_RE = re.compile("|".join(_BASH_DENY_PATTERNS))
 
 
 # ── Bash safety gates ───────────────────────────────────────────────────────
-# Giữ hành vi cũ (shell=True) nhưng thêm confirm + allowlist tối thiểu.
+# Bash is arbitrary code execution, not a filesystem sandbox. Build mode asks
+# for explicit permission; plan mode denies it completely.
 # Có 2 lớp permission độc lập:
 #   Lớp 1 — _check_permission() trong 08_undo_dispatch.py: hỏi "Allow? [y/N/a]"
 #            /perm bash allow chỉ ảnh hưởng lớp này (bỏ câu hỏi confirm).
@@ -109,10 +110,11 @@ def tool_bash(command, timeout=30):
     if _project_dir is not None:
         proj = _project_dir.resolve()
 
-        # Chặn lệnh cố escape khỏi sandbox
+        # Block obvious destructive commands as defense in depth. This is not
+        # a security boundary: an allowed interpreter can access host files.
         if _BASH_DENY_RE.search(command):
-            return (f"[sandbox] Lệnh bị chặn: không được thoát khỏi project_dir.\n"
-                    f"Chỉ được thao tác bên trong: {proj}\n"
+            return (f"[policy] Lệnh nguy hiểm bị chặn.\n"
+                    f"Thư mục chạy dự kiến: {proj}\n"
                     f"Lệnh bị từ chối: {command[:200]}")
 
         # Chạy trong project_dir, không phải cwd tuỳ tiện
@@ -855,6 +857,9 @@ def tool_write(path, content, conn=None, sid=None):
     p = _resolve_to_sandbox(path)
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
+        if p.exists():
+            return (f"[error] write only creates new files; '{p}' already exists. "
+                    f"Use edit, multiedit, or apply_patch for existing files.")
         before = p.read_text() if p.exists() else None
         p.write_text(content)
         # Track write time so subsequent edits don't false-alarm on FileTime check
@@ -863,8 +868,8 @@ def tool_write(path, content, conn=None, sid=None):
         _cache_put(str(p), content, _current_sid)
         _recent_writes.add(str(p.resolve()))  # block read-after-write
         if conn and sid:
-            snapshot_save(conn, sid, str(p.resolve()), before, content)
-            _undo_stack.append({"path": str(p.resolve()), "before": before, "after": content})
+            _undo_stack.append(snapshot_save(
+                conn, sid, str(p.resolve()), before, content))
             _redo_stack.clear()
         redirected = f" (redirected from {path})" if str(p.resolve()) != str(Path(path).expanduser().resolve()) else ""
         # Inject anchor map — model biết structure ngay, không cần read/glob lại turn sau
@@ -906,8 +911,8 @@ def tool_extract(src, start, end, dst, mode="move", conn=None, sid=None):
         _recent_writes.add(str(dp.resolve()))
         # C11/C27 FIX: save snapshot cho dst để /undo restore được dst (cả copy lẫn move)
         if conn and sid:
-            snapshot_save(conn, sid, str(dp.resolve()), dst_before or "", dst_after)
-            _undo_stack.append({"path": str(dp.resolve()), "before": dst_before or "", "after": dst_after})
+            _undo_stack.append(snapshot_save(
+                conn, sid, str(dp.resolve()), dst_before, dst_after))
             _redo_stack.clear()
 
         result = f"Extracted lines {start}-{end} of {sp} → {dp} ({len(chunk)} lines)"
@@ -921,8 +926,8 @@ def tool_extract(src, start, end, dst, mode="move", conn=None, sid=None):
             _recent_writes.add(str(sp.resolve()))
             _cache_put(str(sp), src_after, _current_sid)
             if conn and sid:
-                snapshot_save(conn, sid, str(sp.resolve()), src_before, src_after)
-                _undo_stack.append({"path": str(sp.resolve()), "before": src_before, "after": src_after})
+                _undo_stack.append(snapshot_save(
+                    conn, sid, str(sp.resolve()), src_before, src_after))
                 # Note: _redo_stack already cleared above for dst snapshot
             result += f"\n[removed from {sp}, {len(new_src_lines)} lines remain]"
 
@@ -953,8 +958,8 @@ def tool_edit(path, old_str, new_str, conn=None, sid=None):
         # Update cache với content mới — AI thấy thay đổi ngay trong cache block
         _cache_put(str(p), after, _current_sid)
         if conn and sid:
-            snapshot_save(conn, sid, str(p.resolve()), text, after)
-            _undo_stack.append({"path": str(p.resolve()), "before": text, "after": after})
+            _undo_stack.append(snapshot_save(
+                conn, sid, str(p.resolve()), text, after))
             _redo_stack.clear()
         # Trả về context snippet quanh vùng thay đổi — AI không cần read lại để verify
         lines_before = text.splitlines()
@@ -1072,5 +1077,3 @@ def _anchor_map(lines: list[str], focus_line: int | None = None) -> str:
 
     found = [f"  L{lineno:<5} [{kind:<6}] {text}" for lineno, kind, text in selected]
     return "Anchors:\n" + "\n".join(found)
-
-

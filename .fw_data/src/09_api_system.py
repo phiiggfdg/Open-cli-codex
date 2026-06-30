@@ -1,15 +1,16 @@
 def load_config() -> dict:
     """Load config from .fw_data/config.json, return {} if not found."""
-    try:
-        if CONFIG_PATH.exists():
+    if CONFIG_PATH.exists():
+        try:
             return json.loads(CONFIG_PATH.read_text())
-    except Exception:
-        pass
+        except (OSError, json.JSONDecodeError) as e:
+            raise RuntimeError(f"Config hỏng hoặc không đọc được: {CONFIG_PATH}: {e}") from e
     return {}
 
 def save_config(cfg: dict):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     CONFIG_PATH.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
+    CONFIG_PATH.chmod(0o600)
 
 def history_load() -> list[str]:
     """Load input history từ .fw_data/history."""
@@ -1165,6 +1166,18 @@ def call_api_stream(messages, model, api_key, tool_choice="auto", session_id=Non
             print(f"\n{RED}Network error: {e}{R}")
             return {"text": "", "tool_calls": [], "usage": {}, "truncated": False, "reasoning": "", "thinking": "", "thinking_signature": "", "redacted_thinking_data": ""}
 
+        except Exception as e:
+            # Adapter/protocol failures (for example an Anthropic or Bedrock
+            # error event received after HTTP 200) are not HTTPError objects.
+            # Stop the UI cleanly and surface the failure instead of treating
+            # a partial stream as a successful assistant response.
+            _rate_limit_mark()
+            spinner_ref[0].stop()
+            print(f"\n{RED}Stream error: {e}{R}")
+            return {"text": "", "tool_calls": [], "usage": {}, "truncated": False,
+                    "reasoning": "", "thinking": "", "thinking_signature": "",
+                    "redacted_thinking_data": "", "error": str(e)}
+
         except KeyboardInterrupt:
             interrupted = True
             spinner_ref[0].stop()
@@ -1827,4 +1840,3 @@ def agent_turn(messages, model, api_key, conn, sid, max_steps=20, agent=AGENT_BU
         )
 
     return messages
-

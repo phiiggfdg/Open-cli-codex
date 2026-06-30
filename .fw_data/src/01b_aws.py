@@ -291,7 +291,13 @@ def _to_converse_payload(payload: dict) -> dict:
         for tc in m.get("tool_calls") or []:
             try:
                 args = json.loads(tc["function"].get("arguments") or "{}")
-            except Exception:
+            except json.JSONDecodeError:
+                # arguments thật sự malformed (vd model bị cắt stream giữa
+                # chừng) — fallback {} là hợp lý, không chặn cả turn.
+                # CHỈ bắt JSONDecodeError ở đây: bắt Exception rộng trước
+                # đây sẽ nuốt luôn KeyError/TypeError/NameError... từ lỗi
+                # code thật, biến chúng thành "input rỗng" âm thầm thay vì
+                # lộ ra để debug.
                 args = {}
             content.append({
                 "toolUse": {
@@ -488,9 +494,9 @@ class _FakeSSEResponse:
         event_type = headers.get(":event-type", "")
         message_type = headers.get(":message-type", "event")
         if message_type in ("error", "exception"):
-            # Lỗi từ AWS giữa luồng (vd throttling, validation) — dừng
-            # luồng, không cố parse payload như event bình thường.
-            return None
+            detail = payload_raw.decode("utf-8", errors="replace")[:2000]
+            raise RuntimeError(
+                f"AWS Bedrock stream {message_type} ({event_type or 'unknown'}): {detail}")
         try:
             payload = json.loads(payload_raw.decode("utf-8")) if payload_raw else {}
         except Exception:
@@ -563,6 +569,13 @@ def _convert_event(event_type: str, payload: dict, tool_block_idx: dict,
         start = payload.get("start", {})
         if "toolUse" in start:
             tu = start["toolUse"]
+            if idx in tool_block_idx and _cache_debug:
+                # FIX (bug #4): contentBlockStart lặp lại cùng index — vi
+                # phạm Converse Stream spec (mỗi index chỉ start 1 lần).
+                # Trước đây ghi đè vô điều kiện làm "mồ côi" tool_call cũ.
+                # Chỉ log khi debug bật, hành vi mặc định không đổi.
+                _cache_log("?", f"bedrock-stream idx={idx}",
+                           "contentBlockStart lặp lại — tool_call cũ bị ghi đè")
             tc_idx = state._next_tc_idx
             state._next_tc_idx += 1
             tool_block_idx[idx] = tc_idx
@@ -578,6 +591,14 @@ def _convert_event(event_type: str, payload: dict, tool_block_idx: dict,
         if "text" in delta:
             out.append({"choices": [{"delta": {"content": delta["text"]}}]})
         elif "toolUse" in delta:
+            if idx not in tool_block_idx and _cache_debug:
+                # FIX (bug #3): orphan delta — contentBlockDelta đến cho 1
+                # index chưa từng có contentBlockStart. Trước đây âm thầm
+                # fallback tc_idx=0 (map nhầm vào tool đầu tiên hoặc không
+                # tool nào), không dấu vết. Giữ nguyên fallback (không đổi
+                # hành vi mặc định) nhưng log khi debug bật.
+                _cache_log("?", f"bedrock-stream idx={idx}",
+                           "contentBlockDelta toolUse orphan (không có contentBlockStart)")
             tc_idx = tool_block_idx.get(idx, 0)
             partial = delta["toolUse"].get("input", "")
             out.append({"choices": [{"delta": {"tool_calls": [{

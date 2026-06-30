@@ -20,14 +20,38 @@ def todos_save(conn, sid, todos):
 
 # ── File snapshots (undo/redo) ───────────────────────────────────────────────
 def snapshot_save(conn, sid, path, before, after):
-    conn.execute("INSERT INTO file_snapshot VALUES (?,?,?,?,?,?)",
-                 (str(uuid.uuid4()), sid, path, before, after, int(time.time())))
+    # A new edit after undo creates a new history branch; stale redo entries
+    # must not become available again after a restart.
+    conn.execute("DELETE FROM file_snapshot WHERE session_id=? AND undone=1", (sid,))
+    snap = {
+        "id": str(uuid.uuid4()), "session_id": sid, "path": path,
+        "before": before, "after": after, "created_at": int(time.time()),
+        "undone": 0,
+    }
+    conn.execute("""INSERT INTO file_snapshot
+                    (id,session_id,path,before,after,created_at,undone)
+                    VALUES (?,?,?,?,?,?,?)""",
+                 tuple(snap[k] for k in (
+                     "id", "session_id", "path", "before", "after",
+                     "created_at", "undone")))
     conn.commit()
+    return snap
 
 def snapshots_load(conn, sid):
     return [dict(r) for r in conn.execute(
-        "SELECT * FROM file_snapshot WHERE session_id=? ORDER BY created_at",
+        "SELECT * FROM file_snapshot WHERE session_id=? ORDER BY created_at, rowid",
         (sid,)).fetchall()]
+
+def undo_state_load(conn, sid):
+    """Restore durable undo/redo stacks in their correct pop order."""
+    active = [dict(r) for r in conn.execute(
+        "SELECT * FROM file_snapshot WHERE session_id=? AND undone=0 "
+        "ORDER BY created_at, rowid", (sid,)).fetchall()]
+    undone = [dict(r) for r in conn.execute(
+        "SELECT * FROM file_snapshot WHERE session_id=? AND undone=1 "
+        "ORDER BY created_at DESC, rowid DESC", (sid,)).fetchall()]
+    _undo_stack[:] = active
+    _redo_stack[:] = undone
 
 # ════════════════════════════════════════════════════════════════════════════
 # TOKEN / COMPACT
@@ -386,4 +410,3 @@ ALL_TOOL_NAMES = {t["function"]["name"] for t in TOOLS}
 
 # Tool focus hint only. Full TOOLS schema stays stable for prompt-cache reuse.
 _active_tools: set | None = None
-

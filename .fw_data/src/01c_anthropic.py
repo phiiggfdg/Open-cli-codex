@@ -110,7 +110,13 @@ def _to_anthropic_payload(payload: dict) -> dict:
             for tc in m.get("tool_calls") or []:
                 try:
                     args = json.loads(tc["function"].get("arguments") or "{}")
-                except Exception:
+                except json.JSONDecodeError:
+                    # arguments thật sự malformed (vd model bị cắt stream giữa
+                    # chừng) — fallback {} là hợp lý, không chặn cả turn.
+                    # CHỈ bắt JSONDecodeError ở đây: bắt Exception rộng trước
+                    # đây sẽ nuốt luôn KeyError/TypeError/NameError... từ lỗi
+                    # code thật, biến chúng thành "input rỗng" âm thầm thay vì
+                    # lộ ra để debug.
                     args = {}
                 content.append({
                     "type": "tool_use",
@@ -345,6 +351,12 @@ class _AnthropicSSEResponse:
 
         etype = ev.get("type", "")
 
+        if etype == "error":
+            err = ev.get("error") or {}
+            detail = err.get("message") or json.dumps(err, ensure_ascii=False)
+            raise RuntimeError(
+                f"Anthropic stream error ({err.get('type', 'unknown')}): {detail}")
+
         if etype == "message_start":
             # Lưu lại input_tokens — KHÔNG emit usage riêng ở đây (xem lý do
             # ở __init__). Sẽ gộp vào chunk usage cuối ở message_delta.
@@ -357,6 +369,19 @@ class _AnthropicSSEResponse:
             block = ev.get("content_block", {})
             btype = block.get("type", "")
             if btype == "tool_use":
+                if idx in self._tool_blocks:
+                    # FIX (bug #4): content_block_start lặp lại cùng index —
+                    # vi phạm spec Anthropic (mỗi index chỉ start 1 lần),
+                    # nhưng có tiền lệ thật với gateway third-party lệch
+                    # spec (custom provider format_anthropic=True). Trước
+                    # đây ghi đè vô điều kiện làm "mồ côi" tool_call cũ
+                    # (mọi delta sau map nhầm sang tool mới). Giờ log cảnh
+                    # báo nếu debug bật, rồi vẫn tiếp tục với index mới —
+                    # không thay đổi hành vi observable trong trường hợp
+                    # bình thường (Anthropic chính chủ không bao giờ lặp).
+                    if _cache_debug:
+                        _cache_log("?", f"anthropic-sse idx={idx}",
+                                   "content_block_start lặp lại — tool_call cũ bị ghi đè")
                 tc_idx = self._next_tc_idx
                 self._next_tc_idx += 1
                 self._tool_blocks[idx] = {
@@ -400,6 +425,16 @@ class _AnthropicSSEResponse:
                         "index":    tb["tc_idx"],
                         "function": {"arguments": delta.get("partial_json", "")},
                     }]}}]})
+                elif _cache_debug:
+                    # FIX (bug #3): trước đây orphan delta (content_block_delta
+                    # đến cho 1 index chưa từng có content_block_start) bị vứt
+                    # hoàn toàn, không dấu vết — hậu quả downstream là
+                    # arguments rỗng, tool bị gọi thiếu tham số mà không rõ
+                    # nguyên nhân gốc. Vi phạm spec Anthropic (chỉ xảy ra với
+                    # gateway third-party lệch spec), nên chỉ log khi debug
+                    # bật, không đổi hành vi mặc định.
+                    _cache_log("?", f"anthropic-sse idx={idx}",
+                               "input_json_delta orphan (không có content_block_start) — bị bỏ qua")
             elif dtype == "thinking_delta":
                 # Extended thinking — text suy luận thật. Emit qua field
                 # riêng "thinking" (KHÔNG dùng "content") để _stream_response()
