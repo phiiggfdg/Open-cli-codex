@@ -354,6 +354,7 @@ HELP = f"""
   {CYAN}/agent{R}               switch agent mode  {DIM}(build / plan){R}
   {CYAN}/sequential{R}          step-by-step mode  {DIM}(safer, more tokens){R}
   {CYAN}/batch{R}               batched tool calls {DIM}(default, faster){R}
+  {CYAN}/mode{R}                thinking on/off  {DIM}(if model supports it){R}
 
 {GRAY}Context & Memory{R}
   {CYAN}/tokens{R}              token usage + cost
@@ -479,16 +480,17 @@ def _multiline_input(prompt):
     return "\n".join(lines).strip()
 
 def main():
-    # B2 FIX: thiếu global cho 2 biến này khiến các lần "reset" ở /sessions
+    # B2 FIX: thiếu global cho các biến này khiến các lần "reset" ở /sessions
     # và /perm bash ask (xem dưới) chỉ tạo biến local trong main(), không
     # đụng tới biến module-level thật mà tool_bash()/_check_permission() đọc.
-    global _input_history, _tool_mode, _BASH_CONFIRMED, _bash_allow_all
+    global _input_history, _tool_mode, _thinking_mode, _bash_allow_all
     _input_history = history_load()
     choose_provider()
     api_key = get_api_key()
     conn    = db_connect()
 
     _tool_mode = "batch"  # mặc định batch, user có thể gõ /sequential để đổi
+    _thinking_mode = "off"  # mặc định off, user gõ /mode on để bật (nếu model hỗ trợ)
 
     session, model, messages = pick_session(conn, api_key)
     sid    = session["id"]
@@ -678,11 +680,12 @@ def main():
             _sandbox_init(conn, sid, session.get("project_dir"))
             _undo_stack.clear(); _redo_stack.clear()
             # C8/C14/C26 FIX: reset session-scoped globals khi switch session
-            # Không reset → bash không cần confirm, allow-all vẫn on, file timestamps sai
-            # B2 FIX: cần "global _BASH_CONFIRMED, _bash_allow_all" ở đầu main() để
-            # 2 dòng dưới đụng đúng biến module-level (trước đây chỉ tạo local var,
+            # Không reset → allow-all vẫn on, file timestamps sai
+            # B2 FIX: cần "global _bash_allow_all" ở đầu main() để dòng dưới
+            # đụng đúng biến module-level (trước đây chỉ tạo local var,
             # reset không có tác dụng — xem khai báo global ở đầu hàm main()).
-            _BASH_CONFIRMED = False
+            # (Bug #1 fix: allowlist bash giờ tự check ở MỌI lệnh — không còn
+            # cờ "_BASH_CONFIRMED" cần reset theo session nữa.)
             _bash_allow_all = False
             _file_read_time.clear()
             print(f"{GREEN}✓ [{sid}]{R}\n"); continue
@@ -711,6 +714,61 @@ def main():
             _tool_mode = "batch"
             _system_static_cache.clear()  # rebuild vì _tool_mode ko còn trong static, nhưng giữ để safe
             print(f"{GREEN}✓ Batch mode — gộp tool calls, tiết kiệm token. {DIM}(mặc định){R}\n"); continue
+
+        _cmd_parts = user.split(None, 1)
+        if _cmd_parts and _cmd_parts[0].lower() == "/mode":
+            arg = _cmd_parts[1].strip().lower() if len(_cmd_parts) > 1 else ""
+
+            if not arg:
+                # Gõ /mode trống → hiện trạng thái hiện tại + gợi ý cách dùng
+                state_cl = GREEN if _thinking_mode == "on" else DIM
+                print(f"{state_cl}Thinking mode: {_thinking_mode}{R}")
+                supported = _thinking_support_get(model)
+                if supported is True:
+                    print(f"{DIM}  Model này đã xác nhận hỗ trợ thinking.{R}")
+                elif supported is False:
+                    print(f"{DIM}  Model này đã thử và KHÔNG hỗ trợ thinking.{R}")
+                else:
+                    print(f"{DIM}  Chưa rõ model này có hỗ trợ thinking không — "
+                          f"gõ {CYAN}/mode on{R}{DIM} để thử.{R}")
+                print(f"{DIM}  Gõ {CYAN}/mode on{R}{DIM} hoặc {CYAN}/mode off{R}{DIM} để đổi.{R}\n")
+                continue
+
+            if arg in ("on", "off"):
+                supported = _thinking_support_get(model)
+                if supported is None:
+                    print(f"{DIM}  Đang kiểm tra model này có hỗ trợ thinking không...{R}")
+                    supported = _probe_thinking_support(model, api_key)
+                    _thinking_support_set(model, supported)
+                if not supported:
+                    print(f"{YELLOW}⚠ Model/provider này không hỗ trợ thinking "
+                          f"(không trả reasoning_content/thinking block).{R}")
+                    print(f"{DIM}  Đã ghi nhớ, lần sau /mode sẽ báo ngay không cần thử lại.{R}\n")
+                    continue
+                _thinking_mode = arg
+                print(f"{GREEN}✓ Thinking mode: {arg}{R}")
+                if arg == "on" and (_prov().get("format_anthropic") or _active_provider == "aws_bedrock"):
+                    print(f"{DIM}  Lưu ý: nội dung thinking sẽ hiện ra màn hình (màu xám/dim, "
+                          f"tag [thinking]). Signature được lưu/replay tự động để giữ thinking "
+                          f"hoạt động cả ở các turn sau có tool_calls (tối ưu cache); nếu history "
+                          f"cũ thiếu signature hợp lệ, thinking sẽ tự tắt riêng cho turn đó thay "
+                          f"vì báo lỗi.{R}")
+                if (arg == "off" and (_prov().get("format_anthropic") or _active_provider == "aws_bedrock")
+                        and not _thinking_disable_already_probed(model)):
+                    # Lần đầu tắt thinking cho cặp (provider, model) này —
+                    # probe xem field "disabled" có thực sự tắt được hay
+                    # provider custom chấp nhận nhưng bỏ qua (vd 1 số
+                    # gateway Anthropic-format third-party). Best-effort,
+                    # 1 request rất nhẹ, chỉ chạy 1 lần rồi đánh dấu đã probe.
+                    works = _probe_thinking_disable(model, api_key)
+                    _thinking_disable_mark_probed(model)  # đánh dấu đã probe, dù kết quả gì
+                    if not works:
+                        print(f"{YELLOW}⚠ Provider này có vẻ KHÔNG tắt được thinking thật dù đã "
+                              f"gửi 'disabled' — model có thể tự bật thinking ngầm phía server.{R}")
+                        print(f"{DIM}  Đây là giới hạn của provider/gateway, không phải lỗi của "
+                              f"app. Nếu cần tắt hẳn, kiểm tra docs riêng của provider.{R}")
+                print()
+                continue
 
         if user.lower() == "/clear":
             conn.execute("DELETE FROM message WHERE session_id=?", (sid,))

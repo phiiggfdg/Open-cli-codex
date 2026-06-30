@@ -42,13 +42,16 @@ _BASH_DENY_RE = re.compile("|".join(_BASH_DENY_PATTERNS))
 # ── Bash safety gates ───────────────────────────────────────────────────────
 # Giữ hành vi cũ (shell=True) nhưng thêm confirm + allowlist tối thiểu.
 # Có 2 lớp permission độc lập:
-#   Lớp 1 — _check_permission() trong 10_main.py: hỏi "Allow? [y/N/a]"
+#   Lớp 1 — _check_permission() trong 08_undo_dispatch.py: hỏi "Allow? [y/N/a]"
 #            /perm bash allow chỉ ảnh hưởng lớp này (bỏ câu hỏi confirm).
-#   Lớp 2 — allowlist dưới đây (_BASH_ALLOW_RE / _BASH_CONFIRMED): chặn
+#   Lớp 2 — allowlist dưới đây (_BASH_ALLOW_RE): chặn
 #            lệnh không nằm trong danh sách (git/pytest/python/node/npm/make).
 #            /perm bash allow KHÔNG tắt lớp này — 2 lớp hoàn toàn độc lập.
-#            _BASH_CONFIRMED chỉ tự set True khi 1 lệnh hợp lệ đã chạy qua.
-_BASH_CONFIRM_EVERY_SESSION = True
+#   FIX (bug #1): trước đây allowlist chỉ check LỆNH ĐẦU TIÊN của session —
+#            sau khi 1 lệnh khớp allowlist chạy qua, cờ "_BASH_CONFIRMED" được
+#            set True vĩnh viễn và mọi lệnh sau đó (kể cả "rm -rf foo") bỏ qua
+#            hoàn toàn allowlist. Giờ allowlist được check ở MỌI lệnh — không
+#            còn cờ "đã confirm" nào tắt gate này nữa.
 _BASH_ALLOWLIST = [
     r"^git\b",
     r"^pytest\b",
@@ -60,17 +63,24 @@ _BASH_ALLOWLIST = [
     r"^make\b",
 ]
 _BASH_ALLOW_RE = re.compile("|".join(_BASH_ALLOWLIST), re.IGNORECASE)
-_BASH_CONFIRMED = False
 
 # Pattern chặn file inspection qua bash — AI phải dùng read/glob/grep thay thế
 # head/tail chỉ block khi đứng đầu lệnh (không phải sau pipe)
+# FIX (bug #2): trước đây các pattern chỉ bắt khi cat/less/head/tail/find
+#            đứng ngay sau ^ / && / ; — dễ bypass bằng subshell "(cat f)"
+#            hoặc "bash -c 'cat f'" / "sh -c 'cat f'". Giờ thêm "(" làm
+#            boundary hợp lệ, và chặn riêng cú pháp "bash -c"/"sh -c"/"zsh -c"
+#            vì nội dung trong dấu quote không thể parse an toàn bằng regex.
 _BASH_INSPECT_PATTERNS = [
-    r"(?:^|&&|;)\s*cat\s+\S",           # cat <file> (không phải | cat)
-    r"(?:^|&&|;)\s*less\s+\S",          # less <file>
-    r"(?:^|&&|;)\s*head\s+",            # head ... ở đầu lệnh
-    r"(?:^|&&|;)\s*tail\s+",            # tail ... ở đầu lệnh
-    r"(?:^|&&|;|\|)\s*ls\s+-[a-zA-Z]*R",# ls -R, ls -lR ở bất kỳ đâu
-    r"(?:^|&&|;)\s*find\s+[./]",        # find . / find ./dir ở đầu lệnh
+    r"(?:^|&&|;|\()\s*cat\s+\S",           # cat <file> hoặc (cat <file>)
+    r"(?:^|&&|;|\()\s*less\s+\S",          # less <file> hoặc (less <file>)
+    r"(?:^|&&|;|\()\s*head\s+",            # head ... ở đầu lệnh / trong subshell
+    r"(?:^|&&|;|\()\s*tail\s+",            # tail ... ở đầu lệnh / trong subshell
+    r"(?:^|&&|;|\||\()\s*ls\s+-[a-zA-Z]*R",# ls -R, ls -lR ở bất kỳ đâu
+    r"(?:^|&&|;|\()\s*find\s+[./]",        # find . / find ./dir
+    r"\b(?:bash|sh|zsh)\s+-c\b",           # bash -c "..." / sh -c "..." — chặn
+                                            # toàn bộ vì nội dung bên trong quote
+                                            # không kiểm tra an toàn bằng regex.
 ]
 _BASH_INSPECT_RE = re.compile("|".join(_BASH_INSPECT_PATTERNS))
 
@@ -82,22 +92,20 @@ def tool_bash(command, timeout=30):
             "Dùng các tool chuyên dụng thay thế:\n"
             "  • cat / head / tail / less  → read(path, offset, limit)\n"
             "  • ls -R / find .            → glob(pattern) hoặc read(dir)\n"
-            "Lý do: bash file inspection lãng phí token, phá cache context."
+            "  • bash -c / sh -c           → không hỗ trợ, dùng tool trực tiếp\n"
+            "Lý do: bash file inspection lãng phí token, phá cache context,\n"
+            "và subshell/`-c` không kiểm tra an toàn được bằng policy này."
         )
 
 
 
-    # ── Allowlist + confirm gate (minimal) ─────────────────────────────────
-    global _BASH_CONFIRMED
-    if _BASH_CONFIRM_EVERY_SESSION and not _BASH_CONFIRMED:
-        # Nếu lệnh không nằm trong allowlist → yêu cầu confirm qua permission layer
-        if not _BASH_ALLOW_RE.search(command.strip()):
-            return (
-                "[policy] bash command blocked by allowlist.\n"
-                "Hãy dùng lệnh trong allowlist (git/pytest/python/node/npm/make) hoặc\n"
-                "đổi strategy (tools read/write/edit/apply_patch)."
-            )
-        _BASH_CONFIRMED = True
+    # ── Allowlist gate (minimal) — áp dụng cho MỌI lệnh, không chỉ lệnh đầu ──
+    if not _BASH_ALLOW_RE.search(command.strip()):
+        return (
+            "[policy] bash command blocked by allowlist.\n"
+            "Hãy dùng lệnh trong allowlist (git/pytest/python/node/npm/make) hoặc\n"
+            "đổi strategy (tools read/write/edit/apply_patch)."
+        )
     if _project_dir is not None:
         proj = _project_dir.resolve()
 
@@ -277,6 +285,11 @@ def _prune_tool_results(messages: list) -> list:
 
     # ── Bước 2: dedup read/glob/grep theo file path ───────────────────────────
     # Map tool_call_id → tool_name cho các assistant messages
+    # FIX (bug #4): tool "glob" dùng tham số "pattern"/"cwd", KHÔNG có "path"
+    # (xem schema trong 05_session_db.py). Code cũ chỉ đọc args.get("path", "")
+    # nên với "glob" key dedup luôn là "" → "not path" = True → toàn bộ kết quả
+    # glob bị skip khỏi dedup, dù "glob" có mặt trong DEDUPABLE bên dưới (dead
+    # code). Giờ xây dựng key riêng cho từng tool: glob dùng "cwd|pattern".
     tc_id_to_name: dict[str, str] = {}
     for m in messages:
         if m.get("role") == "assistant" and m.get("tool_calls"):
@@ -287,7 +300,13 @@ def _prune_tool_results(messages: list) -> list:
                     args = json.loads(args_raw)
                 except Exception:
                     args = {}
-                path = args.get("path", "")
+                if name == "glob":
+                    # glob không có "path" — dùng cwd+pattern làm key dedup
+                    cwd = args.get("cwd", "")
+                    pattern = args.get("pattern", "")
+                    path = f"{cwd}|{pattern}" if pattern else ""
+                else:
+                    path = args.get("path", "")
                 tc_id_to_name[tc.get("id", "")] = (name, path)
 
     # Tìm các tool_result là read/grep/glob cùng path — chỉ giữ lần cuối
@@ -393,17 +412,50 @@ def _fw_data_dir() -> Path:
     return d
 
 def _index_path() -> Path:
-    """<cwd>/.fw_data/index.json — lưu cạnh project, ẩn khỏi mọi tool."""
-    return _fw_data_dir() / "index.json"
+    """<cwd>/.fw_data/index_<sid>.json — lưu cạnh project, ẩn khỏi mọi tool.
+    FIX (bug #6): trước đây file là <cwd>/.fw_data/index.json dùng CHUNG cho
+    mọi session trong cùng cwd, dù docstring/comment khẳng định "Per-session
+    file index". Nhưng key bên trong dict (xem _index_update) được tính theo
+    _workspace_root() — là sandbox RIÊNG từng session (cwd/<sid>). Hệ quả: 2
+    session khác nhau cùng cwd, nếu có file trùng tên tương đối (vd "foo.py"),
+    session chạy sau sẽ ghi đè entry "foo.py" của session chạy trước trong
+    cùng 1 file JSON, dù 2 file vật lý hoàn toàn khác nhau (sidA/foo.py vs
+    sidB/foo.py) — session trước "mất" index dù file vẫn còn nguyên trên đĩa.
+    Giờ tách file theo sid: mỗi session ghi vào index_<sid>.json riêng, không
+    còn đụng nhau. Fallback "index.json" (không sid) chỉ dùng khi chưa có sid
+    nào active (vd gọi ngoài luồng agent_turn bình thường).
+    """
+    sid = _project_dir_sid if _project_dir_sid else ""
+    fname = f"index_{sid}.json" if sid else "index.json"
+    return _fw_data_dir() / fname
 
 def _index_load() -> dict:
-    """Load index cho project hiện tại. Trả về {} nếu chưa có."""
+    """Load index cho project hiện tại. Trả về {} nếu chưa có.
+    Migrate-on-read: nếu file theo-sid chưa tồn tại nhưng index.json cũ
+    (không sid, từ trước khi fix bug #6) có entry thuộc workspace hiện tại,
+    import các entry đó vào lần đầu để không mất dữ liệu cũ của user."""
     p = _index_path()
     try:
         if p.exists():
             return json.loads(p.read_text())
     except Exception:
         pass
+    # Migrate-on-read từ index.json cũ (chung, trước bug-fix) nếu có
+    if _project_dir_sid:
+        legacy = _fw_data_dir() / "index.json"
+        if legacy.exists():
+            try:
+                legacy_index = json.loads(legacy.read_text())
+                root = _workspace_root()
+                migrated = {
+                    k: v for k, v in legacy_index.items()
+                    if Path(v.get("path", "")).resolve().is_relative_to(root)
+                }
+                if migrated:
+                    _index_save(migrated)
+                    return migrated
+            except Exception:
+                pass
     return {}
 
 def _index_save(index: dict):
@@ -622,6 +674,16 @@ def tool_read(path, offset=1, limit=READ_DEFAULT_LIMIT, depth=4):
     # cảnh báo, không đọc lại disk — tiết kiệm 1 tool-call thật như rule
     # "Re-read after edit = FORBIDDEN" trong system prompt đã yêu cầu.
     resolved_key = str(p.resolve())
+    # FIX (bug #7): trước đây nhánh này (a) không gọi _cache_invalidate() nên
+    # có thể trả về nội dung CŨ nếu file bị sửa từ bên ngoài app (process khác,
+    # user tự sửa tay, git checkout...) ngay sau write/edit gần nhất nhưng
+    # trước khi _cache_validate_all() chạy lại (nó chỉ chạy lazy, sau bước có
+    # write — xem 09_api_system.py); và (b) không cập nhật _file_read_time,
+    # khiến edit's FileTime safety check (tool_edit) dùng timestamp lỗi thời
+    # nếu thứ tự gọi đổi trong tương lai. Giờ luôn validate cache bằng hash
+    # trước khi quyết định dùng, và luôn cập nhật read-time khi trả từ cache.
+    if resolved_key in _recent_writes and resolved_key in _file_cache:
+        _cache_invalidate(resolved_key)  # pop khỏi _file_cache nếu hash lệch (external edit)
     if resolved_key in _recent_writes and resolved_key in _file_cache:
         cached = _file_cache[resolved_key]
         cached_lines = cached["content"].splitlines()
@@ -639,7 +701,11 @@ def tool_read(path, offset=1, limit=READ_DEFAULT_LIMIT, depth=4):
         remaining = ctotal - end
         if remaining > 0:
             out += f"\n\n(+{remaining} more lines — call read with offset={end+1} if truly needed)"
+        _file_read_time[resolved_key] = time.time()
         return out
+    # Nếu vừa pop cache vì external edit, bỏ luôn khỏi _recent_writes để
+    # nhánh đọc disk thật bên dưới chạy bình thường, không tự coi là "đã biết".
+    _recent_writes.discard(resolved_key)
 
     try:
         all_lines = p.read_text(errors="replace").splitlines()

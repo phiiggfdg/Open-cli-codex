@@ -644,14 +644,48 @@ def _call_simple(messages, model, api_key):
     return {"text": "[error: max retries exceeded]", "tool_calls": []}
 
 
-def _stream_response(resp, text_parts, tc_raw, usage_out, spinner_ref):
+def _stream_response(resp, text_parts, tc_raw, usage_out, spinner_ref, reasoning_parts=None,
+                      thinking_parts=None, thinking_sig=None, redacted_parts=None,
+                      fix_dup_tool_index=False):
     """
     Đọc SSE stream từ resp, fill vào text_parts / tc_raw / usage_out (dict).
     Trả về finish_reason (str | None).
     spinner_ref: list[Spinner] — stop spinner khi token đầu tiên về.
+    reasoning_parts: list | None — nếu truyền vào, gom delta.reasoning_content
+        (DeepSeek thinking mode / adapter dịch sang field này). Không in ra
+        màn hình (chỉ là CoT nội bộ) — chỉ giữ lại để gửi lại API ở lượt sau
+        nếu turn có tool_calls (DeepSeek bắt buộc trong trường hợp đó).
+        Mặc định None → không gom gì cả, hành vi y hệt code cũ.
+    thinking_parts: list | None — gom delta.thinking (Anthropic/Bedrock
+        extended thinking thật, KHÁC reasoning_content ở trên — xem
+        01c_anthropic.py/01b_aws.py). In trực tiếp ra màn hình màu DIM
+        theo yêu cầu, vì đây là nội dung thinking thật của model.
+    thinking_sig: list | None — gom delta.thinking_signature (chữ ký mã
+        hoá, cần lưu nguyên văn để replay đúng ở turn sau có tool_calls).
+    redacted_parts: list | None — gom delta.redacted_thinking_data. Khác
+        thinking_parts/thinking_sig: redacted_thinking là 1 block ĐÃ ĐẦY ĐỦ
+        ngay từ content_block_start (Anthropic/Bedrock không stream từng
+        phần nội dung đã mã hoá — chỉ có 1 field "data" opaque), nên adapter
+        emit nguyên block 1 lần qua field riêng "redacted_thinking_data"
+        thay vì nhiều delta nhỏ như thinking_delta/signature_delta. Phải
+        lưu lại nguyên văn (không sửa) để replay đúng ở turn sau có
+        tool_calls — Anthropic/Bedrock coi sửa đổi field này là lỗi 400.
+        Không in ra màn hình (nội dung đã mã hoá, không đọc được).
+    fix_dup_tool_index: bool — mặc định False (hành vi y hệt code cũ, áp
+        dụng cho mọi provider chuẩn OpenAI streaming: tên tool stream rời
+        ký tự nhưng CÙNG 1 tool_call thì luôn cùng 1 index → nối chuỗi là
+        đúng). CHỈ bật True cho provider Gemini (OpenAI-compat endpoint
+        của Google) — quan sát thực tế: Gemini có thể trả nhiều tool_call
+        KHÁC NHAU nhưng gắn cùng index=0, khiến nối chuỗi gộp nhầm nhiều
+        tên tool lại (vd "bash"+"edit"+"grep" → "basheditgrep" → lỗi
+        unknown tool → HTTP 400 INVALID_ARGUMENT ở turn sau). Khi bật,
+        nếu 1 index đã có name xong và delta mới tới có id khác hẳn id
+        đang lưu, coi đó là tool_call MỚI bị Gemini gắn nhầm index →
+        cấp 1 index giả mới (không đụng tới các provider khác).
     """
     finish_reason = None
     first_token   = True
+    first_thinking = True
     for raw_line in resp:
         line = raw_line.decode("utf-8").strip()
         if not line.startswith("data:"): continue
@@ -665,9 +699,45 @@ def _stream_response(resp, text_parts, tc_raw, usage_out, spinner_ref):
             if choice.get("finish_reason"):
                 finish_reason = choice["finish_reason"]
             delta = choice["delta"]
+            if reasoning_parts is not None and delta.get("reasoning_content"):
+                reasoning_parts.append(delta["reasoning_content"])
+            if delta.get("thinking"):
+                if thinking_parts is not None:
+                    thinking_parts.append(delta["thinking"])
+                if first_thinking:
+                    if spinner_ref:
+                        spinner_ref[0].stop()
+                    if _thinking_mode == "off":
+                        # Leak thật phát hiện tại runtime — đáng tin hơn
+                        # _probe_thinking_disable() (chỉ test 1 lần với
+                        # prompt ngắn "hi", có thể không đại diện đúng cho
+                        # turn dài/có tool_calls thật). Cảnh báo ngay đây,
+                        # bất kể probe trước đó đã báo "works=True" sai hay
+                        # đã bị skip do cache _thinking_disable_already_probed.
+                        # Chỉ in 1 lần/phiên (cờ in-memory) — tránh spam nếu
+                        # leak xảy ra liên tục nhiều turn liền.
+                        global _thinking_leak_warned_session
+                        if not _thinking_leak_warned_session:
+                            print(f"\n{YELLOW}⚠ Mode đang OFF nhưng provider vẫn trả thinking "
+                                  f"(leak runtime, không qua probe).{R}")
+                            _thinking_leak_warned_session = True
+                    print(f"\n{DIM}[thinking] ", end="", flush=True)
+                    first_thinking = False
+                print(f"{DIM}{delta['thinking']}{R}", end="", flush=True)
+            if delta.get("thinking_signature") and thinking_sig is not None:
+                thinking_sig.append(delta["thinking_signature"])
+            if delta.get("redacted_thinking_data") and redacted_parts is not None:
+                redacted_parts.append(delta["redacted_thinking_data"])
+                if first_thinking:
+                    if spinner_ref:
+                        spinner_ref[0].stop()
+                    print(f"\n{DIM}[thinking — redacted by safety system]{R}", end="", flush=True)
+                    first_thinking = False
             if first_token and (delta.get("content") or delta.get("tool_calls")):
                 if spinner_ref:
                     spinner_ref[0].stop()
+                if not first_thinking:
+                    print()  # xuống dòng sạch sau block thinking trước khi in AI:
                 print(f"\n{GREEN}{BOLD}AI:{R} ", end="", flush=True)
                 first_token = False
             if delta.get("content"):
@@ -675,6 +745,16 @@ def _stream_response(resp, text_parts, tc_raw, usage_out, spinner_ref):
                 text_parts.append(delta["content"])
             for tc in delta.get("tool_calls") or []:
                 idx = tc.get("index", 0)
+                tc_id = tc.get("id")
+                if fix_dup_tool_index:
+                    # Gemini-only: phát hiện idx bị tái sử dụng cho 1
+                    # tool_call KHÁC (id mới khác hẳn id đang lưu, trong
+                    # khi index cũ đã có name xong) → cấp index giả mới
+                    # thay vì nối chuỗi đè lên tool cũ.
+                    existing = tc_raw.get(idx)
+                    if (existing is not None and existing["function"]["name"]
+                            and tc_id and existing["id"] and tc_id != existing["id"]):
+                        idx = f"gemini_dup_{idx}_{tc_id}"
                 if idx not in tc_raw:
                     tc_raw[idx] = {"id": "", "type": "function",
                                    "function": {"name": "", "arguments": ""}}
@@ -682,6 +762,24 @@ def _stream_response(resp, text_parts, tc_raw, usage_out, spinner_ref):
                 fn = tc.get("function", {})
                 if fn.get("name"):      tc_raw[idx]["function"]["name"]      += fn["name"]
                 if fn.get("arguments"): tc_raw[idx]["function"]["arguments"] += fn["arguments"]
+                if fix_dup_tool_index:
+                    # Gemini-only: thought_signature bắt buộc phải replay lại
+                    # nguyên văn ở turn sau khi message có tool_calls, nếu
+                    # không API trả 400 "missing thought_signature in
+                    # functionCall parts". Field nằm ở
+                    # tool_calls[].extra_content.google.thought_signature
+                    # (Gemini OpenAI-compat endpoint). Theo Google: chỉ
+                    # function call ĐẦU TIÊN trong 1 response có signature
+                    # khi gọi song song nhiều tool — lưu field tạm
+                    # "_thought_signature" riêng trên từng tc_raw item (không
+                    # phải chuẩn OpenAI, tách khỏi "function" để không lẫn
+                    # vào name/arguments). Field tạm này chỉ được đọc bởi
+                    # nhánh replay Gemini bên dưới (a_msg) rồi bị strip ra —
+                    # 3 provider khác (OpenAI mặc định/Anthropic/Bedrock) và
+                    # mọi custom provider khác không bao giờ đọc field này.
+                    _sig = (tc.get("extra_content", {}) or {}).get("google", {}).get("thought_signature")
+                    if _sig:
+                        tc_raw[idx]["_thought_signature"] = _sig
         except (json.JSONDecodeError, KeyError, IndexError):
             continue
     return finish_reason
@@ -689,9 +787,31 @@ def _stream_response(resp, text_parts, tc_raw, usage_out, spinner_ref):
 
 def _sanitize_tool_turns(messages: list) -> list:
     """Đảm bảo mỗi assistant tool_call đều có tool result tương ứng.
-    Nếu thiếu (do crash/lỗi trước đó), inject placeholder để tránh HTTP 400."""
+    Nếu thiếu (do crash/lỗi trước đó), inject placeholder để tránh HTTP 400.
+
+    Bug fix: compact_messages() (05_session_db.py) cắt messages[-keep:] thuần
+    theo VỊ TRÍ, không biết gì về cặp assistant(tool_calls) ↔ tool(result).
+    Nếu ranh giới cắt rơi giữa 1 cặp, assistant gốc bị cắt vào phần tóm tắt
+    nhưng tool result vẫn còn trong phần giữ lại → tool message MỒ CÔI ở đầu
+    list (tool_call_id không khớp bất kỳ tool_calls nào còn trong history) →
+    API trả 400 (tool_result không khớp tool_use nào). Đã verify bằng test
+    brute-force thật, không phải lý thuyết. Lọc bỏ orphan TRƯỚC khi chạy
+    logic cũ (chỉ xử lý chiều thiếu — assistant tool_calls không có result).
+    """
+    # Bước 1: tập hợp toàn bộ tool_call_id hợp lệ (do assistant trong CHÍNH
+    # list này phát ra) — chỉ những id này mới có quyền xuất hiện ở role=tool.
+    valid_ids = {
+        tc.get("id", "")
+        for m in messages if m.get("role") == "assistant"
+        for tc in (m.get("tool_calls") or [])
+    }
+    filtered = [
+        m for m in messages
+        if not (m.get("role") == "tool" and m.get("tool_call_id", "") not in valid_ids)
+    ]
+
     result = []
-    for i, msg in enumerate(messages):
+    for i, msg in enumerate(filtered):
         result.append(msg)
         if msg.get("role") != "assistant":
             continue
@@ -701,8 +821,8 @@ def _sanitize_tool_turns(messages: list) -> list:
         # Tìm tool result ngay sau
         existing_ids = set()
         j = i + 1
-        while j < len(messages) and messages[j].get("role") == "tool":
-            existing_ids.add(messages[j].get("tool_call_id", ""))
+        while j < len(filtered) and filtered[j].get("role") == "tool":
+            existing_ids.add(filtered[j].get("tool_call_id", ""))
             j += 1
         # Inject placeholder cho tool_call nào thiếu response
         for tc in tcs:
@@ -714,6 +834,207 @@ def _sanitize_tool_turns(messages: list) -> list:
                     "content": "[tool_error: response missing — tool call was incomplete]"
                 })
     return result
+
+
+# ── Thinking mode (/mode) ─────────────────────────────────────────────────────
+# State trong phiên hiện tại — y hệt _tool_mode (/sequential, /batch): không
+# auto-persist riêng, nhưng kết quả "provider+model này có support thinking
+# không" thì lưu xuống config.json (xem _thinking_support_get/_set) để lần
+# mở app sau khỏi phải dò lại — tránh tốn token / lỗi vô ích cho mọi turn.
+_thinking_mode: str = "off"   # "off" hoặc "on" — set qua lệnh /mode
+
+# Cờ in-memory (KHÔNG persist) — chỉ cảnh báo leak runtime (mode off nhưng
+# provider vẫn trả thinking) 1 lần mỗi phiên chạy app, tránh spam mỗi turn
+# nếu provider leak liên tục nhiều turn liền. Reset về False mỗi lần mở app
+# (khác _thinking_disable_already_probed — cái đó persist qua config.json).
+_thinking_leak_warned_session: bool = False
+
+def _thinking_key(model: str) -> str:
+    """Key cache duy nhất cho 1 cặp provider+model (mỗi cặp khác nhau là khác nhau)."""
+    return f"{_active_provider}::{model}"
+
+def _thinking_support_get(model: str):
+    """True/False nếu đã biết, None nếu chưa từng thử (cần probe)."""
+    cfg = load_config()
+    table = cfg.get("thinking_support", {})
+    val = table.get(_thinking_key(model))
+    return val  # None nếu key chưa tồn tại
+
+def _thinking_support_set(model: str, supported: bool):
+    cfg = load_config()
+    table = cfg.get("thinking_support", {})
+    table[_thinking_key(model)] = supported
+    cfg["thinking_support"] = table
+    save_config(cfg)
+
+# Cache riêng: model CÓ support thinking (xác nhận ở _thinking_support_*
+# bên trên) NHƯNG gửi {"type": "disabled"} có thực sự tắt được không.
+# Lý do tách riêng: 2 câu hỏi độc lập. Model "support thinking" chỉ nghĩa
+# là nó CÓ khái niệm thinking — không suy ra được liệu field "disabled" có
+# tắt được thật hay không. Một số provider Anthropic-format custom (vd
+# MiniMax dòng M2.x) CHẤP NHẬN field "disabled" mà KHÔNG lỗi 400, nhưng
+# thinking vẫn tự bật ngầm phía server — y hệt vấn đề DeepSeek đã biết với
+# nhánh OpenAI-compat ("model mặc định tự bật thinking dù không gửi gì"),
+# nhưng ở đây còn tệ hơn: ngay cả gửi tường minh "disabled" cũng không có
+# tác dụng. Không thể tự dò bằng cách kiểm tra response body có thinking
+# hay không (model có thể chọn không thinking ở 1 câu hỏi cụ thể dù chưa
+# tắt được cơ chế), nên đây chỉ là cảnh báo người dùng — KHÔNG retry/đổi
+# field, vì không có field chuẩn nào khác để thử (tuỳ provider).
+def _thinking_disable_key(model: str) -> str:
+    return f"{_active_provider}::{model}::disable"
+
+def _thinking_disable_already_probed(model: str) -> bool:
+    """
+    True nếu đã probe (gọi _probe_thinking_disable) cho cặp (provider,
+    model) này rồi — dùng để quyết định có cần probe lại không, KHÔNG
+    phải kết quả probe (kết quả chỉ dùng 1 lần ngay lúc probe để in cảnh
+    báo, không cache lại — nếu cache cả True/False thì các bản fix
+    provider sau này sẽ không bao giờ được phát hiện lại).
+    """
+    cfg = load_config()
+    table = cfg.get("thinking_disable_warned", {})
+    return bool(table.get(_thinking_disable_key(model)))
+
+def _thinking_disable_mark_probed(model: str):
+    """Đánh dấu đã probe cho cặp (provider, model) này — chỉ probe (và in
+    cảnh báo nếu cần) 1 lần mỗi cặp, không lặp lại mỗi lần gõ /mode off."""
+    cfg = load_config()
+    table = cfg.get("thinking_disable_warned", {})
+    table[_thinking_disable_key(model)] = True
+    cfg["thinking_disable_warned"] = table
+    save_config(cfg)
+
+def _apply_thinking_param(payload: dict, model: str):
+    """
+    Gắn tham số thinking vào payload OpenAI-shape (call_api_stream luôn
+    build payload theo format này; 2 adapter Anthropic/AWS tự dịch tiếp ở
+    tầng dưới — xem _provider_request / _to_anthropic_payload / _to_converse_payload).
+
+    QUAN TRỌNG — "/mode off" KHÔNG đơn giản là "không gửi gì":
+    nhiều model (DeepSeek V4...) MẶC ĐỊNH TỰ BẬT thinking phía server dù
+    mình không gửi tham số gì cả. Nếu off chỉ im lặng không gửi, model vẫn
+    tự thinking như cũ → off vô tác dụng. Vì vậy: khi đã biết chắc model
+    này support thinking (cache=True, tức nó CÓ khái niệm thinking), off
+    phải CHỦ ĐỘNG gửi {"type": "disabled"} để ép tắt thật.
+
+    Model chưa rõ / đã biết KHÔNG support thinking thì cả hai chiều on/off
+    đều không gửi field "thinking" — tránh gửi tham số lạ cho model không
+    hiểu, có thể gây lỗi 400/422 không cần thiết.
+    """
+    supported = _thinking_support_get(model)
+    if supported is not True:
+        return  # chưa biết hoặc biết chắc KHÔNG support → không gắn gì cả, dù on hay off
+
+    if _prov().get("format_anthropic") or _active_provider == "aws_bedrock":
+        # Anthropic Messages API / Bedrock Converse: extended thinking.
+        # _to_anthropic_payload và _to_converse_payload đọc field "thinking"
+        # gốc OpenAI-shape này (xem TODO dịch tiếp ở 2 adapter nếu cần).
+        if _thinking_mode == "on":
+            payload["thinking"] = {"type": "enabled", "budget_tokens": 8000}
+        else:
+            payload["thinking"] = {"type": "disabled"}
+    else:
+        # OpenAI-compatible (DeepSeek/GLM/Qwen-thinking qua unimodel...):
+        # chuẩn DeepSeek dùng extra_body.thinking — payload ở đây gửi thẳng
+        # JSON nên không có khái niệm extra_body riêng, set thẳng key.
+        if _thinking_mode == "on":
+            payload["thinking"] = {"type": "enabled"}
+        else:
+            payload["thinking"] = {"type": "disabled"}
+
+def _probe_thinking_support(model: str, api_key: str) -> bool:
+    """
+    Gửi 1 request rất nhẹ (1 câu hỏi ngắn, không tool, max_tokens nhỏ) kèm
+    tham số thinking để xem provider+model này có thực sự trả reasoning_content
+    không. Dùng đúng 1 lần cho mỗi cặp (provider, model) — kết quả được cache
+    lại (_thinking_support_set) nên các lần sau không tốn thêm request nào.
+    """
+    probe_payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 64,
+        "stream": False,
+    }
+    if _prov().get("format_anthropic") or _active_provider == "aws_bedrock":
+        probe_payload["thinking"] = {"type": "enabled", "budget_tokens": 1024}
+    else:
+        probe_payload["thinking"] = {"type": "enabled"}
+    try:
+        req = _provider_request("/chat/completions", api_key, probe_payload)
+        if _active_provider == "aws_bedrock":
+            resp_cm = urlopen_smart(req, api_key, probe_payload, timeout=30)
+        else:
+            resp_cm = urllib.request.urlopen(req, timeout=30)
+        with resp_cm as resp:
+            body = json.loads(resp.read())
+        if _active_provider == "aws_bedrock":
+            # Bedrock Converse: reasoningContent nằm trong content blocks.
+            blocks = (body.get("output", {}).get("message", {}) or {}).get("content", [])
+            return any("reasoningContent" in b for b in blocks)
+        if _prov().get("format_anthropic"):
+            blocks = body.get("content", [])
+            return any(b.get("type") == "thinking" for b in blocks)
+        msg = body.get("choices", [{}])[0].get("message", {})
+        return bool(msg.get("reasoning_content"))
+    except Exception:
+        # Lỗi (400/422/network...) → coi như KHÔNG support, tránh thử lại
+        # liên tục gây tốn request mỗi lần user gõ /mode.
+        return False
+
+
+def _probe_thinking_disable(model: str, api_key: str) -> bool:
+    """
+    Chỉ gọi khi model ĐÃ XÁC NHẬN support thinking (qua _probe_thinking_support)
+    VÀ format_anthropic/aws_bedrock. Câu hỏi khác với probe trên: gửi
+    {"type": "disabled"} có thực sự tắt được thinking không, hay provider
+    chấp nhận field này (không lỗi 400) nhưng vẫn tự bật ngầm — case đã
+    xác nhận xảy ra thật với 1 số provider Anthropic-format custom (vd
+    MiniMax dòng M2.x: "thinking cannot be disabled; thinking: disabled
+    is accepted but thinking remains on").
+
+    Không áp dụng cho nhánh OpenAI-compat (DeepSeek...): _apply_thinking_param()
+    đã xử lý đúng bằng cách LUÔN gửi field "disabled" tường minh khi biết
+    model support thinking — nếu provider đó vẫn không tắt được thì đó là
+    giới hạn riêng, không có thêm field chuẩn nào khác để dò/thử.
+
+    Trả về True nếu "disabled" hoạt động đúng (không thấy thinking/
+    redacted_thinking block nào trong response), False nếu vẫn thấy
+    thinking dù đã gửi disabled. Kết quả chỉ dùng để CẢNH BÁO người dùng
+    1 lần (xem _thinking_disable_mark_probed) — không có cách chuẩn hoá hơn
+    để ép tắt vì hành vi này tuỳ provider custom.
+    """
+    probe_payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 64,
+        "stream": False,
+        "thinking": {"type": "disabled"},
+    }
+    try:
+        req = _provider_request("/chat/completions", api_key, probe_payload)
+        if _active_provider == "aws_bedrock":
+            resp_cm = urlopen_smart(req, api_key, probe_payload, timeout=30)
+        else:
+            resp_cm = urllib.request.urlopen(req, timeout=30)
+        with resp_cm as resp:
+            body = json.loads(resp.read())
+        if _active_provider == "aws_bedrock":
+            blocks = (body.get("output", {}).get("message", {}) or {}).get("content", [])
+            return not any("reasoningContent" in b for b in blocks)
+        if _prov().get("format_anthropic"):
+            blocks = body.get("content", [])
+            return not any(b.get("type") in ("thinking", "redacted_thinking") for b in blocks)
+        # Nhánh OpenAI-compat: hàm này chỉ được gọi khi format_anthropic
+        # hoặc aws_bedrock (xem guard ở 10_main.py), nhưng tự bảo vệ ở đây
+        # thay vì ngầm định body.get("content") luôn rỗng/an toàn — tránh
+        # silent-return True sai nếu guard ở caller đổi trong tương lai.
+        return True
+    except Exception:
+        # Lỗi khi probe disable (vd provider từ chối thẳng field "disabled"
+        # với 400) — không suy luận được gì chắc chắn về hành vi thinking
+        # thật, coi như "đã tắt được" để tránh cảnh báo sai do lỗi network
+        # nhất thời không liên quan.
+        return True
 
 
 # Cache max_tokens đã biết là an toàn cho từng model (key: model name).
@@ -734,13 +1055,21 @@ def call_api_stream(messages, model, api_key, tool_choice="auto", session_id=Non
         payload["temperature"] = 0.3
     if _active_provider == "mercury":
         payload["reasoning_effort"] = "low"
-    if _active_provider in ("cohere", "cerebras", "upstage"):
+    if _active_provider in ("cohere", "cerebras") or _active_provider.startswith("upstage"):
         # Cohere + Cerebras không hỗ trợ parallel_tool_calls → trả 422 nếu gửi.
+        # FIX (bug #8): "upstage" không có trong PROVIDERS built-in (xem
+        # 02_provider.py) — provider này chỉ tồn tại nếu user tự thêm qua
+        # _add_custom_provider(), và slug được sinh TỰ ĐỘNG từ tên người dùng
+        # gõ (lowercase, strip ký tự lạ, vd "Upstage AI" → "upstage_ai"). So
+        # khớp exact "upstage" trước đây khiến rule này im lặng không kích
+        # hoạt với bất kỳ tên nào khác "upstage" y hệt. Giờ dùng startswith
+        # để bắt mọi biến thể tên hợp lý mà vẫn không đụng tới provider khác.
         del payload["parallel_tool_calls"]
     if _active_provider == "cerebras":
         # zai-glm-4.7 max output là 40K, gpt-oss-120b giới hạn tương tự.
         # Dùng max_completion_tokens thay max_tokens (Cerebras docs khuyến nghị).
         payload["max_completion_tokens"] = payload.pop("max_tokens", 32768)
+    _apply_thinking_param(payload, model)
     extra_hdrs = {}
     if session_id:
         extra_hdrs["x-session-affinity"] = session_id
@@ -755,6 +1084,10 @@ def call_api_stream(messages, model, api_key, tool_choice="auto", session_id=Non
     for attempt in range(_RETRY_MAX):
         text_parts    = []
         tc_raw: dict  = {}
+        reasoning_parts: list = []
+        thinking_parts: list = []
+        thinking_sig: list = []
+        redacted_parts: list = []
         _rate_limit_wait()
         req = _provider_request("/chat/completions", api_key, payload,
                                 extra_headers=extra_hdrs)
@@ -770,7 +1103,11 @@ def call_api_stream(messages, model, api_key, tool_choice="auto", session_id=Non
                               if _prov().get("format_anthropic")
                               else resp)
                 finish_reason = _stream_response(
-                    stream_src, text_parts, tc_raw, usage, spinner_ref)
+                    stream_src, text_parts, tc_raw, usage, spinner_ref,
+                    reasoning_parts=reasoning_parts,
+                    thinking_parts=thinking_parts, thinking_sig=thinking_sig,
+                    redacted_parts=redacted_parts,
+                    fix_dup_tool_index=(_active_provider == "gemini"))
             _rate_limit_mark()
             break   # thành công — thoát retry loop
 
@@ -809,7 +1146,7 @@ def call_api_stream(messages, model, api_key, tool_choice="auto", session_id=Non
             # Lỗi khác không retry
             spinner_ref[0].stop()
             print(f"\n{RED}HTTP {e.code}: {body_txt[:300]}{R}")
-            return {"text": "", "tool_calls": [], "usage": {}, "truncated": False}
+            return {"text": "", "tool_calls": [], "usage": {}, "truncated": False, "reasoning": "", "thinking": "", "thinking_signature": "", "redacted_thinking_data": ""}
 
         except urllib.error.URLError as e:
             # Network timeout / connection refused — có thể retry
@@ -826,7 +1163,7 @@ def call_api_stream(messages, model, api_key, tool_choice="auto", session_id=Non
                 continue
             spinner_ref[0].stop()
             print(f"\n{RED}Network error: {e}{R}")
-            return {"text": "", "tool_calls": [], "usage": {}, "truncated": False}
+            return {"text": "", "tool_calls": [], "usage": {}, "truncated": False, "reasoning": "", "thinking": "", "thinking_signature": "", "redacted_thinking_data": ""}
 
         except KeyboardInterrupt:
             interrupted = True
@@ -838,7 +1175,7 @@ def call_api_stream(messages, model, api_key, tool_choice="auto", session_id=Non
         # Hết retry mà vẫn chưa break
         spinner_ref[0].stop()
         print(f"\n{RED}  ✗ Quá số lần retry ({_RETRY_MAX}). Bỏ qua.{R}")
-        return {"text": "", "tool_calls": [], "usage": {}, "truncated": False}
+        return {"text": "", "tool_calls": [], "usage": {}, "truncated": False, "reasoning": "", "thinking": "", "thinking_signature": "", "redacted_thinking_data": ""}
 
     spinner_ref[0].stop()
     _rate_limit_mark()
@@ -852,6 +1189,10 @@ def call_api_stream(messages, model, api_key, tool_choice="auto", session_id=Non
         "usage":      usage,
         "truncated":  truncated,
         "interrupted": interrupted,
+        "reasoning":  "".join(reasoning_parts),
+        "thinking":   "".join(thinking_parts),
+        "thinking_signature": "".join(thinking_sig),
+        "redacted_thinking_data": "".join(redacted_parts),
     }
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1274,6 +1615,86 @@ def agent_turn(messages, model, api_key, conn, sid, max_steps=20, agent=AGENT_BU
             if tcs:
                 a_msg = {"role": "assistant", "content": text or None,
                          "tool_calls": tcs}
+                # DeepSeek thinking mode: reasoning_content chỉ BẮT BUỘC phải
+                # gửi lại API khi assistant message có tool_calls (xem docs
+                # api-docs.deepseek.com/guides/thinking_mode). Turn không có
+                # tool_calls thì field này bị ignore nếu gửi → không thêm,
+                # tránh tốn token / không cần thiết.
+                #
+                # QUAN TRỌNG: KHÔNG áp dụng cơ chế reasoning_content (text
+                # thuần) này cho provider Anthropic-format hoặc aws_bedrock.
+                # Cả hai yêu cầu thinking block đi kèm "signature" — chữ ký
+                # mã hoá thật do chính Anthropic cấp, không thể tự tạo lại từ
+                # text thuần. Gắn reasoning_content (không signature) vào đây
+                # cho 2 provider này sẽ khiến adapter build ra 1 thinking
+                # block giả → bị từ chối 400 ngay khi có tool_calls.
+                # → 2 provider này dùng nhánh else bên dưới: lưu/replay
+                # signature THẬT qua thinking_block (đã triển khai đầy đủ,
+                # xem _to_anthropic_payload/_to_converse_payload).
+                if not (_prov().get("format_anthropic") or _active_provider == "aws_bedrock"):
+                    _reasoning = result.get("reasoning") or ""
+                    if _reasoning:
+                        a_msg["reasoning_content"] = _reasoning
+                else:
+                    # Anthropic/Bedrock: lưu thinking_block với cấu trúc
+                    # gốc (thinking text + signature mã hoá thật) — KHÔNG
+                    # nén thành text thuần như DeepSeek, vì signature
+                    # không thể tự tạo lại. Chỉ gắn khi có CẢ HAI thinking
+                    # text và signature thật trả về (đủ điều kiện replay
+                    # hợp lệ ở turn sau). Chỉ cần thiết khi có tool_calls
+                    # (turn này có tcs — đang ở nhánh if tcs: rồi), tránh
+                    # lưu thừa dữ liệu sẽ rớt khi load lại session (xem
+                    # _normalize_message — message không có tool_calls
+                    # không giữ field lạ).
+                    _think_text = result.get("thinking") or ""
+                    _think_sig  = result.get("thinking_signature") or ""
+                    _redacted   = result.get("redacted_thinking_data") or ""
+                    # redacted_thinking là 1 block KHÁC thinking thường —
+                    # không có "thinking text" đọc được, chỉ có "data" mã
+                    # hoá nguyên khối. Anthropic/Bedrock đều yêu cầu pass-
+                    # through nguyên văn (không sửa) ở turn sau có
+                    # tool_calls, y hệt cách signature thường phải giữ
+                    # nguyên. Lưu riêng "redacted" để _to_anthropic_payload/
+                    # _to_converse_payload biết replay đúng type
+                    # "redacted_thinking" thay vì "thinking".
+                    # Một turn có thể có CẢ HAI (thinking block thường +
+                    # 1 redacted_thinking block kế tiếp) — nhưng vì code
+                    # này gom toàn bộ thinking text của 1 turn thành 1
+                    # block duy nhất (không tách theo content_block index),
+                    # ưu tiên: nếu có redacted, replay redacted (an toàn —
+                    # bỏ qua redacted là vi phạm yêu cầu round-trip của
+                    # Anthropic); nếu không, dùng thinking+signature thường.
+                    if _redacted:
+                        a_msg["thinking_block"] = {"redacted": _redacted}
+                    elif _think_text and _think_sig:
+                        a_msg["thinking_block"] = {
+                            "thinking": _think_text,
+                            "signature": _think_sig,
+                        }
+
+                # Gemini-only: gắn lại thought_signature đúng vị trí
+                # (tool_call ĐẦU TIÊN trong tcs) trước khi gửi turn sau, theo
+                # đúng field Gemini yêu cầu. Nếu vì lý do nào đó không lưu
+                # được signature thật (vd: history cũ trước khi patch, hoặc
+                # provider không trả về), dùng dummy
+                # "skip_thought_signature_validator" theo khuyến nghị chính
+                # thức của Google để tránh lỗi 400 mà không cần signature
+                # thật. Luôn strip field tạm "_thought_signature" khỏi MỌI
+                # tool_call trong tcs (kể cả khi không phải Gemini) để không
+                # rò rỉ field lạ vào payload của provider khác — dù trên
+                # thực tế field này chỉ được set khi fix_dup_tool_index=True
+                # (tức đã là Gemini) nên các provider khác không bao giờ có
+                # field này để mà strip, đây chỉ là phòng hờ thêm 1 lớp an
+                # toàn, không đổi hành vi của OpenAI mặc định/Anthropic/
+                # Bedrock/custom provider khác.
+                if _active_provider == "gemini" and tcs:
+                    _first_sig = tcs[0].pop("_thought_signature", None) or "skip_thought_signature_validator"
+                    tcs[0].setdefault("extra_content", {}).setdefault("google", {})["thought_signature"] = _first_sig
+                    for _tc in tcs[1:]:
+                        _tc.pop("_thought_signature", None)
+                else:
+                    for _tc in tcs:
+                        _tc.pop("_thought_signature", None)
             else:
                 a_msg = {"role": "assistant", "content": text}
             messages.append(a_msg)

@@ -146,6 +146,19 @@ def tool_glob(pattern, cwd=None):
     base = Path(base_str)
     err = _check_sandbox_read(str(base))
     if err: return err
+    # FIX (bug #3): _check_sandbox_read() chỉ kiểm tra `base` (root tìm kiếm),
+    # KHÔNG kiểm tra từng kết quả match sau khi `pattern` được áp dụng. Nếu
+    # pattern chứa "../" (vd "../other_session/*.py"), kết quả có thể nằm
+    # NGOÀI sandbox dù base hợp lệ — lộ tên/đường dẫn file của session khác.
+    # Giải pháp: resolve `base` một lần, rồi lọc lại từng match để đảm bảo nó
+    # thực sự nằm trong base sau khi resolve (chặn mọi dạng "..").
+    base_resolved = base.resolve()
+    def _inside_base(m: Path) -> bool:
+        try:
+            m.resolve().relative_to(base_resolved)
+            return True
+        except ValueError:
+            return False
     # Try fd (fast, respects .gitignore) then fall back to Python glob
     if shutil.which("fd"):
         try:
@@ -155,6 +168,9 @@ def tool_glob(pattern, cwd=None):
                 capture_output=True, text=True, timeout=10)
             out = r.stdout.strip()
             lines = [l for l in out.splitlines() if l.strip() not in ("fw.py", "./fw.py")]
+            # FIX (bug #3): fd cũng có thể trả về path "../..." nếu pattern
+            # chứa traversal — lọc lại từng dòng theo base_resolved.
+            lines = [l for l in lines if _inside_base(base / l)]
             return "\n".join(lines) or "(no matches)"
         except Exception:
             pass
@@ -163,7 +179,8 @@ def tool_glob(pattern, cwd=None):
         # Lọc bỏ .fw_data và fw.py — không bao giờ xuất hiện trong kết quả
         matches = [m for m in matches
                    if FW_DATA_NAME not in m.parts
-                   and not (m.parent == base and m.name == "fw.py")]
+                   and not (m.parent == base and m.name == "fw.py")
+                   and _inside_base(m)]
         return "\n".join(str(m.relative_to(base)) for m in matches[:300]) or "(no matches)"
     except Exception as e:
         return f"[error: {e}]"
@@ -203,6 +220,16 @@ def tool_view_symbol(path, symbol):
     Không cần đọc full file — tiết kiệm token tối đa.
     Hỗ trợ: Python, JS/TS, Java, Go, Rust, PHP, Ruby, C/C++
     """
+    # Auto-resolve vào sandbox chỉ khi sandbox đã enforce (không phải placeholder)
+    # — đồng bộ với tool_read, tránh side-effect tự enforce sandbox sớm.
+    if _project_dir is not None and not _project_dir_is_placeholder:
+        resolved_p = Path(path).expanduser()
+        try:
+            resolved_p.resolve().relative_to(_project_dir.resolve())
+        except ValueError:
+            sandbox_p = _resolve_to_sandbox(path)
+            if sandbox_p.exists():
+                path = str(sandbox_p)
     err = _check_sandbox_read(path)
     if err: return err
     p = Path(path).expanduser()
@@ -458,6 +485,19 @@ def tool_websearch(query, num=5):
                     break
 
         # Pattern C: uddg= redirect links — robust nhất khi markup thay đổi
+        # Lọc bỏ link nội bộ DDG (footer/help/about/privacy/ads) — đây là
+        # nguyên nhân gây ra kết quả rác kiểu "ads-by-microsoft" thay vì
+        # kết quả tìm kiếm thật.
+        _DDG_JUNK_HOSTS = (
+            "duckduckgo.com",  # help pages, about, privacy, company/...
+        )
+        def _is_junk_result(url_r: str) -> bool:
+            try:
+                host = urllib.parse.urlparse(url_r).netloc.lower()
+            except Exception:
+                return False
+            return any(host == h or host.endswith("." + h) for h in _DDG_JUNK_HOSTS)
+
         if not results:
             for m in re.finditer(
                 r'>([^<]{5,80})</[^>]+>\s*(?:<[^>]+>\s*)*'
@@ -466,7 +506,7 @@ def tool_websearch(query, num=5):
             ):
                 title = m.group(1).strip()
                 url_r = urllib.parse.unquote(m.group(2))
-                if url_r not in seen_urls:
+                if url_r not in seen_urls and not _is_junk_result(url_r):
                     seen_urls.add(url_r)
                     results.append(f"**{title}**\n{url_r}")
                 if len(results) >= int(num):
@@ -475,7 +515,7 @@ def tool_websearch(query, num=5):
             if not results:
                 for m in re.finditer(r'uddg=(https?%3A%2F%2F[^&"]+)', html):
                     url_r = urllib.parse.unquote(m.group(1))
-                    if url_r not in seen_urls:
+                    if url_r not in seen_urls and not _is_junk_result(url_r):
                         seen_urls.add(url_r)
                         results.append(url_r)
                     if len(results) >= int(num):
@@ -594,18 +634,14 @@ def tool_verify(path: str, reason: str = "") -> str:
     except (EOFError, KeyboardInterrupt):
         return "verification skipped"
     if ans in ("y", "yes"):
-        # Thực hiện read/ls tuỳ loại
-        p = Path(path).expanduser()
+        # Resolve qua sandbox giống mọi tool khác (write/edit/read/extract...)
+        p = _resolve_to_sandbox(path)
         if p.is_dir():
             return tool_read(str(p), depth=2)
         elif p.is_file():
             return tool_read(str(p), limit=30)
         else:
-            try:
-                r = subprocess.run(["ls", "-lh", path], capture_output=True, text=True, timeout=5)
-                return r.stdout.strip() or r.stderr.strip() or "(no output)"
-            except Exception as e:
-                return f"[verify error: {e}]"
+            return f"[verify] not found: {p}"
     return "verification skipped by user"
 
 
@@ -745,42 +781,54 @@ def tool_lsp(operation, file=None, line=None, character=None, query=None):
 
     # ── definition ────────────────────────────────────────────────────────────
     if operation == "definition":
-        if not file:
-            return "[lsp] definition requires file"
-        src = _read(file)
-        if src is None:
-            return f"[lsp] Cannot read {file}"
-        src_lines = src.splitlines()
-        ln  = int(line or 1)
-        col = int(character or 0)
-        # Get token under cursor or use query
-        name = query or _token_at(src_lines, ln, col)
+        if not file and not query:
+            return "[lsp] definition requires file (or query to search by name)"
+        name = query
+        src_lines = []
+        if file:
+            src = _read(file)
+            if src is None:
+                return f"[lsp] Cannot read {file}"
+            src_lines = src.splitlines()
+            ln  = int(line or 1)
+            col = int(character or 0)
+            # Get token under cursor or use query
+            name = query or _token_at(src_lines, ln, col)
+            if not name:
+                return "[lsp] No symbol at cursor"
+            tree = _parse(src)
+            if tree:
+                symbols = _all_symbols(tree, src_lines)
+                for s in symbols:
+                    if s["name"] == name:
+                        snippet = src_lines[s["line"]-1].strip()
+                        return f"Definition of `{name}`:\n  {file}:{s['line']}  {snippet}"
         if not name:
             return "[lsp] No symbol at cursor"
-        tree = _parse(src)
-        if tree:
-            symbols = _all_symbols(tree, src_lines)
-            for s in symbols:
-                if s["name"] == name:
-                    snippet = src_lines[s["line"]-1].strip()
-                    return f"Definition of `{name}`:\n  {file}:{s['line']}  {snippet}"
-        # Grep fallback across project
-        result = tool_grep(f"def {name}", Path(file).parent.name or ".")
+        # Grep fallback across project (cũng dùng khi không truyền file).
+        # Thử cả "def name" (function/method) lẫn "class name" — trước đây
+        # chỉ thử "def" nên không tìm được class definition qua fallback.
+        search_root = Path(file).parent.name if file else "."
+        result = tool_grep(f"def {name}", search_root or ".")
+        if "(no matches)" in result:
+            result = tool_grep(f"class {name}", search_root or ".")
         if "(no matches)" not in result:
             return f"Definition of `{name}` (grep):\n{result[:800]}"
-        return f"[lsp] Definition of `{name}` not found in {file}"
+        return f"[lsp] Definition of `{name}` not found"
 
     # ── references ────────────────────────────────────────────────────────────
     if operation == "references":
-        if not file:
-            return "[lsp] references requires file"
-        src = _read(file)
-        if src is None:
-            return f"[lsp] Cannot read {file}"
-        src_lines = src.splitlines()
-        ln  = int(line or 1)
-        col = int(character or 0)
-        name = query or _token_at(src_lines, ln, col)
+        if not file and not query:
+            return "[lsp] references requires file (or query to search by name)"
+        name = query
+        if file:
+            src = _read(file)
+            if src is None:
+                return f"[lsp] Cannot read {file}"
+            src_lines = src.splitlines()
+            ln  = int(line or 1)
+            col = int(character or 0)
+            name = query or _token_at(src_lines, ln, col)
         if not name:
             return "[lsp] No symbol at cursor"
         return _workspace_references(name, seed_file=file)

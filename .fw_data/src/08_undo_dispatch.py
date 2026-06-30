@@ -308,10 +308,24 @@ def _check_permission(name, args, agent=None):
     level = perms.get(name)
     if level is None:
         import fnmatch
+        # FIX (bug #5): trước đây dùng "for pattern, plevel in perms.items(): ...
+        # break" — kết quả phụ thuộc INSERTION ORDER của dict, không phải độ cụ
+        # thể của pattern. Ví dụ "/perm mcp__* ask" gõ trước rồi
+        # "/perm mcp__github_* deny" gõ sau → vì "mcp__*" đứng trước trong dict,
+        # nó luôn match trước và break, khiến rule "deny" cụ thể hơn KHÔNG BAO
+        # GIỜ có tác dụng — user tưởng đã deny nhưng vẫn ask/allow. Đảo thứ tự
+        # gõ lệnh cho kết quả ngược lại hoàn toàn dù ý định không đổi.
+        # Giờ: thu thập TẤT CẢ pattern khớp, chọn pattern có phần literal (loại
+        # bỏ ký tự "*") dài nhất — tức cụ thể nhất — bất kể thứ tự nhập.
+        best_pattern = None
+        best_specificity = -1
         for pattern, plevel in perms.items():
             if "*" in pattern and fnmatch.fnmatch(name, pattern):
-                level = plevel
-                break
+                specificity = len(pattern.replace("*", ""))
+                if specificity > best_specificity:
+                    best_specificity = specificity
+                    best_pattern = pattern
+                    level = plevel
     if level is None:
         level = PERM_ALLOW
     if level == PERM_DENY:

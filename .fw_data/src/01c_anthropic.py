@@ -121,6 +121,28 @@ def _to_anthropic_payload(payload: dict) -> dict:
             # content rỗng CHỈ khi không có text VÀ không có tool_calls —
             # khi đó fallback 1 text block rỗng vì Anthropic cần ≥1 block.
             # Nếu có tool_use, content đã không rỗng → không bị fallback.
+            # Replay thinking/redacted_thinking THẬT: nếu message gốc có
+            # tool_calls VÀ thinking_block hợp lệ (lưu bởi agent_turn() ở
+            # 09_api_system.py), prepend đúng block vào ĐẦU content —
+            # Anthropic yêu cầu: "final assistant message must start with
+            # a thinking (or redacted_thinking) block" khi nó dẫn tới
+            # tool_use. Phải giữ nguyên văn, không sửa — kể cả với
+            # redacted_thinking, dù "data" không đọc được, Anthropic vẫn
+            # coi sửa đổi field này là lỗi 400 (docs: "you should pass
+            # redacted_thinking blocks back to the API unchanged").
+            tb = m.get("thinking_block")
+            if m.get("tool_calls") and isinstance(tb, dict):
+                if tb.get("redacted"):
+                    content.insert(0, {
+                        "type": "redacted_thinking",
+                        "data": tb["redacted"],
+                    })
+                elif tb.get("signature"):
+                    content.insert(0, {
+                        "type":      "thinking",
+                        "thinking":  tb.get("thinking", ""),
+                        "signature": tb.get("signature", ""),
+                    })
             anth_messages.append({"role": "assistant", "content": content or [{"type": "text", "text": ""}]})
 
         else:  # user
@@ -145,6 +167,61 @@ def _to_anthropic_payload(payload: dict) -> dict:
     temp = payload.get("temperature")
     if temp is not None:
         out["temperature"] = temp
+
+    # Extended thinking — field "thinking" được _apply_thinking_param()
+    # (09_api_system.py) gắn sẵn theo OpenAI-shape payload khi user bật
+    # /mode thinking VÀ provider+model này đã xác nhận support (cache).
+    # Dịch sang đúng format Anthropic Messages API:
+    #   https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking
+    #
+    # Lưu/replay thinking THẬT: agent_turn() (09_api_system.py) lưu
+    # a_msg["thinking_block"] = {"thinking":..., "signature":...} (block
+    # thường) HOẶC {"redacted": ...} (redacted_thinking, khi nội dung suy
+    # luận bị hệ thống an toàn của Anthropic mã hoá — không có "thinking
+    # text" đọc được, chỉ có "data" opaque, xem nhánh redacted_thinking ở
+    # _to_anthropic_payload bên trên) khi turn đó có tool_calls. Ở đây,
+    # nếu message assistant gần nhất (có thể không phải message cuối cùng
+    # trong list — turn sau nó có thể đã .extend() thêm tool result) có
+    # tool_calls VÀ có thinking_block hợp lệ (1 trong 2 dạng trên), giữ
+    # nguyên thinking cho turn này — phần prepend thật sự nằm ở vòng lặp
+    # build content phía trên (Anthropic yêu cầu: "final assistant message
+    # must start with a thinking or redacted_thinking block"). Nếu KHÔNG
+    # có thinking_block hợp lệ (history cũ trước khi có fix này, hoặc
+    # provider không trả về signature/redacted) → tự động tắt thinking cho
+    # turn này thay vì cố gửi rồi ăn lỗi 400.
+    thinking = payload.get("thinking")
+    if thinking and thinking.get("type") == "enabled":
+        _last_assistant = next(
+            (m for m in reversed(messages_in) if m.get("role") == "assistant"),
+            None,
+        )
+        if _last_assistant and _last_assistant.get("tool_calls"):
+            tb = _last_assistant.get("thinking_block")
+            _has_valid_tb = isinstance(tb, dict) and (
+                tb.get("redacted") or tb.get("signature")
+            )
+            if not _has_valid_tb:
+                thinking = None  # thiếu thinking_block hợp lệ — bỏ qua, không set out["thinking"]
+    if thinking and thinking.get("type") == "enabled":
+        budget = thinking.get("budget_tokens", 8000)
+        out["thinking"] = {"type": "enabled", "budget_tokens": budget}
+        # Anthropic KHÔNG cho phép set temperature khi thinking bật (API
+        # trả 400 nếu có) — bỏ field này, không liên quan gì tới việc
+        # _no_temperature() đã xử lý cho Claude 4+ ở trên, đây là rule
+        # riêng của thinking mode, áp dụng bất kể model nào.
+        out.pop("temperature", None)
+        # max_tokens phải LỚN HƠN budget_tokens, nếu không Anthropic 400.
+        if out.get("max_tokens", 0) <= budget:
+            out["max_tokens"] = budget + ANTHROPIC_DEFAULT_MAX_TOKENS
+    elif thinking is not None and thinking.get("type") == "disabled":
+        # Trước đây nhánh này là code chết — "disabled" không bao giờ được
+        # set vào request thật. Vô hại với Anthropic gốc (mặc định tắt
+        # sẵn) nhưng rủi ro thật với custom provider format_anthropic=True
+        # tự bật thinking mặc định phía server (vd gateway dựa trên
+        # DeepSeek-shape). Set tường minh để /mode off tắt được thật.
+        out["thinking"] = {"type": "disabled"}
+
+    out["messages"] = anth_messages
 
     # Tools
     tools = payload.get("tools")
@@ -293,6 +370,21 @@ class _AnthropicSSEResponse:
                     "type":     "function",
                     "function": {"name": block.get("name", ""), "arguments": ""},
                 }]}}]})
+            elif btype == "redacted_thinking":
+                # KHÁC thinking thường: redacted_thinking không stream qua
+                # nhiều delta nhỏ — toàn bộ nội dung đã mã hoá nằm sẵn
+                # trong field "data" ngay tại content_block_start (xem
+                # docs.anthropic.com/en/docs/build-with-claude/extended-thinking,
+                # mục "redacted_thinking"). Không có content_block_delta
+                # nào theo sau cho block này (đi thẳng tới content_block_stop).
+                # Emit nguyên block 1 lần qua field riêng "redacted_thinking_data"
+                # — _stream_response() (09_api_system.py) gom field này
+                # tương tự thinking_signature, không lẫn với "thinking"
+                # (text đọc được) vì redacted KHÔNG có text đọc được.
+                data = block.get("data", "")
+                if data:
+                    self._emit({"choices": [{"delta": {
+                        "redacted_thinking_data": data}}]})
             # text block — không cần emit gì ở đây
 
         elif etype == "content_block_delta":
@@ -308,6 +400,19 @@ class _AnthropicSSEResponse:
                         "index":    tb["tc_idx"],
                         "function": {"arguments": delta.get("partial_json", "")},
                     }]}}]})
+            elif dtype == "thinking_delta":
+                # Extended thinking — text suy luận thật. Emit qua field
+                # riêng "thinking" (KHÔNG dùng "content") để _stream_response()
+                # (09_api_system.py) phân biệt được với text trả lời thường,
+                # và không lẫn với "reasoning_content" (cơ chế riêng của
+                # DeepSeek/OpenAI-shape) — 2 cơ chế tách biệt hoàn toàn.
+                self._emit({"choices": [{"delta": {"thinking": delta.get("thinking", "")}}]})
+            elif dtype == "signature_delta":
+                # Chữ ký mã hoá thinking block — bắt buộc phải lưu nguyên
+                # văn để replay đúng ở turn sau có tool_calls (Anthropic
+                # docs: "we recommend passing everything back as you
+                # received it"). Field riêng "thinking_signature".
+                self._emit({"choices": [{"delta": {"thinking_signature": delta.get("signature", "")}}]})
 
         elif etype == "message_delta":
             delta  = ev.get("delta", {})

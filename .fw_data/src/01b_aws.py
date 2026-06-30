@@ -300,6 +300,34 @@ def _to_converse_payload(payload: dict) -> dict:
                     "input": args,
                 }
             })
+        # Replay reasoningContent thật (giống nhánh Anthropic): nếu message
+        # gốc có tool_calls VÀ thinking_block hợp lệ, prepend đúng block
+        # reasoningContent vào ĐẦU content. Cấu trúc lồng đã xác minh từ
+        # response thật của Converse: {"reasoningContent":
+        # {"reasoningText": {"text":..., "signature":...},
+        # "redactedContent": "<base64>"}} — redactedContent là SIBLING của
+        # reasoningText trong CÙNG object reasoningContent (không phải
+        # block riêng như "redacted_thinking" của Anthropic gốc). Khi nội
+        # dung suy luận bị mã hoá toàn bộ, response chỉ trả redactedContent
+        # (không có reasoningText) — replay đúng như vậy, không tự bịa
+        # reasoningText rỗng. Phải giữ nguyên văn, không sửa.
+        tb = m.get("thinking_block")
+        if role == "assistant" and m.get("tool_calls") and isinstance(tb, dict):
+            if tb.get("redacted"):
+                content.insert(0, {
+                    "reasoningContent": {
+                        "redactedContent": tb["redacted"],
+                    }
+                })
+            elif tb.get("signature"):
+                content.insert(0, {
+                    "reasoningContent": {
+                        "reasoningText": {
+                            "text":      tb.get("thinking", ""),
+                            "signature": tb.get("signature", ""),
+                        }
+                    }
+                })
         converse_messages.append({
             "role": "assistant" if role == "assistant" else "user",
             "content": content or [{"text": ""}],
@@ -317,6 +345,45 @@ def _to_converse_payload(payload: dict) -> dict:
     }
     if system_blocks:
         out["system"] = system_blocks
+
+    # Extended thinking (Claude qua Bedrock Converse) — field "thinking" được
+    # _apply_thinking_param() (09_api_system.py) gắn sẵn theo OpenAI-shape
+    # payload khi user bật /mode thinking VÀ provider+model đã xác nhận support.
+    #
+    # Lưu/replay reasoningContent thật (giống nhánh Anthropic trực tiếp):
+    # nếu message assistant gần nhất có tool_calls thiếu thinking_block hợp
+    # lệ (history cũ trước fix này, hoặc provider không trả signature/
+    # redacted), tự động tắt thinking cho turn này thay vì cố gửi rồi ăn
+    # lỗi. "Hợp lệ" gồm cả 2 dạng: {"signature":...} (thinking thường) và
+    # {"redacted":...} (redactedContent — xem nhánh build content ở trên).
+    # Docs: https://docs.aws.amazon.com/bedrock/latest/userguide/claude-messages-thinking-encryption.html
+    thinking = payload.get("thinking")
+    if thinking and thinking.get("type") == "enabled":
+        _last_assistant = next(
+            (m for m in reversed(messages) if m.get("role") == "assistant"),
+            None,
+        )
+        if _last_assistant and _last_assistant.get("tool_calls"):
+            tb = _last_assistant.get("thinking_block")
+            _has_valid_tb = isinstance(tb, dict) and (
+                tb.get("redacted") or tb.get("signature")
+            )
+            if not _has_valid_tb:
+                thinking = None
+    if thinking and thinking.get("type") == "enabled":
+        budget = thinking.get("budget_tokens", 8000)
+        out["additionalModelRequestFields"] = {
+            "thinking": {"type": "enabled", "budget_tokens": budget}
+        }
+        # Anthropic/Bedrock không cho set temperature khi thinking bật.
+        out["inferenceConfig"].pop("temperature", None)
+        # maxTokens phải LỚN HƠN budget_tokens, nếu không bị từ chối.
+        if out["inferenceConfig"].get("maxTokens", 0) <= budget:
+            out["inferenceConfig"]["maxTokens"] = budget + 4096
+    elif thinking is not None and thinking.get("type") == "disabled":
+        # Trước đây là code chết — set tường minh để /mode off tắt được
+        # thinking thật trên custom provider/gateway tự bật mặc định.
+        out["additionalModelRequestFields"] = {"thinking": {"type": "disabled"}}
 
     tools = payload.get("tools")
     if tools:
@@ -517,6 +584,30 @@ def _convert_event(event_type: str, payload: dict, tool_block_idx: dict,
                 "index": tc_idx,
                 "function": {"arguments": partial},
             }]}}]})
+        elif "reasoningContent" in delta:
+            # Extended thinking qua Bedrock Converse — delta thật có dạng
+            # {"reasoningContent": {"text": "..."}} rồi sau đó
+            # {"reasoningContent": {"signature": "..."}} (đến 1 lần cuối
+            # mỗi block), HOẶC {"reasoningContent": {"redactedContent":
+            # "<base64>"}} khi nội dung suy luận bị hệ thống an toàn mã
+            # hoá toàn bộ (ReasoningContentBlockDelta docs — 3 field text/
+            # signature/redactedContent đều optional, cùng cấp, KHÔNG lồng
+            # nhau, khác cấu trúc redacted_thinking của Anthropic Messages
+            # API gốc — ở Bedrock nó là 1 field trong cùng reasoningContent
+            # chứ không phải content block "type" riêng). Field riêng
+            # "thinking"/"thinking_signature"/"redacted_thinking_data",
+            # tách biệt "text"/"reasoning_content" (DeepSeek) — đối xứng
+            # với nhánh Anthropic trực tiếp ở 01c_anthropic.py (cùng tên
+            # field "redacted_thinking_data" ở cả 2 adapter để
+            # _stream_response() trong 09_api_system.py xử lý chung).
+            rc = delta["reasoningContent"]
+            if "text" in rc:
+                out.append({"choices": [{"delta": {"thinking": rc.get("text", "")}}]})
+            elif "signature" in rc:
+                out.append({"choices": [{"delta": {"thinking_signature": rc.get("signature", "")}}]})
+            elif "redactedContent" in rc:
+                out.append({"choices": [{"delta": {
+                    "redacted_thinking_data": rc.get("redactedContent", "")}}]})
 
     elif event_type == "messageStop":
         reason_map = {
@@ -547,10 +638,21 @@ def parse_converse_response(body: dict) -> dict:
     Dùng bởi _call_simple() (non-streaming, vd compact history) — dịch
     response Converse API (non-stream) thành format {"text", "tool_calls"}
     mà code cũ đang trả về cho mọi provider khác.
+
+    Cũng trả thêm "thinking_block" (None nếu không có) khi response có
+    block "reasoningContent" — đối xứng với _to_converse_payload() (build
+    request, đọc reasoningContent.reasoningText/redactedContent) và
+    _convert_event() (stream parse) ở cùng file. Trước đây hàm này bỏ qua
+    hẳn block reasoningContent: không lỗi, nhưng nội dung thinking (nếu
+    model trả về ở đường non-stream) bị mất âm thầm. ReasoningContentBlock
+    là UNION: chỉ 1 trong 2 field "reasoningText" hoặc "redactedContent"
+    xuất hiện (xác nhận qua docs.aws.amazon.com/bedrock/.../
+    API_runtime_ReasoningContentBlock.html).
     """
     msg = body.get("output", {}).get("message", {})
     text = ""
     tool_calls = []
+    thinking_block = None
     for block in msg.get("content", []):
         if "text" in block:
             text += block["text"]
@@ -564,7 +666,17 @@ def parse_converse_response(body: dict) -> dict:
                     "arguments": json.dumps(tu.get("input", {})),
                 },
             })
-    return {"text": text, "tool_calls": tool_calls}
+        elif "reasoningContent" in block:
+            rc = block["reasoningContent"]
+            if "reasoningText" in rc:
+                rt = rc["reasoningText"]
+                thinking_block = {
+                    "thinking":  rt.get("text", ""),
+                    "signature": rt.get("signature", ""),
+                }
+            elif "redactedContent" in rc:
+                thinking_block = {"redacted": rc["redactedContent"]}
+    return {"text": text, "tool_calls": tool_calls, "thinking_block": thinking_block}
 
 
 # ── Models list (ListFoundationModels) ─────────────────────────────────────
