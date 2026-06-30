@@ -68,7 +68,10 @@ def _load_modules(namespace: dict) -> None:
 
 def main():
     """Entry point for 'opencli' command after pip install."""
-    _ns = {"__name__": "__main__", "__file__": str(Path(__file__).resolve())}
+    # Modules share one runtime namespace, but they are not standalone entrypoints.
+    # Using "__main__" here would execute 10_main.py's guard while loading and then
+    # call main() a second time below after the first loop returns.
+    _ns = {"__name__": "_fw_runtime", "__file__": str(Path(__file__).resolve())}
     _load_modules(_ns)
     sys.exit(_ns["main"]())
 
