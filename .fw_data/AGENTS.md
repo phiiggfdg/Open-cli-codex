@@ -16,23 +16,14 @@ Tự hỏi: "Senior engineer có nói cái này overcomplicated không?" Nếu c
 - Sửa đúng file theo module map — không đặt logic vào sai layer.
 - Biến global dùng chung → khai báo ở module phù hợp nhất, không tạo bản sao.
 - Thêm feature mới → hỏi trước nếu ảnh hưởng >2 module.
+- Task lớn hoặc mơ hồ về cách làm/phạm vi → `skill("spec-driven")` trước khi sửa code diện rộng.
 
 ## Môi trường: Termux / Android
 
 - `pip install` luôn cần `--break-system-packages`.
 - Không có `sudo` — không dùng `apt`, `systemctl`, hay lệnh cần root.
 
-## Section markers
+## Section markers & Output
 
-File mới >80 dòng dùng pattern: `# ##== NAME ==##`. Ví dụ:
-```python
-# ##== PROVIDER ==##
-...code...
-# ##== /end PROVIDER ==##
-```
-
-## Output / UX
-
-- Không emoji trong output của agent.
-- Tóm tắt sau task: files đã thay đổi + cách chạy/verify. Ngắn gọn.
-- Không giải thích lại những gì đã rõ.
+- File mới >80 dòng dùng `##== NAME ==##` (xem chi tiết trong system prompt chính — không lặp lại ở đây).
+- Không emoji trong output. Tóm tắt sau task: files đã thay đổi + cách chạy/verify. Ngắn gọn, không giải thích lại những gì đã rõ.
