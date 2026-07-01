@@ -54,6 +54,7 @@ _MODULES = [
     "07_tools_more.py",
     "08_undo_dispatch.py",
     "09_api_system.py",
+    "11_key_pool.py",
     "10_main.py",
 ]
 
