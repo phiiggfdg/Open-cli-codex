@@ -621,7 +621,9 @@ def tool_skill(name):
     available = []
     for sd in SKILLS_DIRS:
         if sd.exists():
-            available += [f.stem for f in sd.rglob("*.md")]
+            for f in sd.rglob("*.md"):
+                # Skill dạng thư mục (name/SKILL.md) → hiện tên thư mục, không phải "SKILL"
+                available.append(f.parent.name if f.stem.upper() == "SKILL" else f.stem)
     hint = f"Available: {', '.join(available)}" if available else f"No skills found in {SKILLS_DIRS}"
     return f"[skill not found: '{name}'. {hint}]"
 

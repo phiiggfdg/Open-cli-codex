@@ -75,7 +75,8 @@ Include:
 6. Important errors or constraints
 
 Be thorough. Factual, neutral tone. Use clear sections.
-Write in Vietnamese, except for exact commands, file paths, errors, identifiers, and quoted output."""
+Write in Vietnamese, except for exact commands, file paths, errors, identifiers, and quoted output.
+Some messages below were truncated before reaching you. If a path, command, or fact appears to end mid-sentence, mark it as truncated/uncertain instead of completing it from assumption."""
 
 def compact_messages(messages, model, api_key, mode: str = "soft"):
     """
@@ -229,7 +230,7 @@ TOOLS = [
   }},
   {"type":"function","function":{
     "name":"read",
-    "description":"Read file with line numbers or list directory as tree. Output includes an auto-generated Anchor map (functions/classes/CSS rules/headings near your offset) — check it first before grepping again. For files >80 lines: read with a small offset+limit first; use the anchor map or grep to jump to the right section instead of reading the whole file. Never call without offset on large files.",
+    "description":"Read file with line numbers or list directory as tree. Output includes an auto-generated Anchor map (functions/classes/CSS rules/headings near your offset) — check it first before grepping again. Prefer a small offset+limit over whole-file reads on large files; see system prompt Discovery policy for the full search order.",
     "parameters":{"type":"object","properties":{
       "path":  {"type":"string"},
       "offset":{"type":"integer","description":"Start line 1-indexed (files only)"},
@@ -258,7 +259,7 @@ TOOLS = [
   }},
   {"type":"function","function":{
     "name":"edit",
-    "description":"Simple replacement for small one-line or single-location changes only. For multiple locations or large sections, use multiedit or apply_patch instead.",
+    "description":"Simple replacement for one precise, single-location change. Not for multiple locations or large sections — see system prompt Editing policy for choosing between edit/multiedit/apply_patch.",
     "parameters":{"type":"object","properties":{
       "path":   {"type":"string"},
       "old_str":{"type":"string","description":"Exact text to find (must be unique in file). Do NOT include line-number prefixes shown by the read tool."},
@@ -320,7 +321,7 @@ TOOLS = [
   }},
   {"type":"function","function":{
     "name":"todowrite",
-    "description":"Update todo list only for multi-step tasks. Do not use for small/simple tasks. Batch updates at major milestones (~50% progress), completion, or blocker/scope changes; avoid per-step updates.",
+    "description":"Replace the current todo list with a new one. See system prompt Task management policy for when and how often to call this.",
     "parameters":{"type":"object","properties":{
       "todos":{"type":"array","description":"Full list of todos (replaces existing)","items":{
         "type":"object","properties":{
@@ -396,7 +397,7 @@ TOOLS = [
   }},
   {"type":"function","function":{
     "name":"verify",
-    "description":"Ask the user to visually inspect a file or UI output. Use INSTEAD of calling read/glob/bash(ls) after a write. Do NOT use for running automated tests — use bash for that. Call when human confirmation is needed before proceeding.",
+    "description":"Ask the user to visually inspect a file or UI output. Do NOT use for running automated tests — use bash for that. Call when human confirmation is needed before proceeding. See system prompt Tools policy for when this replaces re-reading.",
     "parameters":{"type":"object","properties":{
       "path":   {"type":"string","description":"File or directory path to verify"},
       "reason": {"type":"string","description":"Why you want to verify (optional)"}
