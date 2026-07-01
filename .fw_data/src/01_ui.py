@@ -96,6 +96,7 @@ SLASH_COMMANDS = [
     "/undo", "/redo", "/diff", "/sandbox", "/export", "/cache", "/checkpoint",
     "/perm", "/perms", "/skills", "/setkey", "/deletekey", "/init", "/rules",
     "/commands", "/sequential", "/batch", "/commit", "/review", "/help", "/mcp",
+    "/addkey", "/listkeys", "/rmkey", "/keystrategy",
 ]
 
 SLASH_DESC = {
@@ -124,6 +125,10 @@ SLASH_DESC = {
     "/skills":     "liệt kê skills",
     "/setkey":     "đổi API key",
     "/deletekey":  "xoá API key đã lưu",
+    "/addkey":     "thêm key vào pool (nhiều key/provider, tự xoay khi 429)",
+    "/listkeys":   "xem pool key + trạng thái cooldown",
+    "/rmkey":      "xoá key khỏi pool theo số thứ tự",
+    "/keystrategy":"chọn round_robin hoặc fill_first",
     "/init":       "tạo AGENTS.md cho project",
     "/rules":      "xem AGENTS.md đang active",
     "/commands":   "liệt kê custom commands",

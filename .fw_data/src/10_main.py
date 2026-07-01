@@ -26,17 +26,35 @@ def _auto_rename_session(conn, sid, messages, model, api_key):
     def _do_rename():
         import concurrent.futures as _cf
         def _api_call():
+            # retry_max=2 (KHÔNG phải 1): tác vụ phụ, không quan trọng, nên
+            # tránh retry dài 5 lần (loop >90s khi bị 429 — bug gốc). Nhưng
+            # retry_max=1 có bug đã xác nhận bằng trace code: điều kiện
+            # "attempt < retries-1" trong _call_simple luôn False ngay lần
+            # thử đầu tiên khi retries=1 (0 < 0 = False) → nhánh xoay key
+            # pool (pool_rotate_after_429, KHÔNG sleep, gần như miễn phí về
+            # thời gian) không bao giờ chạy được — auto-rename fail ngay cả
+            # khi pool có key khác đang rảnh sẵn. retry_max=2 mở đúng 1 cơ
+            # hội retry: 429 → thử key khác ngay nếu có (không sleep); hết
+            # key rảnh hoặc 5xx → sleep tối đa _RETRY_DELAYS[0]=5s (không
+            # phải 25-30s như các lần retry sau ở _RETRY_MAX=5) rồi bỏ cuộc.
+            # silent=True: không print cảnh báo, tránh phá màn hình người
+            # dùng đang gõ ở main thread (đây là thread nền).
+            # check_cancel=True: nếu người dùng Ctrl+C, dừng ngay thay vì
+            # chờ hết request/sleep hiện tại — kể cả sleep 5s ở trên vẫn bị
+            # _cancel_bg.wait() cắt ngang ngay lập tức, không phá nguyên tắc.
             return _call_simple(
                 [{"role": "user", "content":
                     f"Đặt tên ngắn (tối đa 5 từ tiếng Việt, không dấu chấm) "
                     f"cho cuộc hội thoại bắt đầu bằng:\n\n{first_user}\n\n"
                     f"Chỉ trả lời tên, không giải thích."}],
-                model, api_key
+                model, api_key, retry_max=2, silent=True, check_cancel=True
             )
         try:
             with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
                 fut = _ex.submit(_api_call)
                 result = fut.result(timeout=15)  # timeout 15s — tránh zombie thread
+            if result.get("text") == "[cancelled]":
+                return  # người dùng đã Ctrl+C — không lưu tên
             new_title = result.get("text", "").strip().strip('"').strip("'")
             # Sanity: không dài hơn 60 ký tự, không chứa newline
             new_title = new_title.splitlines()[0][:60].strip()
@@ -45,6 +63,10 @@ def _auto_rename_session(conn, sid, messages, model, api_key):
         except Exception:
             pass  # silent fail — không quan trọng nếu rename lỗi
 
+    # Clear cờ hủy trước khi start thread mới — cờ này có thể đã bị set bởi
+    # Ctrl+C ở turn trước; nếu không clear, thread mới sẽ bị coi là "đã hủy"
+    # ngay từ đầu và thoát không làm gì.
+    _cancel_bg.clear()
     threading.Thread(target=_do_rename, daemon=True).start()
 
 
@@ -396,6 +418,10 @@ HELP = f"""
   {CYAN}/skills{R}              list available skills
   {CYAN}/setkey{R}              change API key  {DIM}(Enter trống để xoá){R}
   {CYAN}/deletekey{R}           xoá API key đã lưu
+  {CYAN}/addkey <key>{R}        thêm key vào pool  {DIM}(nhiều key/provider, tự xoay khi 429){R}
+  {CYAN}/listkeys{R}            xem pool key + trạng thái cooldown
+  {CYAN}/rmkey <n>{R}           xoá key khỏi pool theo số thứ tự
+  {CYAN}/keystrategy <s>{R}     round_robin | fill_first
   {CYAN}/init{R}                analyze project, create AGENTS.md
   {CYAN}/rules{R}               view active AGENTS.md rules
   {CYAN}/commands{R}            list custom commands
@@ -608,6 +634,7 @@ def main():
             )
         except (EOFError, KeyboardInterrupt):
             user = None
+            _cancel_bg.set()  # báo các thread nền (auto-rename...) dừng ngay
         if user is None:
             print(f"\n  {DIM}Goodbye.{R}\n"); break
         if not user: continue
@@ -977,6 +1004,49 @@ def main():
             else:
                 print(f"{YELLOW}Không có key đã lưu cho [{_prov()['name']}]. "
                       f"Đang dùng env {_prov()['env_key']}.{R}\n")
+            continue
+
+        # ── Key pool: nhiều key/provider, tự xoay khi 429 (xem 11_key_pool.py) ──
+        if user.lower().startswith("/addkey"):
+            parts = user.split(maxsplit=1)
+            if len(parts) < 2:
+                print(f"{RED}Usage: /addkey <api_key>{R}\n"); continue
+            n = pool_add_key(parts[1].strip())
+            print(f"{GREEN}✓ Đã thêm key vào pool [{_prov()['name']}] — tổng {n} key.{R}\n")
+            continue
+
+        if user.lower() == "/listkeys":
+            pool = pool_list()
+            if not pool:
+                print(f"{YELLOW}Chưa có key nào trong pool [{_prov()['name']}]. "
+                      f"Dùng /addkey <key> để thêm.{R}\n")
+            else:
+                print(f"{DIM}Pool [{_prov()['name']}] — strategy: {_pool_strategy()}{R}")
+                for i, e in enumerate(pool, 1):
+                    status = (f"{YELLOW}cooldown {e['cooldown_remaining']:.0f}s{R}"
+                              if e["cooldown_remaining"] > 0 else f"{GREEN}sẵn sàng{R}")
+                    print(f"  {WHITE}{i}{R}. {_pool_mask(e['key'])}  "
+                          f"{DIM}fail={e['fail_count']}{R}  {status}")
+                print()
+            continue
+
+        if user.lower().startswith("/rmkey"):
+            parts = user.split(maxsplit=1)
+            if len(parts) < 2 or not parts[1].strip().isdigit():
+                print(f"{RED}Usage: /rmkey <số thứ tự từ /listkeys>{R}\n"); continue
+            removed = pool_remove_key(int(parts[1].strip()))
+            if removed:
+                print(f"{GREEN}✓ Đã xoá key {_pool_mask(removed)} khỏi pool.{R}\n")
+            else:
+                print(f"{RED}Không có key ở vị trí đó.{R}\n")
+            continue
+
+        if user.lower().startswith("/keystrategy"):
+            parts = user.split(maxsplit=1)
+            if len(parts) < 2 or parts[1].strip() not in _KEY_POOL_STRATEGIES:
+                print(f"{RED}Usage: /keystrategy round_robin|fill_first{R}\n"); continue
+            pool_set_strategy(parts[1].strip())
+            print(f"{GREEN}✓ Strategy: {parts[1].strip()}{R}\n")
             continue
 
         if user.lower() == "/skills":

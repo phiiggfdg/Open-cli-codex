@@ -576,6 +576,13 @@ _COST_PROVIDERS  = {"fireworks"}              # providers có bảng giá hiển
 _CACHE_PROVIDERS = {"fireworks", "qwen", "cerebras", "requesty"}  # providers trả về cached_tokens thật
 # Requesty trả về cost USD trong usage.cost và cache qua header x-requesty-cache
 
+# Cờ hủy cho các tác vụ chạy nền (vd _auto_rename_session trong 10_main.py).
+# Main thread set cờ này ở mọi chỗ bắt KeyboardInterrupt — thread nền tự
+# kiểm tra cờ ở các điểm chờ/sleep để dừng ngay, không cần đợi hết retry.
+# Dùng threading.Event (không phải bool thường) vì .wait(timeout) cho phép
+# "sleep có thể bị đánh thức sớm" — Ctrl+C ngắt được cả lúc đang chờ.
+_cancel_bg = threading.Event()
+
 def _parse_retry_after(e: "urllib.error.HTTPError") -> float | None:
     """Đọc Retry-After header nếu có, trả về số giây cần chờ (tối đa 30s)."""
     try:
@@ -593,14 +600,36 @@ def _no_temperature(model: str) -> bool:
     return bool(re.search(r"claude-\w+-4", base))
 
 
-def _call_simple(messages, model, api_key):
+def _call_simple(messages, model, api_key, retry_max=None, silent=False,
+                  check_cancel=False):
+    """
+    retry_max: số lần thử tối đa. None → dùng _RETRY_MAX như cũ (mọi caller
+        hiện tại không truyền tham số này đều giữ nguyên hành vi cũ 100%).
+        Truyền 1 để tắt hẳn retry — dùng cho tác vụ phụ không quan trọng
+        (vd auto-rename session) để tránh loop dài khi bị 429.
+    silent: True → không print cảnh báo 429/5xx ra màn hình. Dùng kèm
+        retry_max thấp cho các tác vụ chạy nền, tránh phá giao diện người
+        dùng đang gõ ở main thread.
+    check_cancel: True → kiểm tra cờ _cancel_bg trước mỗi lần gọi và trong
+        lúc sleep retry; nếu đã bị set thì dừng ngay lập tức. CHỈ dùng cho
+        tác vụ chạy ở thread nền (vd auto-rename) — không dùng cho compact/
+        commit/review vì các tác vụ đó chạy ngay trong main thread lúc xử
+        lý turn, ngữ nghĩa "cancel" không áp dụng ở đó.
+    """
+    retries = retry_max if retry_max is not None else _RETRY_MAX
+    # Nếu provider có key pool (>1 key), ưu tiên key pool chọn (round_robin/
+    # fill_first, tránh key vừa bị 429 cooldown ở turn trước) thay vì luôn
+    # tin key truyền từ main() — main() không biết pool đã tự đổi key.
+    api_key = pool_get_current() or api_key
     payload = {"model": model, "messages": messages,
                "max_tokens": 4096, "stream": False}
     if not _no_temperature(model):
         payload["temperature"] = 0.3
     if _active_provider == "mercury":
         payload["reasoning_effort"] = "low"
-    for attempt in range(_RETRY_MAX):
+    for attempt in range(retries):
+        if check_cancel and _cancel_bg.is_set():
+            return {"text": "[cancelled]", "tool_calls": []}
         _rate_limit_wait()
         req = _provider_request("/chat/completions", api_key, payload)
         try:
@@ -611,6 +640,7 @@ def _call_simple(messages, model, api_key):
             with resp_cm as resp:
                 body = json.loads(resp.read())
                 _rate_limit_mark()
+                pool_mark_success(api_key)  # key này ổn → giảm fail_count (decay)
                 if _active_provider == "aws_bedrock":
                     # Response Converse (non-stream) có schema khác OpenAI —
                     # dịch lại qua aws.py thay vì parse trực tiếp ở đây.
@@ -631,12 +661,61 @@ def _call_simple(messages, model, api_key):
                 return {"text": msg.get("content", ""), "tool_calls": []}
         except urllib.error.HTTPError as e:
             _rate_limit_mark()
-            if e.code in _RETRY_CODES and attempt < _RETRY_MAX - 1:
-                wait = _parse_retry_after(e) or _RETRY_DELAYS[attempt]
-                print(f"\n{YELLOW}  ⚠ HTTP {e.code} — retry {attempt+1}/{_RETRY_MAX-1} "
-                      f"sau {wait:.0f}s...{R}", flush=True)
-                __import__("time").sleep(wait)
-                continue
+            if attempt < retries - 1:
+                # 429: lỗi CỦA KEY này (quota/rate) — thử đổi key khác trong
+                # pool trước, không sleep nếu có key rảnh. 5xx: lỗi SERVER,
+                # đổi key vô nghĩa (mọi key đều dính) → giữ nguyên key cũ,
+                # chỉ sleep-and-retry như trước.
+                if e.code == 429:
+                    retry_after = _parse_retry_after(e)
+                    rot = pool_rotate_after_429_verbose(api_key, retry_after)
+                    if rot["rotated"]:
+                        if not silent:
+                            print(f"\n{YELLOW}  ⚠ Key #{rot['old_index']} ({rot['old_mask']}) "
+                                  f"hết quota (429) → chuyển Key #{rot['new_index']} "
+                                  f"({rot['new_mask']}), còn {rot['free_count']}/"
+                                  f"{rot['total']-1} key khác đang rảnh. Thử lại ngay...{R}",
+                                  flush=True)
+                        api_key = rot["new_key"]
+                        continue
+                    # rot["soonest_wait"] luôn có giá trị hợp lệ ở đây (set ở
+                    # cả nhánh total<=1 và nhánh hết-key-rảnh trong verbose) —
+                    # dùng nó thay _RETRY_DELAYS[attempt] cố định để chờ đúng
+                    # bằng thời gian key thật sự cần để rảnh. Không nối thêm
+                    # "or _RETRY_DELAYS[attempt]" ở cuối: soonest_wait có thể
+                    # hợp lệ bằng 0.0 (key vừa hết cooldown đúng lúc check),
+                    # và 0.0 is falsy nên 1 chuỗi "or" 3 vế sẽ nhảy nhầm sang
+                    # delay cố định thay vì chờ 0s.
+                    wait = retry_after or rot["soonest_wait"]
+                    if not silent:
+                        if rot["total"] <= 1:
+                            print(f"\n{YELLOW}  ⚠ Key {rot['old_mask']} hết quota (429), "
+                                  f"không có key dự phòng → chờ {wait:.0f}s...{R}", flush=True)
+                        else:
+                            print(f"\n{YELLOW}  ⚠ Full {rot['total']}/{rot['total']} key đều "
+                                  f"đang bị limit — key gần rảnh nhất là Key #{rot['soonest_index']} "
+                                  f"({rot['soonest_mask']}, còn {rot['soonest_wait']:.0f}s) → "
+                                  f"chờ {wait:.0f}s rồi thử lại...{R}", flush=True)
+                    if check_cancel:
+                        if _cancel_bg.wait(wait):
+                            return {"text": "[cancelled]", "tool_calls": []}
+                    else:
+                        __import__("time").sleep(wait)
+                    # Sau khi sleep, key đầu tiên bị cooldown có thể đã hết
+                    # hạn — hỏi lại pool thay vì giữ cứng key vừa 429.
+                    api_key = pool_get_current() or api_key
+                    continue
+                if e.code in _RETRY_CODES:
+                    wait = _parse_retry_after(e) or _RETRY_DELAYS[attempt]
+                    if not silent:
+                        print(f"\n{YELLOW}  ⚠ HTTP {e.code} (lỗi server) — retry {attempt+1}/"
+                              f"{retries-1} sau {wait:.0f}s...{R}", flush=True)
+                    if check_cancel:
+                        if _cancel_bg.wait(wait):
+                            return {"text": "[cancelled]", "tool_calls": []}
+                    else:
+                        __import__("time").sleep(wait)
+                    continue
             body_txt = e.read().decode(errors="replace")
             return {"text": f"[HTTP {e.code}: {body_txt[:200]}]", "tool_calls": []}
         except Exception as e:
@@ -1043,6 +1122,10 @@ def _probe_thinking_disable(model: str, api_key: str) -> bool:
 _known_max_tokens: dict = {}
 
 def call_api_stream(messages, model, api_key, tool_choice="auto", session_id=None, tools=None):
+    # Ưu tiên key pool chọn (nếu có >1 key) — tránh mở turn mới bằng đúng
+    # key vừa bị 429/cooldown ở turn trước, vì main() giữ biến api_key cũ
+    # và không biết pool đã tự xoay trong lần gọi trước.
+    api_key = pool_get_current() or api_key
     api_tools = tools if tools is not None else TOOLS
     payload = {
         "model": model, "messages": messages,
@@ -1110,6 +1193,7 @@ def call_api_stream(messages, model, api_key, tool_choice="auto", session_id=Non
                     redacted_parts=redacted_parts,
                     fix_dup_tool_index=(_active_provider == "gemini"))
             _rate_limit_mark()
+            pool_mark_success(api_key)  # key này ổn → giảm fail_count (decay)
             break   # thành công — thoát retry loop
 
         except urllib.error.HTTPError as e:
@@ -1131,12 +1215,51 @@ def call_api_stream(messages, model, api_key, tool_choice="auto", session_id=Non
                     _known_max_tokens[model] = safe_limit  # nhớ cho turn sau
                     continue
 
-            # 429 / 5xx: retry với backoff
+            # 429: lỗi CỦA KEY này (quota/rate) — ưu tiên đổi sang key khác
+            # trong pool (né limit tức thời, không sleep). 5xx: lỗi SERVER —
+            # đổi key vô ích vì key nào gọi cũng dính, giữ nguyên hành vi cũ
+            # (sleep-and-retry với CÙNG 1 key).
+            if e.code == 429 and attempt < _RETRY_MAX - 1:
+                retry_after = _parse_retry_after(e)
+                rot = pool_rotate_after_429_verbose(api_key, retry_after)
+                spinner_ref[0].stop()
+                if rot["rotated"]:
+                    print(f"\n{YELLOW}  ⚠ Key #{rot['old_index']} ({rot['old_mask']}) hết quota "
+                          f"(429) → chuyển Key #{rot['new_index']} ({rot['new_mask']}), còn "
+                          f"{rot['free_count']}/{rot['total']-1} key khác đang rảnh. "
+                          f"Thử lại ngay...{R}", flush=True)
+                    api_key = rot["new_key"]
+                else:
+                    # rot["soonest_wait"] luôn có giá trị hợp lệ ở đây (xem
+                    # giải thích tương tự ở _call_simple) — dùng nó thay
+                    # _RETRY_DELAYS[attempt] cố định. Không nối thêm
+                    # "or _RETRY_DELAYS[attempt]": soonest_wait có thể hợp lệ
+                    # bằng 0.0, và 0.0 is falsy nên chuỗi "or" 3 vế sẽ nhảy
+                    # nhầm sang delay cố định thay vì chờ 0s.
+                    wait = retry_after or rot["soonest_wait"]
+                    if rot["total"] <= 1:
+                        print(f"\n{YELLOW}  ⚠ Key {rot['old_mask']} hết quota (429), không có "
+                              f"key dự phòng → chờ {wait:.0f}s...{R}", flush=True)
+                    else:
+                        print(f"\n{YELLOW}  ⚠ Full {rot['total']}/{rot['total']} key đều đang bị "
+                              f"limit — key gần rảnh nhất là Key #{rot['soonest_index']} "
+                              f"({rot['soonest_mask']}, còn {rot['soonest_wait']:.0f}s) → "
+                              f"chờ {wait:.0f}s rồi thử lại...{R}", flush=True)
+                    __import__("time").sleep(wait)
+                    # Sau khi sleep, key đầu tiên bị cooldown (vd A trong A→B→C)
+                    # có thể đã hết hạn — hỏi lại pool thay vì cố định dùng
+                    # đúng key vừa 429 (C), tránh bỏ qua key đã rảnh.
+                    api_key = pool_get_current() or api_key
+                spinner = Spinner(f"Retry {attempt+1}")
+                spinner.start()
+                spinner_ref[0] = spinner
+                continue
+
             if e.code in _RETRY_CODES and attempt < _RETRY_MAX - 1:
                 wait = _parse_retry_after(e) or _RETRY_DELAYS[attempt]
                 spinner_ref[0].stop()
-                print(f"\n{YELLOW}  ⚠ HTTP {e.code} — retry {attempt+1}/{_RETRY_MAX-1} "
-                      f"sau {wait:.0f}s...{R}", flush=True)
+                print(f"\n{YELLOW}  ⚠ HTTP {e.code} (lỗi server) — retry {attempt+1}/"
+                      f"{_RETRY_MAX-1} sau {wait:.0f}s...{R}", flush=True)
                 __import__("time").sleep(wait)
                 # Khởi động lại spinner cho lần retry
                 spinner = Spinner(f"Retry {attempt+1}")

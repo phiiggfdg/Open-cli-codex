@@ -160,6 +160,27 @@ def _to_anthropic_payload(payload: dict) -> dict:
 
     _flush_tools()  # flush cuối nếu message cuối là tool result
 
+    # Merge các message cùng role liên tiếp (gộp content list) — phòng
+    # trường hợp tool_result (role=tool → dịch thành "user") đứng ngay
+    # trước 1 user message thật, tạo ra 2 message "user" liên tiếp trong
+    # payload. Anthropic API chính hãng tự merge consecutive same-role
+    # messages phía server (từ 10/2024) nên về lý thuyết không bắt buộc,
+    # nhưng module này còn phục vụ custom provider format_anthropic=True
+    # (gateway self-hosted/Requesty/CommandCode...) — không đảm bảo mọi
+    # gateway đó implement đúng silent-merge như Anthropic gốc. Merge ở
+    # đây để không phụ thuộc hành vi phía server. Làm SAU _flush_tools()
+    # (không đổi thứ tự message) và SAU khi thinking_block đã được
+    # prepend vào đúng message assistant gốc ở vòng lặp trên — merge chỉ
+    # nối list content, không đụng tới vị trí phần tử đầu, nên không phá
+    # yêu cầu "thinking block phải là block đầu tiên".
+    merged_messages: list[dict] = []
+    for msg in anth_messages:
+        if merged_messages and merged_messages[-1]["role"] == msg["role"]:
+            merged_messages[-1]["content"].extend(msg["content"])
+        else:
+            merged_messages.append({"role": msg["role"], "content": list(msg["content"])})
+    anth_messages = merged_messages
+
     out: dict = {
         "model":      payload.get("model", ""),
         "max_tokens": payload.get("max_tokens", ANTHROPIC_DEFAULT_MAX_TOKENS),

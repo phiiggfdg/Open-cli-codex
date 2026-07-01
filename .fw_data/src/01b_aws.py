@@ -342,6 +342,26 @@ def _to_converse_payload(payload: dict) -> dict:
     # Flush tool results còn lại cuối list
     _flush_tool_results()
 
+    # Merge các message cùng role liên tiếp (gộp content list) — Bedrock
+    # Converse yêu cầu roles PHẢI alternate strict, và có báo cáo thật
+    # (issue tháng 1/2026) server-side silent-merge cho case tool_result
+    # (role=tool → dịch thành "user") đứng ngay trước 1 user message thật
+    # KHÔNG luôn active, gây "ValidationException: roles must alternate...
+    # found multiple 'user' roles in a row". Khác với Anthropic API chính
+    # hãng (đã confirm tự merge ổn định từ 10/2024), Bedrock là rủi ro
+    # thật cần tự xử lý ở tầng adapter, không tin tưởng server. Làm SAU
+    # _flush_tool_results() (giữ nguyên thứ tự message) và SAU khi
+    # reasoningContent đã được prepend vào đúng message assistant gốc ở
+    # vòng lặp trên — merge chỉ nối list content, không đụng vị trí phần
+    # tử đầu, nên không phá yêu cầu "reasoningContent phải là block đầu".
+    merged_messages: list = []
+    for msg in converse_messages:
+        if merged_messages and merged_messages[-1]["role"] == msg["role"]:
+            merged_messages[-1]["content"].extend(msg["content"])
+        else:
+            merged_messages.append({"role": msg["role"], "content": list(msg["content"])})
+    converse_messages = merged_messages
+
     out = {
         "messages": converse_messages,
         "inferenceConfig": {
