@@ -358,19 +358,6 @@ def choose_agent():
     except (EOFError, KeyboardInterrupt):
         return AGENT_BUILD
 
-def choose_tool_mode() -> str:
-    """Hỏi user muốn model dùng ít hay nhiều API call."""
-    print(f"\n  {GRAY}tool call mode{R}")
-    print(f"  {CYAN}1{R}  {TEAL}batch{R}       {DIM}group tool calls — faster, cheaper{R}")
-    print(f"  {CYAN}2{R}  {CYAN}sequential{R}  {DIM}step-by-step — safer, easier to debug{R}")
-    try:
-        n = input(f"  {TEAL}❯{R} {DIM}[1]{R} ").strip()
-        if n == "2":
-            return "sequential"
-        return "batch"
-    except (EOFError, KeyboardInterrupt):
-        return "batch"
-
 # ════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ════════════════════════════════════════════════════════════════════════════
@@ -426,6 +413,7 @@ HELP = f"""
   {CYAN}/rules{R}               view active AGENTS.md rules
   {CYAN}/commands{R}            list custom commands
   {CYAN}/mcp [list|add|remove|refresh]{R}  MCP servers  {DIM}(Command Code only){R}
+  {CYAN}/web{R}                 mở web UI local  {DIM}(terminal bridge qua trình duyệt){R}
   {CYAN}/help{R}                this screen
   {DIM}exit / quit / q{R}       quit
 
@@ -567,6 +555,16 @@ def main():
     _sandbox_init(conn, sid, session.get("project_dir"))
     undo_state_load(conn, sid)
 
+    # ── SessionState: nền tảng chung cho CLI và (tương lai) web ──────────────
+    # agent_turn(state=state) sẽ emit Event thay vì print() trực tiếp;
+    # render_cli/cli_ask_handler ở đây tái tạo lại đúng UX terminal cũ.
+    # Không thay giá trị trả về hay hành vi nào của agent_turn — chỉ đổi
+    # ĐƯỜNG XUẤT của output.
+    state = SessionState(conn, sid, model, agent, api_key, messages)
+    state.bus.subscribe(render_cli)
+    state.bus.subscribe_ask(cli_ask_handler)
+    register_cli_state(state)  # /web sau này nối trực tiếp vào state này
+
     ag_cl = BLUE if agent == AGENT_PLAN else GREEN
     tm_cl = YELLOW if _tool_mode == "sequential" else TEAL
     tm_label = "seq" if _tool_mode == "sequential" else "batch"
@@ -622,81 +620,166 @@ def main():
     print(f"  {DIM}Type /help for commands  ·  @file to attach  ·  \\ to continue line{R}\n")
 
     while True:
-        # Context bar + session cost trước prompt
-        if messages:
+        # Context bar + session cost trước prompt -- KHÔNG in khi web đang
+        # armed: bàn phím CLI đã bị khoá lúc này (chỉ có đúng 4 dòng thông
+        # báo từ wait_web_mode() là cần thiết), in thêm bar mỗi vòng lặp gây
+        # rác màn hình CLI trong lúc user không thao tác được gì ở đó.
+        _web_armed = state is not None and state.web_bridge is not None and state.web_bridge.is_armed()
+        if messages and not _web_armed:
             bar = _context_bar(messages, model)
             cost_s = _session_cost_str()
             print(f"  {bar}  {cost_s}")
         try:
             ag_col  = BLUE if agent == AGENT_PLAN else GREEN
-            user = _multiline_input_with_hint(
+            user = get_next_input(
+                state,
                 f"{GRAY}{short}{R} {ag_col}{agent}{R} {TEAL}{BOLD}❯{R} "
             )
-        except (EOFError, KeyboardInterrupt):
+        except EOFError:
             user = None
-            _cancel_bg.set()  # báo các thread nền (auto-rename...) dừng ngay
+            _cancel_bg.set()
+        except KeyboardInterrupt:
+            # ── Nút ^C trên Web UI (lúc KHÔNG có turn nào đang chạy) ────────
+            # Đây LUÔN là interrupt đến từ push_interrupt() của web (next_line()
+            # raise KeyboardInterrupt khi có "interrupt" trong queue) -- Ctrl-C
+            # bàn phím CLI thật không thể xảy ra ở đây vì bàn phím CLI đã bị
+            # khoá hoàn toàn trong lúc armed.
+            #
+            # Theo yêu cầu: ^C lúc KHÔNG có gì đang chạy (idle, đứng ở dấu
+            # nhắc) không được làm gì cả -- không disarm, không thoát về CLI,
+            # không tắt CLI. Web vẫn giữ nguyên trạng thái armed, người dùng
+            # tiếp tục chat bình thường. (^C lúc AI ĐANG trả lời đã được xử
+            # lý riêng, đúng chỗ, trong _stream_response/call_api_stream --
+            # xem WebInputBridge._stream_interrupt.)
+            if state is not None and state.web_bridge is not None and state.web_bridge.is_armed():
+                continue
+            user = None
+            _cancel_bg.set()
         if user is None:
             print(f"\n  {DIM}Goodbye.{R}\n"); break
         if not user: continue
 
+        # ── Web UI: chỉ dùng để chat/thao tác code, KHÔNG dùng để chạy lệnh
+        # slash hay thoát chương trình ────────────────────────────────────
+        # Quyết định: mọi lệnh "/..." VÀ exit/quit/q đều bị chặn khi đang
+        # armed (web đang bật) — Web UI chỉ để chat với AI, mọi thao tác
+        # quản lý (session/model/key/mcp...) hoặc thoát chương trình bắt
+        # buộc quay lại CLI thật. exit/quit/q đặc biệt nguy hiểm nếu không
+        # chặn: gõ từ web sẽ break vòng lặp và tắt hẳn tiến trình CLI thật
+        # (không phải chỉ đóng tab web).
+        _cmd0 = user.split(None, 1)[0].lower() if user.split(None, 1) else ""
+        if (state is not None and state.web_bridge is not None
+                and state.web_bridge.is_armed()
+                and (_cmd0.startswith("/") or _cmd0 in ("exit", "quit", "q"))):
+            state.emit(EV_WARN, text=(
+                "Lệnh / (và exit/quit) không dùng được qua Web UI — bấm Esc "
+                "trên CLI để chạy lệnh, Web UI chỉ để chat/thao tác code.\n"
+            ))
+            continue
+
         if user.lower() in ("exit","quit","q"):
             print(f"  {DIM}Goodbye.{R}\n"); break
 
-        if user.lower() == "/help":         print(HELP); continue
+        if user.lower() == "/help":
+            if state is not None:
+                state.emit(EV_INFO, text=HELP, raw=True)
+            else:
+                print(HELP)
+            continue
+
+        if user.lower() == "/web":
+            # Web nối TRỰC TIẾP vào session CLI đang chạy (state) -- không
+            # spawn tiến trình con, không mở session mới (đúng quyết định đã
+            # chốt). Trình duyệt là 1 client của cùng state.bus; render_web
+            # gửi JSON qua WebSocket khi có client nối vào /ws.
+            if web_server_running():
+                host, port = web_server_addr()
+            else:
+                # __file__ trong namespace chung được fw.py set = path thật
+                # của chính fw.py (dùng để tìm web_index.html cạnh nó).
+                _fw_path_real = globals().get("__file__") or sys.argv[0]
+                host, port = start_web_server(_fw_path_real)
+            # Khoá bàn phím CLI hiện tại, arm() web_bridge, chờ Esc/Ctrl-C để
+            # lấy lại quyền. Server + kết nối WS vẫn chạy nền trong lúc này.
+            wait_web_mode(state, host, port, color_fns={"GREEN": GREEN, "DIM": DIM, "R": R})
+            continue
 
         if user.lower() == "/todos":
             todos = todos_load(conn, sid)
-            if not todos: print(f"{DIM}(no todos){R}\n"); continue
+            if not todos:
+                if state is not None: state.emit(EV_INFO, text=f"{DIM}(no todos){R}\n", raw=True)
+                else: print(f"{DIM}(no todos){R}\n")
+                continue
+            lines = []
             for t in todos:
                 icon = {"pending":"○","in_progress":"◉","completed":"✓"}.get(t["status"],"○")
-                print(f"  {icon} [{t['id']}] {t['content']} {DIM}({t['status']}){R}")
-            print(); continue
+                lines.append(f"  {icon} [{t['id']}] {t['content']} {DIM}({t['status']}){R}")
+            out = "\n".join(lines) + "\n"
+            if state is not None: state.emit(EV_INFO, text=out, raw=True)
+            else: print(out)
+            continue
 
         if user.lower() == "/tokens":
             r   = conn.execute("SELECT token_input,token_output FROM session WHERE id=?", (sid,)).fetchone()
             est = estimate_tokens(messages)
             bar = _context_bar(messages, model)
-            print(f"{DIM}  session: {r['token_input']:,}↑  {r['token_output']:,}↓")
-            print(f"  context now: ~{est:,} tokens estimated")
-            print(f"  {bar}")
-            print(f"  {_session_cost_str()}{R}"); continue
+            out = (f"{DIM}  session: {r['token_input']:,}↑  {r['token_output']:,}↓\n"
+                   f"  context now: ~{est:,} tokens estimated\n"
+                   f"  {bar}\n"
+                   f"  {_session_cost_str()}{R}")
+            if state is not None: state.emit(EV_INFO, text=out, raw=True)
+            else: print(out)
+            continue
 
         if user.lower().startswith("/checkpoint"):
             label = user[len("/checkpoint"):].strip()
             if label:
                 cid = checkpoint_save(conn, sid, label, messages)
-                print(f"{GREEN}✓ checkpoint saved{R} {DIM}{cid} — {label[:80]}{R}\n")
+                out = f"{GREEN}✓ checkpoint saved{R} {DIM}{cid} — {label[:80]}{R}\n"
+                if state is not None: state.emit(EV_INFO, text=out, raw=True)
+                else: print(out)
                 continue
             cps = checkpoints_load(conn, sid)
             if not cps:
-                print(f"{DIM}(no checkpoints){R}\n"); continue
-            print(f"\n{BOLD}Checkpoints:{R}")
+                out = f"{DIM}(no checkpoints){R}\n"
+                if state is not None: state.emit(EV_INFO, text=out, raw=True)
+                else: print(out)
+                continue
+            lines = [f"\n{BOLD}Checkpoints:{R}"]
             for cp in cps:
                 ts = datetime.fromtimestamp(cp["created_at"]).strftime("%m-%d %H:%M")
-                print(f"  {TEAL}{cp['id']}{R}  {DIM}{ts}{R}  {cp['label']}  {GRAY}{cp['summary']}{R}")
-            print(); continue
+                lines.append(f"  {TEAL}{cp['id']}{R}  {DIM}{ts}{R}  {cp['label']}  {GRAY}{cp['summary']}{R}")
+            out = "\n".join(lines) + "\n"
+            if state is not None: state.emit(EV_INFO, text=out, raw=True)
+            else: print(out)
+            continue
 
         if user.lower().startswith("/cache"):
             global _cache_debug
             parts = user.split()
             sub   = parts[1].lower() if len(parts) > 1 else "show"
+
+            def _emit_cache(text):
+                if state is not None: state.emit(EV_INFO, text=text, raw=True)
+                else: print(text)
+
             if sub in ("debug", "on"):
                 _cache_debug = True
-                print(f"{GREEN}✓ cache debug ON{R}\n"); continue
+                _emit_cache(f"{GREEN}✓ cache debug ON{R}\n"); continue
             if sub in ("off",):
                 _cache_debug = False
-                print(f"{YELLOW}✓ cache debug OFF{R}\n"); continue
+                _emit_cache(f"{YELLOW}✓ cache debug OFF{R}\n"); continue
             if sub in ("clear",):
                 _file_cache.clear()
-                print(f"{YELLOW}✓ cache cleared ({len(_file_cache)} entries){R}\n"); continue
+                _emit_cache(f"{YELLOW}✓ cache cleared ({len(_file_cache)} entries){R}\n"); continue
             # default: show cache status
             if not _file_cache:
-                print(f"{DIM}  (cache empty){R}\n"); continue
+                _emit_cache(f"{DIM}  (cache empty){R}\n"); continue
             sorted_c = sorted(_file_cache.items(), key=lambda kv: kv[1]["access"], reverse=True)
             total_chars = sum(len(v["content"]) for v in _file_cache.values())
-            print(f"\n{BOLD}File cache ({len(_file_cache)} files, ~{total_chars:,} chars):{R}")
-            print(f"{DIM}  debug={'ON' if _cache_debug else 'OFF'}  "
-                  f"limit={CACHE_MAX_FILES} files / {CACHE_MAX_CHARS:,} chars{R}")
+            lines = [f"\n{BOLD}File cache ({len(_file_cache)} files, ~{total_chars:,} chars):{R}",
+                     f"{DIM}  debug={'ON' if _cache_debug else 'OFF'}  "
+                     f"limit={CACHE_MAX_FILES} files / {CACHE_MAX_CHARS:,} chars{R}"]
             for abs_path, info in sorted_c:
                 rel = abs_path
                 try: rel = str(Path(abs_path).relative_to(Path.cwd()))
@@ -713,27 +796,31 @@ def main():
                     inject_type = f"{CYAN}symbols({syms}){R}"
                 else:
                     inject_type = f"{YELLOW}preview{R}"
-                print(f"  {DIM}{rel}{R}  "
+                lines.append(f"  {DIM}{rel}{R}  "
                       f"{lines_n}L/{chars_n:,}c  "
                       f"[{inject_type}]  "
                       f"hash={h}  "
                       f"{DIM}access {age}s ago{R}")
-            print(f"\n{DIM}  /cache debug   — bật log [cache +/-/~]")
-            print(f"  /cache off     — tắt log")
-            print(f"  /cache clear   — xoá cache{R}\n")
+            lines.append(f"\n{DIM}  /cache debug   — bật log [cache +/-/~]")
+            lines.append(f"  /cache off     — tắt log")
+            lines.append(f"  /cache clear   — xoá cache{R}\n")
+            _emit_cache("\n".join(lines))
             continue
 
         if user.lower() == "/session":
             r   = conn.execute("SELECT * FROM session WHERE id=?", (sid,)).fetchone()
             dt  = datetime.fromtimestamp(r["updated_at"]).strftime("%Y-%m-%d %H:%M")
             ag  = r["agent"] if "agent" in r.keys() else AGENT_BUILD
-            print(f"{DIM}  [{r['id']}] {r['title']}")
-            print(f"  model:   {r['model']}")
-            print(f"  agent:   {ag}")
-            print(f"  dir:     {r['directory']}")
-            print(f"  updated: {dt}")
-            print(f"  tokens:  {r['token_input']:,}↑  {r['token_output']:,}↓")
-            print(f"  messages: {len(messages)}{R}\n"); continue
+            out = (f"{DIM}  [{r['id']}] {r['title']}\n"
+                   f"  model:   {r['model']}\n"
+                   f"  agent:   {ag}\n"
+                   f"  dir:     {r['directory']}\n"
+                   f"  updated: {dt}\n"
+                   f"  tokens:  {r['token_input']:,}↑  {r['token_output']:,}↓\n"
+                   f"  messages: {len(messages)}{R}\n")
+            if state is not None: state.emit(EV_INFO, text=out, raw=True)
+            else: print(out)
+            continue
 
         if user.lower() == "/sessions":
             session, model, messages = pick_session(conn, api_key)
@@ -753,32 +840,54 @@ def main():
             # cờ "_BASH_CONFIRMED" cần reset theo session nữa.)
             _bash_allow_all = False
             _file_read_time.clear()
+            # Giữ web_bridge cũ (nếu web đang mở/armed) sang state mới, để
+            # kết nối WS hiện có không bị "mồ côi" khi đổi session -- chỉ
+            # đổi nội dung phiên (sid/model/messages...), không đổi ai đang
+            # cầm quyền input.
+            _old_web_bridge = state.web_bridge
+            state = SessionState(conn, sid, model, agent, api_key, messages)
+            state.web_bridge = _old_web_bridge
+            state.bus.subscribe(render_cli)
+            state.bus.subscribe_ask(cli_ask_handler)
+            register_cli_state(state)  # /web phải trỏ vào state MỚI
             print(f"{GREEN}✓ [{sid}]{R}\n"); continue
 
         if user.lower() == "/model":
             model = choose_model(api_key)
             short = model.split("/")[-1]
             session_update(conn, sid, model=model)
-            print(f"{GREEN}✓ {short}{R}\n"); continue
+            state.model = model
+            out = f"{GREEN}✓ {short}{R}\n"
+            state.emit(EV_INFO, text=out, raw=True)
+            continue
 
         if user.lower() == "/agent":
             agent = choose_agent()
             _current_agent = agent
             session_update(conn, sid, agent=agent)
+            state.agent = agent
             ag_cl = BLUE if agent == AGENT_PLAN else GREEN
-            print(f"{ag_cl}✓ agent={agent}{R}\n"); continue
+            out = f"{ag_cl}✓ agent={agent}{R}\n"
+            state.emit(EV_INFO, text=out, raw=True)
+            continue
 
         if user.lower() == "/sequential":
             _tool_mode = "sequential"
             _system_static_cache.clear()  # rebuild vì _tool_mode ko còn trong static, nhưng giữ để safe
-            print(f"{YELLOW}✓ Sequential mode — từng bước, verify mỗi bước.")
-            print(f"{DIM}  Tốn token hơn nhưng an toàn hơn cho project lớn.{R}")
-            print(f"{DIM}  Gõ /batch để về mặc định.{R}\n"); continue
+            out = (f"{YELLOW}✓ Sequential mode — từng bước, verify mỗi bước.\n"
+                   f"{DIM}  Tốn token hơn nhưng an toàn hơn cho project lớn.\n"
+                   f"  Gõ /batch để về mặc định.{R}\n")
+            if state is not None: state.emit(EV_INFO, text=out, raw=True)
+            else: print(out)
+            continue
 
         if user.lower() == "/batch":
             _tool_mode = "batch"
             _system_static_cache.clear()  # rebuild vì _tool_mode ko còn trong static, nhưng giữ để safe
-            print(f"{GREEN}✓ Batch mode — gộp tool calls, tiết kiệm token. {DIM}(mặc định){R}\n"); continue
+            out = f"{GREEN}✓ Batch mode — gộp tool calls, tiết kiệm token. {DIM}(mặc định){R}\n"
+            if state is not None: state.emit(EV_INFO, text=out, raw=True)
+            else: print(out)
+            continue
 
         _cmd_parts = user.split(None, 1)
         if _cmd_parts and _cmd_parts[0].lower() == "/mode":
@@ -838,7 +947,10 @@ def main():
         if user.lower() == "/clear":
             conn.execute("DELETE FROM message WHERE session_id=?", (sid,))
             conn.commit(); messages.clear()
-            print(f"{YELLOW}Đã xoá lịch sử.{R}\n"); continue
+            _txt = f"{YELLOW}Đã xoá lịch sử.{R}\n"
+            if state: state.emit(EV_INFO, text=_txt, raw=True)
+            else: print(_txt)
+            continue
 
         if user.lower().startswith("/delete"):
             parts = user.split()
@@ -885,22 +997,33 @@ def main():
         if user.lower() == "/compact":
             before = len(messages)
             messages = compact_messages(messages, model, api_key)
+            state.messages = messages
             messages_replace_all(conn, sid, messages)
             print(f"{GREEN}✓ {before} → {len(messages)} messages{R}\n"); continue
 
         if user.lower() == "/undo":
-            print(f"{YELLOW}{do_undo()}{R}\n"); continue
+            _txt = f"{YELLOW}{do_undo()}{R}\n"
+            if state: state.emit(EV_INFO, text=_txt, raw=True)
+            else: print(_txt)
+            continue
 
         if user.lower() == "/redo":
-            print(f"{GREEN}{do_redo()}{R}\n"); continue
+            _txt = f"{GREEN}{do_redo()}{R}\n"
+            if state: state.emit(EV_INFO, text=_txt, raw=True)
+            else: print(_txt)
+            continue
 
         if user.lower() == "/diff":
             snaps = snapshots_load(conn, sid)
             if not snaps:
-                print(f"{DIM}(no file changes in this session){R}\n"); continue
+                _txt = f"{DIM}(no file changes in this session){R}\n"
+                if state: state.emit(EV_INFO, text=_txt, raw=True)
+                else: print(_txt)
+                continue
             seen = {}
             for s in snaps:
                 seen[s["path"]] = s  # keep latest per path
+            _lines = []
             for path, s in seen.items():
                 before = (s["before"] or "").splitlines(keepends=True)
                 after  = s["after"].splitlines(keepends=True)
@@ -909,24 +1032,31 @@ def main():
                 if diff:
                     for line in diff[:60]:
                         cl = GREEN if line.startswith("+") else (RED if line.startswith("-") else DIM)
-                        print(f"{cl}{line}{R}")
-                    if len(diff) > 60: print(f"{DIM}  (+{len(diff)-60} more lines){R}")
-            print(); continue
+                        _lines.append(f"{cl}{line}{R}")
+                    if len(diff) > 60: _lines.append(f"{DIM}  (+{len(diff)-60} more lines){R}")
+            _txt = "\n".join(_lines) + "\n"
+            if state: state.emit(EV_INFO, text=_txt, raw=True)
+            else: print(_txt)
+            continue
 
         if user.lower() == "/sandbox":
+            _lines = []
             if _project_dir:
-                print(f"\n{BOLD}Project sandbox:{R}")
-                print(f"  {GREEN}{_project_dir.resolve()}{R}")
+                _lines.append(f"\n{BOLD}Project sandbox:{R}")
+                _lines.append(f"  {GREEN}{_project_dir.resolve()}{R}")
                 try:
                     files = list(_project_dir.rglob("*"))
                     fcount = sum(1 for f in files if f.is_file())
                     dcount = sum(1 for f in files if f.is_dir())
-                    print(f"  {DIM}{fcount} file(s), {dcount} dir(s){R}")
+                    _lines.append(f"  {DIM}{fcount} file(s), {dcount} dir(s){R}")
                 except Exception:
                     pass
             else:
-                print(f"{DIM}  (sandbox chua khoi tao){R}")
-            print(); continue
+                _lines.append(f"{DIM}  (sandbox chua khoi tao){R}")
+            _txt = "\n".join(_lines) + "\n"
+            if state: state.emit(EV_INFO, text=_txt, raw=True)
+            else: print(_txt)
+            continue
 
         if user.lower() == "/export":
             ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -939,17 +1069,23 @@ def main():
                     c = " ".join(p.get("text","") for p in c if isinstance(p, dict))
                 lines.append(f"**{role}**\n\n{c}\n\n---\n\n")
             out.write_text("".join(lines))
-            print(f"{GREEN}✓ Exported → {out}{R}\n"); continue
+            _txt = f"{GREEN}✓ Exported → {out}{R}\n"
+            if state: state.emit(EV_INFO, text=_txt, raw=True)
+            else: print(_txt)
+            continue
 
         if user.lower() == "/perms":
             merged = dict(DEFAULT_PERMS)
             if agent == AGENT_PLAN: merged.update(PLAN_PERMS)
             merged.update(_custom_perms)
-            print(f"\n{BOLD}Permissions (agent={agent}):{R}")
+            _lines = [f"\n{BOLD}Permissions (agent={agent}):{R}"]
             for t, p in sorted(merged.items()):
                 cl = GREEN if p==PERM_ALLOW else (YELLOW if p==PERM_ASK else RED)
-                print(f"  {cl}{p:6}{R}  {t}")
-            print(); continue
+                _lines.append(f"  {cl}{p:6}{R}  {t}")
+            _txt = "\n".join(_lines) + "\n"
+            if state: state.emit(EV_INFO, text=_txt, raw=True)
+            else: print(_txt)
+            continue
 
         if user.lower().startswith("/perm "):
             parts = user.split()
@@ -959,12 +1095,15 @@ def main():
                     _custom_perms[tool_name] = level
                     if tool_name == "bash" and level == PERM_ASK:
                         _bash_allow_all = False  # reset allow-all khi user set lại bash=ask
+                        if state is not None: state.bash_allow_all = False
                     cl = GREEN if level==PERM_ALLOW else (YELLOW if level==PERM_ASK else RED)
-                    print(f"{cl}✓ {tool_name} = {level}{R}\n")
+                    _txt = f"{cl}✓ {tool_name} = {level}{R}\n"
                 else:
-                    print(f"{RED}Level phải là: allow / ask / deny{R}\n")
+                    _txt = f"{RED}Level phải là: allow / ask / deny{R}\n"
             else:
-                print(f"{RED}Usage: /perm <tool> <allow|ask|deny>{R}\n")
+                _txt = f"{RED}Usage: /perm <tool> <allow|ask|deny>{R}\n"
+            if state: state.emit(EV_INFO, text=_txt, raw=True)
+            else: print(_txt)
             continue
 
         if user.lower() == "/setkey":
@@ -981,12 +1120,15 @@ def main():
             if new_key:
                 cfg[ck] = new_key
                 api_key = new_key
+                if state is not None: state.api_key = api_key
                 save_config(cfg)
-                print(f"{GREEN}✓ Đã lưu key mới.{R}\n")
+                _txt = f"{GREEN}✓ Đã lưu key mới.{R}\n"
             else:
                 cfg.pop(ck, None)
                 save_config(cfg)
-                print(f"{YELLOW}✓ Đã xoá key đã lưu. Dùng env {_prov()['env_key']}.{R}\n")
+                _txt = f"{YELLOW}✓ Đã xoá key đã lưu. Dùng env {_prov()['env_key']}.{R}\n"
+            if state: state.emit(EV_INFO, text=_txt, raw=True)
+            else: print(_txt)
             continue
 
         if user.lower() == "/deletekey":
@@ -997,37 +1139,47 @@ def main():
                 cfg.pop(ck, None)
                 save_config(cfg)
                 api_key = os.environ.get(_prov()["env_key"], "")
+                if state is not None: state.api_key = api_key
                 env_note = (f" Key env đang có sẵn."
                             if api_key else
                             f" {YELLOW}Chưa có key env — cần /setkey hoặc đặt env {_prov()['env_key']}.{R}")
-                print(f"{GREEN}✓ Đã xoá key [{_prov()['name']}]. Sẽ dùng env {_prov()['env_key']}.{env_note}{R}\n")
+                _txt = f"{GREEN}✓ Đã xoá key [{_prov()['name']}]. Sẽ dùng env {_prov()['env_key']}.{env_note}{R}\n"
             else:
-                print(f"{YELLOW}Không có key đã lưu cho [{_prov()['name']}]. "
+                _txt = (f"{YELLOW}Không có key đã lưu cho [{_prov()['name']}]. "
                       f"Đang dùng env {_prov()['env_key']}.{R}\n")
+            if state: state.emit(EV_INFO, text=_txt, raw=True)
+            else: print(_txt)
             continue
 
         # ── Key pool: nhiều key/provider, tự xoay khi 429 (xem 11_key_pool.py) ──
         if user.lower().startswith("/addkey"):
             parts = user.split(maxsplit=1)
             if len(parts) < 2:
-                print(f"{RED}Usage: /addkey <api_key>{R}\n"); continue
+                _txt = f"{RED}Usage: /addkey <api_key>{R}\n"
+                if state: state.emit(EV_INFO, text=_txt, raw=True)
+                else: print(_txt)
+                continue
             n = pool_add_key(parts[1].strip())
-            print(f"{GREEN}✓ Đã thêm key vào pool [{_prov()['name']}] — tổng {n} key.{R}\n")
+            _txt = f"{GREEN}✓ Đã thêm key vào pool [{_prov()['name']}] — tổng {n} key.{R}\n"
+            if state: state.emit(EV_INFO, text=_txt, raw=True)
+            else: print(_txt)
             continue
 
         if user.lower() == "/listkeys":
             pool = pool_list()
             if not pool:
-                print(f"{YELLOW}Chưa có key nào trong pool [{_prov()['name']}]. "
+                _txt = (f"{YELLOW}Chưa có key nào trong pool [{_prov()['name']}]. "
                       f"Dùng /addkey <key> để thêm.{R}\n")
             else:
-                print(f"{DIM}Pool [{_prov()['name']}] — strategy: {_pool_strategy()}{R}")
+                _lines = [f"{DIM}Pool [{_prov()['name']}] — strategy: {_pool_strategy()}{R}"]
                 for i, e in enumerate(pool, 1):
                     status = (f"{YELLOW}cooldown {e['cooldown_remaining']:.0f}s{R}"
                               if e["cooldown_remaining"] > 0 else f"{GREEN}sẵn sàng{R}")
-                    print(f"  {WHITE}{i}{R}. {_pool_mask(e['key'])}  "
+                    _lines.append(f"  {WHITE}{i}{R}. {_pool_mask(e['key'])}  "
                           f"{DIM}fail={e['fail_count']}{R}  {status}")
-                print()
+                _txt = "\n".join(_lines) + "\n"
+            if state: state.emit(EV_INFO, text=_txt, raw=True)
+            else: print(_txt)
             continue
 
         if user.lower().startswith("/rmkey"):
@@ -1036,9 +1188,11 @@ def main():
                 print(f"{RED}Usage: /rmkey <số thứ tự từ /listkeys>{R}\n"); continue
             removed = pool_remove_key(int(parts[1].strip()))
             if removed:
-                print(f"{GREEN}✓ Đã xoá key {_pool_mask(removed)} khỏi pool.{R}\n")
+                _txt = f"{GREEN}✓ Đã xoá key {_pool_mask(removed)} khỏi pool.{R}\n"
             else:
-                print(f"{RED}Không có key ở vị trí đó.{R}\n")
+                _txt = f"{RED}Không có key ở vị trí đó.{R}\n"
+            if state: state.emit(EV_INFO, text=_txt, raw=True)
+            else: print(_txt)
             continue
 
         if user.lower().startswith("/keystrategy"):
@@ -1046,7 +1200,9 @@ def main():
             if len(parts) < 2 or parts[1].strip() not in _KEY_POOL_STRATEGIES:
                 print(f"{RED}Usage: /keystrategy round_robin|fill_first{R}\n"); continue
             pool_set_strategy(parts[1].strip())
-            print(f"{GREEN}✓ Strategy: {parts[1].strip()}{R}\n")
+            _txt = f"{GREEN}✓ Strategy: {parts[1].strip()}{R}\n"
+            if state: state.emit(EV_INFO, text=_txt, raw=True)
+            else: print(_txt)
             continue
 
         if user.lower() == "/skills":
@@ -1055,24 +1211,36 @@ def main():
                 if sd.exists():
                     for f in sd.rglob("*.md"):
                         found.append(str(f.relative_to(sd)))
+            _lines = []
             if found:
-                print(f"\n{BOLD}Skills:{R}")
-                for f in found: print(f"  {DIM}{f}{R}")
+                _lines.append(f"\n{BOLD}Skills:{R}")
+                for f in found: _lines.append(f"  {DIM}{f}{R}")
             else:
-                print(f"{DIM}Không có skills. Tạo file .md trong:{R}")
-                for sd in SKILLS_DIRS: print(f"  {DIM}{sd}{R}")
-            print(); continue
+                _lines.append(f"{DIM}Không có skills. Tạo file .md trong:{R}")
+                for sd in SKILLS_DIRS: _lines.append(f"  {DIM}{sd}{R}")
+            _txt = "\n".join(_lines) + "\n"
+            if state: state.emit(EV_INFO, text=_txt, raw=True)
+            else: print(_txt)
+            continue
 
         if user.lower().startswith("/cd "):
             target = user[4:].strip()
-            try:   os.chdir(target); print(f"{GREEN}✓ {os.getcwd()}{R}\n")
-            except Exception as e: print(f"{RED}{e}{R}\n")
+            try:
+                os.chdir(target)
+                _txt = f"{GREEN}✓ {os.getcwd()}{R}\n"
+            except Exception as e:
+                _txt = f"{RED}{e}{R}\n"
+            if state: state.emit(EV_INFO, text=_txt, raw=True)
+            else: print(_txt)
             continue
 
         if user.lower().startswith("/title "):
             title = user[7:].strip()
             session_update(conn, sid, title=title)
-            print(f"{GREEN}✓ {title}{R}\n"); continue
+            _txt = f"{GREEN}✓ {title}{R}\n"
+            if state: state.emit(EV_INFO, text=_txt, raw=True)
+            else: print(_txt)
+            continue
 
         if user.lower() == "/init":
             print(f"\n{BOLD}{CYAN}[init]{R} Đang phân tích project...{R}")
@@ -1117,33 +1285,44 @@ Write the AGENTS.md content directly. Be concise but complete."""
                     agents_content = re.sub(r"^```[^\n]*\n", "", agents_content)
                     agents_content = re.sub(r"\n```\s*$", "", agents_content)
                 agents_path.write_text(agents_content)
-                print(f"{GREEN}✓ Đã tạo {agents_path}{R}")
-                print(f"{DIM}{agents_content[:400]}{'...' if len(agents_content)>400 else ''}{R}")
+                _txt = (f"{GREEN}✓ Đã tạo {agents_path}{R}\n"
+                        f"{DIM}{agents_content[:400]}{'...' if len(agents_content)>400 else ''}{R}\n")
             else:
-                print(f"{RED}✗ Không tạo được AGENTS.md{R}")
-            print(); continue
+                _txt = f"{RED}✗ Không tạo được AGENTS.md{R}\n"
+            if state: state.emit(EV_INFO, text=_txt, raw=True)
+            else: print(_txt)
+            continue
 
         if user.lower() == "/rules":
             rules = load_agents_md()
+            _lines = []
             if rules:
-                print(f"\n{BOLD}Rules đang active:{R}")
-                print(f"{DIM}{rules[:1500]}{'...' if len(rules)>1500 else ''}{R}")
+                _lines.append(f"\n{BOLD}Rules đang active:{R}")
+                _lines.append(f"{DIM}{rules[:1500]}{'...' if len(rules)>1500 else ''}{R}")
             else:
-                print(f"{DIM}Không tìm thấy AGENTS.md. Chạy /init để tạo.{R}")
-            print(); continue
+                _lines.append(f"{DIM}Không tìm thấy AGENTS.md. Chạy /init để tạo.{R}")
+            _txt = "\n".join(_lines) + "\n"
+            if state: state.emit(EV_INFO, text=_txt, raw=True)
+            else: print(_txt)
+            continue
 
         if user.lower() == "/commands":
             cmds = load_custom_commands()
+            _lines = []
             if cmds:
-                print(f"\n{BOLD}Custom commands:{R}")
+                _lines.append(f"\n{BOLD}Custom commands:{R}")
                 for name, c in sorted(cmds.items()):
-                    print(f"  {YELLOW}/{name}{R}  {DIM}{c['description']}{R}")
-                    if c["agent"]: print(f"      agent={c['agent']}", end="")
-                    if c["model"]: print(f"  model={c['model'].split('/')[-1]}", end="")
-                    if c["agent"] or c["model"]: print()
+                    _lines.append(f"  {YELLOW}/{name}{R}  {DIM}{c['description']}{R}")
+                    _tail = ""
+                    if c["agent"]: _tail += f"      agent={c['agent']}"
+                    if c["model"]: _tail += f"  model={c['model'].split('/')[-1]}"
+                    if _tail: _lines.append(_tail)
             else:
-                print(f"{DIM}Không có custom commands. Tạo .opencode/commands/*.md{R}")
-            print(); continue
+                _lines.append(f"{DIM}Không có custom commands. Tạo .opencode/commands/*.md{R}")
+            _txt = "\n".join(_lines) + "\n"
+            if state: state.emit(EV_INFO, text=_txt, raw=True)
+            else: print(_txt)
+            continue
 
         if user.lower().startswith("/mcp"):
             if not mcp_is_active():
@@ -1262,7 +1441,9 @@ Write the AGENTS.md content directly. Be concise but complete."""
             msg = result.get("text", "").strip()
             if not msg:
                 print(f"{RED}✗ Không tạo được commit message.{R}\n"); continue
-            print(f"\n{GREEN}{BOLD}Commit message:{R}\n{msg}\n")
+            _txt = f"\n{GREEN}{BOLD}Commit message:{R}\n{msg}\n"
+            if state: state.emit(EV_INFO, text=_txt, raw=True)
+            else: print(_txt)
             try:
                 confirm = input(f"{CYAN}  Dùng message này? [y/N/e(dit)]: {R}").strip().lower()
             except (EOFError, KeyboardInterrupt):
@@ -1350,9 +1531,11 @@ Write the AGENTS.md content directly. Be concise but complete."""
                 result = _call_simple(review_msgs, model, api_key)
             review_text = result.get("text", "").strip()
             if review_text:
-                print(f"\n{GREEN}{BOLD}Code Review:{R}\n{review_text}\n")
+                _txt = f"\n{GREEN}{BOLD}Code Review:{R}\n{review_text}\n"
             else:
-                print(f"{RED}✗ Không tạo được review.{R}\n")
+                _txt = f"{RED}✗ Không tạo được review.{R}\n"
+            if state: state.emit(EV_INFO, text=_txt, raw=True)
+            else: print(_txt)
             continue
 
         # Custom slash commands (from .opencode/commands/*.md)
@@ -1394,12 +1577,26 @@ Write the AGENTS.md content directly. Be concise but complete."""
                     messages.append({"role":"user","content":template})
                     message_save(conn, sid, "user", template)
                     try:
-                        messages = agent_turn(messages, run_model, api_key, conn, sid, agent=run_agent)
+                        state.model = run_model
+                        state.agent = run_agent
+                        messages = agent_turn(messages, run_model, api_key, conn, sid, agent=run_agent, state=state)
+                        state.messages = messages
                     except KeyboardInterrupt:
                         cid = checkpoint_save(conn, sid, "interrupted", messages,
                                               "User interrupted agent turn; saved messages are intact.")
-                        print(f"\n{YELLOW}  checkpoint {cid} saved after interrupt{R}")
-                print(); continue
+                        if state is not None:
+                            state.emit(EV_INTERRUPTED, checkpoint_id=cid)
+                        else:
+                            print(f"\n{YELLOW}  checkpoint {cid} saved after interrupt{R}")
+                # Cùng bug print() trần vô điều kiện đã sửa ở nhánh chat
+                # bình thường phía dưới -- nhánh custom-command này cũng
+                # chạy khi gõ qua web (dù phần lớn UI custom-command chưa
+                # emit qua bus, xem comment đầu 12_web.py), nên vẫn áp
+                # cùng guard để nhất quán, tránh dòng trắng dư lặp lại nếu
+                # người dùng gọi custom command từ web.
+                if state is None or not (getattr(state, "web_bridge", None) and state.web_bridge.is_armed()):
+                    print()
+                continue
 
         # Expand @file mentions before sending
         expanded = _expand_at_mentions(user)
@@ -1414,15 +1611,27 @@ Write the AGENTS.md content directly. Be concise but complete."""
         messages.append({"role":"user","content":expanded})
         message_save(conn, sid, "user", expanded)
         try:
-            messages = agent_turn(messages, model, api_key, conn, sid, agent=agent)
+            messages = agent_turn(messages, model, api_key, conn, sid, agent=agent, state=state)
+            state.messages = messages
         except KeyboardInterrupt:
             cid = checkpoint_save(conn, sid, "interrupted", messages,
                                   "User interrupted agent turn; saved messages are intact.")
-            print(f"\n{YELLOW}  checkpoint {cid} saved after interrupt{R}")
+            if state is not None:
+                state.emit(EV_INTERRUPTED, checkpoint_id=cid)
+            else:
+                print(f"\n{YELLOW}  checkpoint {cid} saved after interrupt{R}")
         # Auto-rename session sau turn đầu tiên (nếu vẫn là tên mặc định)
         if is_first_turn:
             _auto_rename_session(conn, sid, messages, model, api_key)
-        print()
+        # BUG ĐÃ SỬA: print() trần vô điều kiện ở đây -- chạy sau MỖI turn
+        # chat bình thường (không phải slash-command), không phân biệt input
+        # đến từ bàn phím CLI thật hay từ web (web_bridge armed). Đây là
+        # nguồn chính của "mỗi lần chat qua web, CLI lại dư 1 dòng trắng":
+        # mọi tin nhắn gửi từ web đều đi qua chính nhánh này ở cuối main
+        # loop. Áp dụng cùng guard đã dùng cho các print() trần khác
+        # (xem 09_api_system.py call_api_stream/_agent_turn_inner).
+        if state is None or not (getattr(state, "web_bridge", None) and state.web_bridge.is_armed()):
+            print()
 
 if __name__ == "__main__":
     main()

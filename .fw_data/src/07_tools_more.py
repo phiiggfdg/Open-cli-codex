@@ -557,13 +557,26 @@ def tool_todowrite(todos):
     _todowrite_calls_this_turn += 1
     _todos = todos
     todos_save(_todos_conn, _todos_sid, todos)
-    # Print todo list nicely
+    # BUG ĐÃ SỬA: print() trần ngay trong hàm tool, tách biệt hoàn toàn
+    # khỏi run_tool()/EventBus (08_undo_dispatch.py) -- vì thế nội dung chi
+    # tiết todo list (icon/priority/status từng item) chỉ hiện trên CLI
+    # thật, không bao giờ tới web (không đi qua state.emit nào cả), đúng
+    # hiện tượng "lọt ra CLI, không hiện bên web UI" quan sát được. Sửa:
+    # dùng current_state() (thread-local, set sẵn ở đầu agent_turn -- xem
+    # 01d_events.py, cùng pattern _check_permission() đã dùng) để emit qua
+    # EV_INFO khi có state, giữ nguyên print() y hệt cũ khi không có state
+    # (CLI chạy ngoài agent_turn, hiếm).
     lines = [f"\n{BOLD}📋 Todo list:{R}"]
     for t in todos:
         icon = {"pending":"○","in_progress":"◉","completed":"✓"}.get(t["status"],"○")
         pri  = {"high":RED,"medium":YELLOW,"low":DIM}.get(t["priority"],DIM)
         lines.append(f"  {pri}{icon}{R} [{t['id']}] {t['content']} {DIM}({t['status']}){R}")
-    print("\n".join(lines))
+    text = "\n".join(lines)
+    _st = current_state()
+    if _st is not None:
+        _st.emit(EV_INFO, text=text, raw=True)
+    else:
+        print(text)
     return f"Todo list updated ({len(todos)} items)"
 
 def tool_todoread():
@@ -574,8 +587,33 @@ def tool_todoread():
         lines.append(f"[{t['id']}] {t['status']} | {t['priority']} | {t['content']}")
     return "\n".join(lines)
 
-def tool_question(question, options=None):
-    """AI hỏi user — hỗ trợ options list (opencode-style)."""
+def tool_question(question, options=None, state=None):
+    """AI hỏi user — hỗ trợ options list (opencode-style).
+    BUG FIX: trước đây hàm này luôn dùng input()/print() thẳng ra CLI, kể cả
+    khi đang chạy /web — vì dispatch không truyền `state` xuống đây, khác
+    với các tool khác (bash permission-ask, tool_write...) đã đi đúng qua
+    state.ask()/state.emit(). Hậu quả: câu hỏi "AI hỏi" luôn rơi vào cửa sổ
+    CLI phía sau thay vì hiện trong web UI như ảnh chụp báo lỗi. Sửa theo
+    đúng pattern permission-ask ở 08_undo_dispatch.py (dòng ~413-422): có
+    state -> emit EV_ASK qua state.ask() (web trả lời qua WS, CLI listener
+    vẫn nhận được nếu còn subscribe); không có state (gọi tool trực tiếp
+    ngoài luồng agent, hiếm) -> giữ nguyên input() cũ.
+    """
+    if state is not None:
+        if options and isinstance(options, list):
+            options = [o.strip() for o in options if isinstance(o, str) and o.strip()]
+        if options:
+            ans = state.ask(
+                prompt=question,
+                kind="choice",
+                default=options[0] if options else None,
+                extra={"options": options},
+            )
+        else:
+            ans = state.ask(prompt=question, kind="text", default=None)
+        ans = (ans or "").strip()
+        return ans if ans else "(no answer)"
+
     print(f"\n{BOLD}{BLUE}❓ AI hỏi:{R} {question}")
     # B7 FIX: model đôi khi generate options toàn chuỗi rỗng (vd ["", "", "", ""])
     # — đã thấy thật trong session live, ra menu "1. 2. 3. 4." không có nội dung
@@ -628,13 +666,38 @@ def tool_skill(name):
     return f"[skill not found: '{name}'. {hint}]"
 
 def tool_verify(path: str, reason: str = "") -> str:
-    """Hỏi user có muốn verify file/output không."""
-    reason_str = f"  {DIM}{reason}{R}" if reason else ""
-    print(f"\n{CYAN}⊙ Verify?{R}  {BOLD}{path}{R}{reason_str}")
-    try:
-        ans = input(f"  {DIM}[y/N]: {R}").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        return "verification skipped"
+    """Hỏi user có muốn verify file/output không.
+
+    BUG ĐÃ SỬA: hàm này trước đây tự print()/input() thẳng, tách biệt hoàn
+    toàn khỏi EventBus/state.ask() -- cùng loại bug đã sửa ở tool_todowrite
+    phía trên (xem comment ở đó). Hệ quả quan sát được thật: khi đang /web
+    (web_bridge armed, bàn phím CLI thật đã khoá), câu hỏi "⊙ Verify?" vẫn
+    chỉ hiện ở CLI thật và chặn input() ở đó -- web không nhận được gì,
+    người dùng thao tác trên web không thấy câu hỏi để trả lời.
+
+    Sửa: dùng current_state() (thread-local, cùng pattern _check_permission
+    ở 08_undo_dispatch.py) để gọi state.ask(kind="confirm") khi có state --
+    cơ chế này đã tự định tuyến đúng nơi cần hỏi (web nếu đang armed, CLI
+    nếu không, xem cli_ask_handler/make_web_ask_handler ở 01d_events.py).
+    Giữ nguyên print()/input() y hệt cũ khi không có state (hiếm, CLI chạy
+    ngoài agent_turn) để không đổi hành vi trường hợp đó.
+    """
+    reason_str = f" — {reason}" if reason else ""
+    _st = current_state()
+    if _st is not None:
+        ans = _st.ask(
+            prompt=f"⊙ Verify {path}{reason_str}? [y/N]",
+            kind="confirm",
+            default="n",
+        ) or "n"
+        ans = str(ans).strip().lower()
+    else:
+        reason_str_cli = f"  {DIM}{reason}{R}" if reason else ""
+        print(f"\n{CYAN}⊙ Verify?{R}  {BOLD}{path}{R}{reason_str_cli}")
+        try:
+            ans = input(f"  {DIM}[y/N]: {R}").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return "verification skipped"
     if ans in ("y", "yes"):
         # Resolve qua sandbox giống mọi tool khác (write/edit/read/extract...)
         p = _resolve_to_sandbox(path)

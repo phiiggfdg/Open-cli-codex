@@ -726,7 +726,7 @@ def _call_simple(messages, model, api_key, retry_max=None, silent=False,
 
 def _stream_response(resp, text_parts, tc_raw, usage_out, spinner_ref, reasoning_parts=None,
                       thinking_parts=None, thinking_sig=None, redacted_parts=None,
-                      fix_dup_tool_index=False):
+                      fix_dup_tool_index=False, state=None):
     """
     Đọc SSE stream từ resp, fill vào text_parts / tc_raw / usage_out (dict).
     Trả về finish_reason (str | None).
@@ -766,7 +766,21 @@ def _stream_response(resp, text_parts, tc_raw, usage_out, spinner_ref, reasoning
     finish_reason = None
     first_token   = True
     first_thinking = True
+    # Web: mỗi lần nhận được 1 dòng SSE mới, kiểm tra xem web_bridge có yêu
+    # cầu ngắt hay không (nút ^C trên trình duyệt, xem
+    # WebInputBridge.push_interrupt/consume_stream_interrupt). Đây là điểm
+    # DUY NHẤT trong lúc AI đang stream mà code có cơ hội kiểm tra định kỳ
+    # -- trước đây push_interrupt() chỉ được next_line() đọc, mà next_line
+    # chỉ chạy lúc ĐANG CHỜ input mới (giữa các turn), không chạy trong lúc
+    # agent_turn() đang xử lý (nó chạy đồng bộ trên main thread), nên bấm
+    # ^C trên web lúc AI đang trả lời trước đây không có tác dụng gì. Raise
+    # KeyboardInterrupt ở đây để tái dùng ĐÚNG cơ chế bắt lỗi + checkpoint
+    # đã có sẵn cho Ctrl-C CLI thật (xem call_api_stream dòng ~1320 và
+    # main() 10_main.py, nhánh "except KeyboardInterrupt: checkpoint_save").
+    _wb = getattr(state, "web_bridge", None) if state is not None else None
     for raw_line in resp:
+        if _wb is not None and _wb.consume_stream_interrupt():
+            raise KeyboardInterrupt()
         line = raw_line.decode("utf-8").strip()
         if not line.startswith("data:"): continue
         ds = line[5:].strip()
@@ -798,12 +812,20 @@ def _stream_response(resp, text_parts, tc_raw, usage_out, spinner_ref, reasoning
                         # leak xảy ra liên tục nhiều turn liền.
                         global _thinking_leak_warned_session
                         if not _thinking_leak_warned_session:
-                            print(f"\n{YELLOW}⚠ Mode đang OFF nhưng provider vẫn trả thinking "
-                                  f"(leak runtime, không qua probe).{R}")
+                            if state is not None:
+                                state.emit(EV_WARN, text="⚠ Mode đang OFF nhưng provider vẫn trả "
+                                           "thinking (leak runtime, không qua probe).")
+                            else:
+                                print(f"\n{YELLOW}⚠ Mode đang OFF nhưng provider vẫn trả thinking "
+                                      f"(leak runtime, không qua probe).{R}")
                             _thinking_leak_warned_session = True
-                    print(f"\n{DIM}[thinking] ", end="", flush=True)
+                    if state is None:
+                        print(f"\n{DIM}[thinking] ", end="", flush=True)
                     first_thinking = False
-                print(f"{DIM}{delta['thinking']}{R}", end="", flush=True)
+                if state is not None:
+                    state.emit(EV_THINKING_DELTA, text=delta["thinking"])
+                else:
+                    print(f"{DIM}{delta['thinking']}{R}", end="", flush=True)
             if delta.get("thinking_signature") and thinking_sig is not None:
                 thinking_sig.append(delta["thinking_signature"])
             if delta.get("redacted_thinking_data") and redacted_parts is not None:
@@ -811,17 +833,24 @@ def _stream_response(resp, text_parts, tc_raw, usage_out, spinner_ref, reasoning
                 if first_thinking:
                     if spinner_ref:
                         spinner_ref[0].stop()
-                    print(f"\n{DIM}[thinking — redacted by safety system]{R}", end="", flush=True)
+                    if state is not None:
+                        state.emit(EV_INFO, text="[thinking — redacted by safety system]")
+                    else:
+                        print(f"\n{DIM}[thinking — redacted by safety system]{R}", end="", flush=True)
                     first_thinking = False
             if first_token and (delta.get("content") or delta.get("tool_calls")):
                 if spinner_ref:
                     spinner_ref[0].stop()
-                if not first_thinking:
-                    print()  # xuống dòng sạch sau block thinking trước khi in AI:
-                print(f"\n{GREEN}{BOLD}AI:{R} ", end="", flush=True)
+                if state is None:
+                    if not first_thinking:
+                        print()  # xuống dòng sạch sau block thinking trước khi in AI:
+                    print(f"\n{GREEN}{BOLD}AI:{R} ", end="", flush=True)
                 first_token = False
             if delta.get("content"):
-                print(delta["content"], end="", flush=True)
+                if state is not None:
+                    state.emit(EV_TEXT_DELTA, text=delta["content"])
+                else:
+                    print(delta["content"], end="", flush=True)
                 text_parts.append(delta["content"])
             for tc in delta.get("tool_calls") or []:
                 idx = tc.get("index", 0)
@@ -1121,7 +1150,7 @@ def _probe_thinking_disable(model: str, api_key: str) -> bool:
 # Tránh việc turn nào cũng phải dính 400 rồi retry lại từ đầu.
 _known_max_tokens: dict = {}
 
-def call_api_stream(messages, model, api_key, tool_choice="auto", session_id=None, tools=None):
+def call_api_stream(messages, model, api_key, tool_choice="auto", session_id=None, tools=None, state=None):
     # Ưu tiên key pool chọn (nếu có >1 key) — tránh mở turn mới bằng đúng
     # key vừa bị 429/cooldown ở turn trước, vì main() giữ biến api_key cũ
     # và không biết pool đã tự xoay trong lần gọi trước.
@@ -1191,7 +1220,8 @@ def call_api_stream(messages, model, api_key, tool_choice="auto", session_id=Non
                     reasoning_parts=reasoning_parts,
                     thinking_parts=thinking_parts, thinking_sig=thinking_sig,
                     redacted_parts=redacted_parts,
-                    fix_dup_tool_index=(_active_provider == "gemini"))
+                    fix_dup_tool_index=(_active_provider == "gemini"),
+                    state=state)
             _rate_limit_mark()
             pool_mark_success(api_key)  # key này ổn → giảm fail_count (decay)
             break   # thành công — thoát retry loop
@@ -1304,7 +1334,23 @@ def call_api_stream(messages, model, api_key, tool_choice="auto", session_id=Non
         except KeyboardInterrupt:
             interrupted = True
             spinner_ref[0].stop()
-            print(f"\n{YELLOW}(stopped){R}")
+            # BUG ĐÃ SỬA: print() trần ở đây luôn in ra CLI thật bất kể
+            # web_bridge có đang armed hay không -- không có điều kiện nào
+            # cả, khác với mọi chỗ khác trong code đã theo pattern "if state
+            # is not None: state.emit(...) else: print(...)". Khi interrupt
+            # đến từ ^C trên web (đúng use-case chính của _stream_interrupt),
+            # dòng "(stopped)" này vẫn in đè lên CLI thật dù CLI không hề
+            # tham gia gì vào việc đó -- phá format terminal (đúng hiện
+            # tượng trong ảnh chụp: "(stopped)" chen ngang giữa các dòng
+            # khác không liên quan). Sửa: dùng state.emit(EV_WARN, ...) khi
+            # có state -- render_cli tự động im lặng lúc web_bridge armed
+            # (cơ chế đã có sẵn, xem render_cli ở trên), render_web gửi
+            # đúng qua web. Khi state is None (agent_turn gọi không qua
+            # web/CLI event, hiếm) giữ nguyên print() như cũ.
+            if state is not None:
+                state.emit(EV_WARN, text="\n(stopped)")
+            else:
+                print(f"\n{YELLOW}(stopped){R}")
             break
 
     else:
@@ -1315,7 +1361,18 @@ def call_api_stream(messages, model, api_key, tool_choice="auto", session_id=Non
 
     spinner_ref[0].stop()
     _rate_limit_mark()
-    print()
+    # BUG ĐÃ SỬA: print() trần vô điều kiện ở đây (xuống dòng trống sau khi
+    # AI trả lời xong) -- không có guard "if state is None" như dòng
+    # EV_WARN "(stopped)" ngay phía trên (đã sửa trước đó). Kết quả: mỗi
+    # lần gọi API xong khi đang dùng qua web (web_bridge armed, CLI không
+    # tham gia gì), dòng trống này vẫn in thẳng ra CLI thật -- đúng hiện
+    # tượng "mỗi lần chạy web là CLI dư 1 dòng trắng". Sửa: chỉ print()
+    # trần khi KHÔNG có state (CLI cũ, agent_turn gọi không qua event
+    # system) hoặc web KHÔNG đang armed; khi web armed, im lặng hoàn toàn
+    # (không cần emit gì thay thế -- đây chỉ là dòng trống định dạng, web
+    # đã có spacing riêng qua CSS .row { gap:6px }).
+    if state is None or not (getattr(state, "web_bridge", None) and state.web_bridge.is_armed()):
+        print()
     truncated = (finish_reason == "length")
     if truncated:
         print(f"{YELLOW}  ⚠ Output bị cắt (finish_reason=length) — tự động tiếp tục...{R}")
@@ -1579,16 +1636,6 @@ def _get_git_branch() -> str:
     except Exception:
         return ""
 
-def _get_git_status() -> str:
-    """Lấy git status --short. Dùng riêng khi cần (không inject vào cache prefix)."""
-    try:
-        return subprocess.run(
-            ["git", "status", "--short"],
-            capture_output=True, text=True, timeout=3, cwd=os.getcwd()
-        ).stdout.strip()
-    except Exception:
-        return ""
-
 _git_injected_branch: str = ""  # branch lúc inject — reset khi branch đổi
 
 def _inject_git_context_once(messages: list) -> list:
@@ -1613,9 +1660,50 @@ def _inject_git_context_once(messages: list) -> list:
     ]
     return inject + messages
 
-def agent_turn(messages, model, api_key, conn, sid, max_steps=20, agent=AGENT_BUILD):
+def agent_turn(messages, model, api_key, conn, sid, max_steps=20, agent=AGENT_BUILD, state=None):
     # C1 FIX: thêm _large_read_credits vào global declaration.
     # Tất cả modules exec() vào cùng một namespace → global ở đây là đúng.
+    global _current_agent, _active_tools, _todowrite_calls_this_turn, _current_sid, _large_read_credits
+    # state: SessionState | None — khi có, output đi qua state.emit(...) thay vì
+    # print() trực tiếp (xem 01d_events.py). None → hành vi CLI cũ y hệt, dùng
+    # khi agent_turn() được gọi từ nơi chưa migrate (vd tool_task() subagent).
+    if state is not None:
+        cli_render_reset()
+        state.emit(EV_TURN_START)
+        # Dọn cờ interrupt rác còn sót lại từ 1 lần ^C trước đó bấm lúc
+        # KHÔNG có gì đang stream (xem WebInputBridge.disarm() -- nơi chính
+        # dọn cờ này). Đây là lớp phòng thủ thêm cho trường hợp disarm()
+        # chưa kịp chạy trước khi turn mới bắt đầu (vd nhiều request WS gần
+        # nhau) -- đảm bảo mọi turn luôn bắt đầu với cờ sạch, không bị ngắt
+        # oan ngay từ chunk SSE đầu tiên.
+        _wb = getattr(state, "web_bridge", None)
+        if _wb is not None:
+            _wb.clear_stream_interrupt()
+    set_current_state(state)   # cho _check_permission() (08_undo_dispatch.py) đọc lại
+    # BUG ĐÃ SỬA: nếu exception (network error, KeyboardInterrupt...) xảy ra
+    # giữa _agent_turn_inner TRƯỚC khi nó kịp emit EV_TURN_END ở cuối, web
+    # sẽ kẹt vĩnh viễn ở trạng thái "đang xử lý" (không biết turn đã kết
+    # thúc) vì EV_TURN_END không bao giờ tới. Cờ _turn_end_emitted theo dõi
+    # việc này qua 1 listener tạm — nếu _agent_turn_inner thoát (bất kỳ lý
+    # do gì) mà chưa emit EV_TURN_END, emit 1 bản tối thiểu ở đây để web
+    # luôn được giải phóng khỏi trạng thái "đang xử lý".
+    turn_end_seen = [False]
+    def _watch_turn_end(ev):
+        if ev.type == EV_TURN_END:
+            turn_end_seen[0] = True
+    if state is not None:
+        state.bus.subscribe(_watch_turn_end)
+    try:
+        return _agent_turn_inner(messages, model, api_key, conn, sid, max_steps, agent, state)
+    finally:
+        if state is not None:
+            state.bus.unsubscribe(_watch_turn_end)
+            if not turn_end_seen[0]:
+                state.emit(EV_TURN_END, session_in=0, session_out=0, summary_line=None)
+        clear_current_state()
+
+
+def _agent_turn_inner(messages, model, api_key, conn, sid, max_steps, agent, state):
     global _current_agent, _active_tools, _todowrite_calls_this_turn, _current_sid, _large_read_credits
     _current_agent    = agent
     _current_sid      = sid
@@ -1687,12 +1775,16 @@ def agent_turn(messages, model, api_key, conn, sid, max_steps=20, agent=AGENT_BU
 
         # ── Step log ─────────────────────────────────────────────────────────
         ctx_est = estimate_tokens(full)
-        print(f"{DIM}  ┤ step {steps+1}  ctx ~{ctx_est:,} tok  model {model.split('/')[-1]}{R}")
+        if state is not None:
+            state.emit(EV_STEP, step=steps + 1, ctx_est=ctx_est, model=model.split('/')[-1])
+        else:
+            print(f"{DIM}  ┤ step {steps+1}  ctx ~{ctx_est:,} tok  model {model.split('/')[-1]}{R}")
 
         # Always auto — let the model decide. Forcing "required" at step 0 causes
         # unnecessary retries when the model just needs to clarify or reason first.
         tc_mode = "auto"
-        result  = call_api_stream(full, model, api_key, tool_choice=tc_mode, session_id=sid, tools=_turn_api_tools)
+        result  = call_api_stream(full, model, api_key, tool_choice=tc_mode, session_id=sid,
+                                   tools=_turn_api_tools, state=state)
         text    = result["text"]
         tcs     = result["tool_calls"]
         usage   = result["usage"]
@@ -1704,7 +1796,10 @@ def agent_turn(messages, model, api_key, conn, sid, max_steps=20, agent=AGENT_BU
                 message_save(conn, sid, "assistant", {"role": "assistant", "content": partial})
             cid = checkpoint_save(conn, sid, "interrupted", messages,
                                   "User interrupted model streaming; previous saved messages are intact.")
-            print(f"{YELLOW}  checkpoint {cid} saved after interrupt{R}")
+            if state is not None:
+                state.emit(EV_INTERRUPTED, checkpoint_id=cid)
+            else:
+                print(f"{YELLOW}  checkpoint {cid} saved after interrupt{R}")
             break
 
         # Auto-continue if output was cut off (finish_reason=length), up to 3 times
@@ -1716,7 +1811,8 @@ def agent_turn(messages, model, api_key, conn, sid, max_steps=20, agent=AGENT_BU
                 message_save(conn, sid, "assistant", {"role": "assistant", "content": text})
             messages.append({"role": "user", "content": "continue"})
             full2   = [{"role":"system","content":build_system(agent)}] + messages
-            result2 = call_api_stream(full2, model, api_key, tool_choice="auto", session_id=sid, tools=_turn_api_tools)
+            result2 = call_api_stream(full2, model, api_key, tool_choice="auto", session_id=sid,
+                                       tools=_turn_api_tools, state=state)
             text2   = result2["text"]
             tcs2    = result2["tool_calls"]
             if result2.get("interrupted"):
@@ -1726,7 +1822,10 @@ def agent_turn(messages, model, api_key, conn, sid, max_steps=20, agent=AGENT_BU
                     message_save(conn, sid, "assistant", {"role": "assistant", "content": partial})
                 cid = checkpoint_save(conn, sid, "interrupted", messages,
                                       "User interrupted auto-continue; previous saved messages are intact.")
-                print(f"{YELLOW}  checkpoint {cid} saved after interrupt{R}")
+                if state is not None:
+                    state.emit(EV_INTERRUPTED, checkpoint_id=cid)
+                else:
+                    print(f"{YELLOW}  checkpoint {cid} saved after interrupt{R}")
                 break
             # Merge
             text      = text2
@@ -1840,8 +1939,18 @@ def agent_turn(messages, model, api_key, conn, sid, max_steps=20, agent=AGENT_BU
 
         if not tcs: break
 
-        print()
+        # Cùng bug với print() trần trong call_api_stream (09_api_system.py
+        # ~dòng 1364, đã sửa) -- dòng trống này chạy vô điều kiện mỗi khi
+        # có tool_calls, kể cả khi web đang armed. Áp dụng cùng guard.
+        if state is None or not (getattr(state, "web_bridge", None) and state.web_bridge.is_armed()):
+            print()
         tool_results         = []   # sent to model (larger)
+
+        # Cùng bug với print() trần trong call_api_stream (09_api_system.py
+        # ~dòng 1364, đã sửa) -- dòng trống này chạy vô điều kiện mỗi khi
+        # có tool_calls, kể cả khi web đang armed. Áp dụng cùng guard.
+        if state is None or not (getattr(state, "web_bridge", None) and state.web_bridge.is_armed()):
+            print()
         tool_results_history = []   # saved to DB (smaller)
         for tc in tcs:
             name = tc["function"]["name"]
@@ -1860,7 +1969,10 @@ def agent_turn(messages, model, api_key, conn, sid, max_steps=20, agent=AGENT_BU
                     f"Do NOT repeat this call. Change your approach or use a different command.\n"
                     f"If you are stuck, call `question` to ask the user for clarification."
                 )
-                print(f"  {YELLOW}[dedup]{R} {DIM}Blocked duplicate: {name} {json.dumps(args)[:60]}{R}")
+                if state is not None:
+                    state.emit(EV_WARN, text=f"[dedup] Blocked duplicate: {name} {json.dumps(args)[:60]}")
+                else:
+                    print(f"  {YELLOW}[dedup]{R} {DIM}Blocked duplicate: {name} {json.dumps(args)[:60]}{R}")
                 tool_results.append({"role":"tool","tool_call_id":tc.get("id",""),"content":dupe_msg})
                 tool_results_history.append({"role":"tool","tool_call_id":tc.get("id",""),"content":dupe_msg})
                 continue
@@ -1894,7 +2006,7 @@ def agent_turn(messages, model, api_key, conn, sid, max_steps=20, agent=AGENT_BU
                 )
                 if not _BASH_READONLY.search(cmd):
                     _had_writes_last_step = True
-            out_model, out_history = run_tool(name, args, model, api_key, conn, sid)
+            out_model, out_history = run_tool(name, args, model, api_key, conn, sid, state=state)
             _seen_calls_result[_call_sig] = out_model  # store for dedup context
             tool_results.append({
                 "role": "tool", "tool_call_id": tc.get("id", ""), "content": out_model
@@ -1957,11 +2069,28 @@ def agent_turn(messages, model, api_key, conn, sid, max_steps=20, agent=AGENT_BU
                 turn_cache_pct = 0
                 sess_cache_pct = 0
 
-        print(
-            f"{DIM}  gửi {session_in:,}  nhận {session_out:,}  │  "
+        summary_line = (
+            f"gửi {session_in:,}  nhận {session_out:,}  │  "
             f"turn (cache {cache_marker}{total_cached:,}{R}{DIM})|{total_in:,} {turn_cache_pct}%  "
             f"session (cache {cache_marker}{session_cached:,}{R}{DIM})|{session_in:,} {sess_cache_pct}%  │  "
-            f"ctx ~{est:,}  {cost_str}{R}"
+            f"ctx ~{est:,}  {cost_str}"
         )
+        if state is not None:
+            state.emit(EV_TURN_END,
+                       session_in=session_in, session_out=session_out,
+                       total_in=total_in, total_cached=total_cached,
+                       turn_cache_pct=turn_cache_pct, session_cached=session_cached,
+                       sess_cache_pct=sess_cache_pct, ctx_est=est,
+                       cost_total=cost_total, cache_marker_ok=(cache_marker == f"{GREEN}●{R}{DIM}"),
+                       summary_line=summary_line)
+        else:
+            print(
+                f"{DIM}  gửi {session_in:,}  nhận {session_out:,}  │  "
+                f"turn (cache {cache_marker}{total_cached:,}{R}{DIM})|{total_in:,} {turn_cache_pct}%  "
+                f"session (cache {cache_marker}{session_cached:,}{R}{DIM})|{session_in:,} {sess_cache_pct}%  │  "
+                f"ctx ~{est:,}  {cost_str}{R}"
+            )
+    elif state is not None:
+        state.emit(EV_TURN_END, session_in=0, session_out=0, summary_line=None)
 
     return messages

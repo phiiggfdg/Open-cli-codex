@@ -261,8 +261,6 @@ def _prune_tool_results(messages: list) -> list:
     2. Dedup read/glob/grep: nếu cùng file bị read nhiều lần,
        chỉ giữ lần gần nhất đầy đủ, các lần cũ hơn → stub
     """
-    import re as _re
-
     # ── Bước 1: xác định groups (assistant+tool_calls → tool_results) ─────────
     groups = []
     i = 0
@@ -371,7 +369,7 @@ def _prune_tool_results(messages: list) -> list:
                 if name in STRIP_TOOLS:
                     try:
                         args = json.loads(tc["function"]["arguments"])
-                        placeholder = "[content omitted from history — outcome was reported in tool result at the time]"
+                        placeholder = _HISTORY_COMPACTED_MARKER
                         if "content" in args:
                             args["content"] = placeholder
                             changed = True
@@ -640,7 +638,7 @@ def _workspace_references(name: str, seed_file: str | None = None,
         out.append(f"  ... truncated at {max_hits} hits")
     return "\n".join(out)
 
-def tool_read(path, offset=1, limit=READ_DEFAULT_LIMIT, depth=4):
+def tool_read(path, offset=1, limit=READ_DEFAULT_LIMIT, depth=4, state=None):
 
     # Auto-resolve vào sandbox chỉ khi sandbox đã enforce (không phải placeholder)
     if _project_dir is not None and not _project_dir_is_placeholder:
@@ -743,17 +741,39 @@ def tool_read(path, offset=1, limit=READ_DEFAULT_LIMIT, depth=4):
                 _large_read_credits -= 1
                 limit = 500
             else:
-                print(f"\n{YELLOW}⚠ AI muốn đọc {limit} dòng từ '{path}'{R}")
-                print(f"{DIM}  Đây là đoạn dài — thường có thể dùng grep để thu hẹp trước.{R}")
-                print(f"{DIM}  Cho phép sẽ đọc tối đa 500 dòng 2 lần.{R}")
-                try:
-                    ans = input(f"  {CYAN}Cho phép đọc nhiều? [y/N]: {R}").strip().lower()
-                except (EOFError, KeyboardInterrupt):
-                    ans = "n"
+                # BUG FIX (cùng loại đã sửa ở tool_question/tool_verify):
+                # trước đây luôn dùng input()/print() thẳng ra CLI, kể cả
+                # khi đang chạy /web -- câu hỏi "Cho phép đọc nhiều?" không
+                # hề hiện trên web UI, luôn rơi ra cửa sổ CLI phía sau. Sửa
+                # theo đúng pattern permission-ask/tool_verify: có state
+                # (tham số hoặc fallback qua current_state() nếu gọi nội bộ
+                # không truyền tay, vd từ tool_verify) -> state.ask() (web
+                # trả lời qua WS); không có state nào cả -> giữ input() cũ.
+                _st = state if state is not None else current_state()
+                if _st is not None:
+                    _st.emit(EV_INFO,
+                        text=f"⚠ AI muốn đọc {limit} dòng từ '{path}' — có thể dùng grep để thu hẹp trước.")
+                    ans = _st.ask(
+                        prompt=f"Cho phép đọc {limit} dòng? Sẽ đọc tối đa 500 dòng, 2 lần.",
+                        kind="confirm",
+                        default="n",
+                    ) or "n"
+                    ans = str(ans).strip().lower()
+                else:
+                    print(f"\n{YELLOW}⚠ AI muốn đọc {limit} dòng từ '{path}'{R}")
+                    print(f"{DIM}  Đây là đoạn dài — thường có thể dùng grep để thu hẹp trước.{R}")
+                    print(f"{DIM}  Cho phép sẽ đọc tối đa 500 dòng 2 lần.{R}")
+                    try:
+                        ans = input(f"  {CYAN}Cho phép đọc nhiều? [y/N]: {R}").strip().lower()
+                    except (EOFError, KeyboardInterrupt):
+                        ans = "n"
                 if ans in ("y", "yes"):
                     _large_read_credits = 1  # lần này + 1 lần nữa = 2 tổng
                     limit = 500
-                    print(f"  {GREEN}✓ Cho phép đọc tối đa 500 dòng 2 lần.{R}")
+                    if _st is not None:
+                        _st.emit(EV_INFO, text="✓ Cho phép đọc tối đa 500 dòng 2 lần.")
+                    else:
+                        print(f"  {GREEN}✓ Cho phép đọc tối đa 500 dòng 2 lần.{R}")
                 else:
                     return (
                         f"[verify] User từ chối đọc {limit} dòng.\n"
@@ -853,7 +873,28 @@ def _edit_sanity_snap(lines: list[str], anchor_line: int) -> str:
         return ""
     return "Snap: " + " · ".join(parts)
 
+# ── History-compaction marker guard ──────────────────────────────────────────
+# Khi lịch sử hội thoại bị nén (xem strip loop phía trên và trong
+# 08_undo_dispatch.py), nội dung write/edit/patch cũ được thay bằng marker
+# này. Nếu model từng "nhìn thấy" marker trong history và nhầm nó là nội
+# dung thật cần ghi (đã xảy ra thực tế, gây SyntaxError khi marker bị ghi
+# đè vào file .py), guard này chặn đứng thao tác ở tầng thực thi thay vì
+# để lỗi lọt xuống file thật.
+_HISTORY_COMPACTED_MARKER = "<<<HISTORY_COMPACTED_38f2a1_DO_NOT_COPY_THIS_MARKER_INTO_ANY_FILE>>>"
+
+def _contains_compaction_marker(*texts) -> bool:
+    return any(_HISTORY_COMPACTED_MARKER in (t or "") for t in texts)
+
+_COMPACTION_MARKER_ERROR = (
+    "[error] The content you provided is a history-compaction placeholder marker, "
+    "not real file content. This means you copied it from an earlier (compacted) "
+    "tool_call in the conversation history instead of writing actual content. "
+    "Do NOT reuse that marker — write the real, full content/patch yourself."
+)
+
 def tool_write(path, content, conn=None, sid=None):
+    if _contains_compaction_marker(content):
+        return _COMPACTION_MARKER_ERROR
     p = _resolve_to_sandbox(path)
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -936,6 +977,8 @@ def tool_extract(src, start, end, dst, mode="move", conn=None, sid=None):
         return f"[error: {e}]"
 
 def tool_edit(path, old_str, new_str, conn=None, sid=None):
+    if _contains_compaction_marker(old_str, new_str):
+        return _COMPACTION_MARKER_ERROR
     p = _resolve_to_sandbox(path)
     if not p.exists(): return f"[not found: {p}]"
     try:
@@ -949,7 +992,21 @@ def tool_edit(path, old_str, new_str, conn=None, sid=None):
                     f"Use the read tool to reload it before editing.")
         text  = p.read_text()
         count = text.count(old_str)
-        if count == 0: return "[error: old_str not found]"
+        if count == 0:
+            # C-fix: thông báo cụ thể hơn để model tự sửa nhanh, không đoán mù.
+            snippet = old_str.strip()
+            snippet = snippet[:80] + ("…" if len(snippet) > 80 else "")
+            hint = (
+                f"[error: old_str not found] The exact text you provided does not "
+                f"appear in '{path}' (last_read={last_read:.0f}, current mtime={mtime:.0f}).\n"
+                f"old_str you sent (truncated): {snippet!r}\n"
+                f"This usually means: (1) the file was rewritten (e.g. via `write`) since "
+                f"your last `read`/`edit`, or (2) whitespace/line-ending differs from what "
+                f"you remember. Re-`read` the file now to get its current exact content, "
+                f"then retry `edit` with old_str copied verbatim from that fresh read — "
+                f"do not reconstruct it from memory."
+            )
+            return hint
         if count > 1:  return f"[error: found {count} times — must be unique]"
         after = text.replace(old_str, new_str, 1)
         p.write_text(after)
@@ -988,6 +1045,10 @@ def tool_edit(path, old_str, new_str, conn=None, sid=None):
 
 def tool_multiedit(path, edits, conn=None, sid=None):
     """Apply multiple str-replace edits to a single file sequentially."""
+    if _contains_compaction_marker(*[
+        v for e in (edits or []) for v in (e.get("old_str"), e.get("new_str"))
+    ]):
+        return _COMPACTION_MARKER_ERROR
     p = _resolve_to_sandbox(path)
     if not p.exists(): return f"[not found: {p}]"
     results = []

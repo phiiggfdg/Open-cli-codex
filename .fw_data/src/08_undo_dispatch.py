@@ -84,6 +84,8 @@ def _patch_snippet(after: str, patch: str) -> str:
 
 def tool_apply_patch(path, patch, conn=None, sid=None):
     """Apply unified diff patch — uses system `patch` if available."""
+    if _contains_compaction_marker(patch):
+        return _COMPACTION_MARKER_ERROR
     p = _resolve_to_sandbox(path)
     if not p.exists(): return f"[not found: {p}]"
     try:
@@ -321,7 +323,7 @@ Be concise. Current directory: {os.getcwd()}"""
                 if name in STRIP_TOOLS_SUB:
                     try:
                         a = json.loads(tc["function"]["arguments"])
-                        placeholder = "[content omitted from history — see tool result below for outcome]"
+                        placeholder = _HISTORY_COMPACTED_MARKER
                         for k in ("content", "patch", "new_str"):
                             if k in a:
                                 a[k] = placeholder
@@ -358,6 +360,7 @@ _bash_allow_all: bool = False  # set True khi user chọn "a" = allow all bash
 def _check_permission(name, args, agent=None):
     """Returns True if tool is allowed. Handles ask/deny/allow + wildcard patterns."""
     ag = agent or _current_agent
+    state = current_state()   # SessionState | None — xem 01d_events.py
     # Merge: custom > plan-override > default
     perms = dict(DEFAULT_PERMS)
     if ag == AGENT_PLAN:
@@ -388,35 +391,67 @@ def _check_permission(name, args, agent=None):
     if level is None:
         level = PERM_ALLOW
     if level == PERM_DENY:
-        print(f"  {RED}✗ {name} denied (agent={ag}){R}")
+        if state is not None:
+            state.emit(EV_TOOL_DENIED, name=name, agent=ag)
+        else:
+            print(f"  {RED}✗ {name} denied (agent={ag}){R}")
         return False
     if level == PERM_ASK:
         global _bash_allow_all
-        if _bash_allow_all and name == "bash":
+        # Web: mỗi session tự giữ cờ allow-all riêng (state.bash_allow_all) để
+        # nhiều tab/nhiều người không đụng nhau qua global chung. CLI (state
+        # is None) giữ hành vi cũ dùng global module-level.
+        allow_all = state.bash_allow_all if state is not None else _bash_allow_all
+        if allow_all and name == "bash":
             return True
-        print(f"\n  {YELLOW}{'─'*56}{R}")
+
         explanation = _explain_tool_action(name, args)
         if name == "bash":
             explanation += ("\nBash có quyền của tiến trình hiện tại và có thể truy cập "
                             "ngoài project_dir; cwd không phải sandbox bảo mật.")
-        for line in explanation.splitlines():
-            print(f"  {line}")
-        print(f"  {YELLOW}{'─'*56}{R}")
-        try:
-            ans = input(f"  {CYAN}Allow? [y/N/a(ll)]: {R}").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            ans = "n"
+
+        if state is not None:
+            # Web/event path: emit EV_ASK rồi block cho tới khi có người trả lời
+            # qua bus.ask() — CLI listener (nếu còn subscribe) trả lời bằng
+            # input() ngay lập tức; web listener trả lời qua POST /api/respond.
+            ans = state.ask(
+                prompt=f"Allow tool '{name}'? [y/N/a(ll)]",
+                kind="confirm",
+                default="n",
+                extra={"explanation": explanation, "name": name},
+            ) or "n"
+            ans = str(ans).strip().lower()
+        else:
+            print(f"\n  {YELLOW}{'─'*56}{R}")
+            for line in explanation.splitlines():
+                print(f"  {line}")
+            print(f"  {YELLOW}{'─'*56}{R}")
+            try:
+                ans = input(f"  {CYAN}Allow? [y/N/a(ll)]: {R}").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                ans = "n"
+
         if ans in ("a", "all"):
-            _bash_allow_all = True
-            print(f"  {GREEN}✓ Allow all bash for this session.{R}")
+            if state is not None:
+                state.bash_allow_all = True
+            else:
+                _bash_allow_all = True
+            if state is not None:
+                state.emit(EV_INFO, text="✓ Allow all bash for this session.")
+            else:
+                print(f"  {GREEN}✓ Allow all bash for this session.{R}")
             return True
         if ans not in ("y", "yes"):
-            print(f"  {RED}✗ Denied by user.{R}")
+            if state is not None:
+                state.emit(EV_TOOL_DENIED, name=name, agent=ag, by_user=True)
+            else:
+                print(f"  {RED}✗ Denied by user.{R}")
             return False
     return True
 
+
 # ── Dispatch ─────────────────────────────────────────────────────────────────
-def _dispatch_tool(name, args, model, api_key, conn, sid):
+def _dispatch_tool(name, args, model, api_key, conn, sid, state=None):
     if name == "set_tools":
         result = tool_set_tools(args.get("tools", []))
         return result
@@ -432,7 +467,7 @@ def _dispatch_tool(name, args, model, api_key, conn, sid):
         return f"[permission denied: {name}]"
     dispatch = {
         "bash":        lambda a: tool_bash(a["command"], a.get("timeout",30)),
-        "read":        lambda a: tool_read(a["path"], a.get("offset",1), a.get("limit",READ_DEFAULT_LIMIT), a.get("depth",4)),
+        "read":        lambda a: tool_read(a["path"], a.get("offset",1), a.get("limit",READ_DEFAULT_LIMIT), a.get("depth",4), state),
         "write":       lambda a: tool_write(a["path"], a["content"], conn, sid),
         "extract":     lambda a: tool_extract(a["src"], a["start"], a["end"], a["dst"], a.get("mode","move"), conn, sid),
         "edit":        lambda a: tool_edit(a["path"], a["old_str"], a["new_str"], conn, sid),
@@ -443,7 +478,7 @@ def _dispatch_tool(name, args, model, api_key, conn, sid):
         "websearch":   lambda a: tool_websearch(a["query"], a.get("num",5)),
         "todowrite":   lambda a: tool_todowrite(a["todos"]),
         "todoread":    lambda a: tool_todoread(),
-        "question":    lambda a: tool_question(a["question"], a.get("options")),
+        "question":    lambda a: tool_question(a["question"], a.get("options"), state),
         "apply_patch": lambda a: tool_apply_patch(a["path"], a["patch"], conn, sid),
         "task":        lambda a: tool_task(a["description"], a.get("tools"),
                                            model, api_key, conn, sid),
@@ -483,13 +518,20 @@ TOOL_ICONS = {
     "verify":      f"{CYAN}⊙",
 }
 
-def run_tool(name, args, model, api_key, conn, sid):
+def run_tool(name, args, model, api_key, conn, sid, state=None):
     icon = TOOL_ICONS.get(name, f"{DIM}⚙")
     preview = json.dumps(args, ensure_ascii=False)[:100]
-    print(f"  {icon} {BOLD}{name}{R}  {DIM}{preview}{R}")
-    result = _dispatch_tool(name, args, model, api_key, conn, sid)
+    if state is not None:
+        state.emit(EV_TOOL_START, name=name, args=args, preview=preview)
+    else:
+        print(f"  {icon} {BOLD}{name}{R}  {DIM}{preview}{R}")
+    result = _dispatch_tool(name, args, model, api_key, conn, sid, state)
     brief  = str(result)[:200].replace("\n","↵")
-    print(f"  {DIM}╰─ {brief}{'…' if len(str(result))>200 else ''}{R}")
+    truncated = len(str(result)) > 200
+    if state is not None:
+        state.emit(EV_TOOL_END, name=name, brief=brief, truncated=truncated)
+    else:
+        print(f"  {DIM}╰─ {brief}{'…' if truncated else ''}{R}")
     # Cap what the model sees — head+tail like openai/codex
     result_for_model   = _head_tail(str(result), TOOL_OUTPUT_MAX_CHARS,  label=name)
     # Cap what stays in context history (even smaller — lives forever)

@@ -496,7 +496,18 @@ def _ensure_project_dir(requested_path: str) -> Path:
         if _project_dir_conn and _project_dir_sid:
             session_update(_project_dir_conn, _project_dir_sid,
                            project_dir=str(_project_dir))
-        print(f"  {GREEN}[sandbox]{R} enforced: {DIM}{_project_dir}{R}")
+        # BUG ĐÃ SỬA: cùng loại bug với tool_todowrite (07_tools_more.py) --
+        # print() trần trong hàm helper sâu (_ensure_project_dir, gọi từ
+        # bên trong write/edit tool), không nhận state, không emit gì --
+        # dòng "[sandbox] enforced: ..." chỉ hiện trên CLI thật, web không
+        # bao giờ thấy. Dùng current_state() (thread-local) cùng pattern
+        # đã áp cho tool_todowrite.
+        _txt = f"  {GREEN}[sandbox]{R} enforced: {DIM}{_project_dir}{R}"
+        _st = current_state()
+        if _st is not None:
+            _st.emit(EV_INFO, text=_txt, raw=True)
+        else:
+            print(_txt)
         return _project_dir
 
     # Fallback legacy session chua co project_dir (rat hiem)

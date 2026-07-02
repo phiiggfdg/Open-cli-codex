@@ -821,7 +821,15 @@ def choose_provider() -> str:
                     else:
                         print(f"  {DIM}MCP: chưa cấu hình server. Dùng /mcp add <name> <url> để thêm.{R}\n")
                 return _active_provider
-        except (ValueError, KeyboardInterrupt):
+        except ValueError:
+            print(f"\n  {DIM}Không hợp lệ, thử lại.{R}")
+            keys = _print_menu()
+            continue
+        except KeyboardInterrupt:
+            # choose_provider() chỉ chạy khi bàn phím CLI thật đang cầm
+            # quyền (web không gọi hàm này -- web dùng get_next_input trên
+            # session đã có sẵn provider/model, xem 01d_events.py). Ctrl-C
+            # ở đây luôn có nghĩa "người dùng CLI thật muốn thoát".
             print(f"\n  {DIM}Bye.{R}"); sys.exit(0)
 
 # ── /end PROVIDER ─────────────────────────────────────────────────────────────

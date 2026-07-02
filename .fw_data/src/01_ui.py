@@ -53,7 +53,33 @@ class Spinner:
         i = 0
         self._start_t = time.time()
         rain_buf = ["  ", "  ", "  "]
+        was_hidden = False
         while not self._stop.is_set():
+            # ── Im lặng khi web đang armed ───────────────────────────────
+            # BUG: Spinner luôn ghi thẳng \r ra sys.stdout bất kể web_bridge
+            # có đang armed hay không -- khác với render_cli (01d_events.py),
+            # vốn tự kiểm tra get_cli_state().web_bridge.is_armed() và im
+            # lặng khi đang dùng qua web. Kết quả: mỗi lần gọi API trong lúc
+            # web đang cầm quyền, spinner "Thinking" vẫn overwrite \r liên
+            # tục đè lên terminal CLI thật, dù không ai nhìn CLI lúc đó.
+            # Sửa: dùng đúng pattern get_cli_state()/is_armed() đã có sẵn ở
+            # render_cli -- nếu armed, bỏ qua vòng vẽ này (không sleep dài
+            # hơn, vẫn poll ở nhịp cũ để phản ứng ngay khi user Esc quay lại
+            # CLI thật giữa chừng một lần gọi API).
+            try:
+                _st = get_cli_state()
+            except NameError:
+                _st = None
+            if _st is not None and getattr(_st, "web_bridge", None) is not None and _st.web_bridge.is_armed():
+                if not was_hidden:
+                    sys.stdout.write("\r\033[K")
+                    sys.stdout.flush()
+                    was_hidden = True
+                time.sleep(0.09)
+                i += 1
+                continue
+            was_hidden = False
+
             frame   = self.FRAMES[i % len(self.FRAMES)]
             elapsed = time.time() - self._start_t
             elapsed_s = f" {elapsed:.1f}s" if elapsed >= 1 else ""
@@ -96,7 +122,7 @@ SLASH_COMMANDS = [
     "/undo", "/redo", "/diff", "/sandbox", "/export", "/cache", "/checkpoint",
     "/perm", "/perms", "/skills", "/setkey", "/deletekey", "/init", "/rules",
     "/commands", "/sequential", "/batch", "/commit", "/review", "/help", "/mcp",
-    "/addkey", "/listkeys", "/rmkey", "/keystrategy",
+    "/addkey", "/listkeys", "/rmkey", "/keystrategy", "/web",
 ]
 
 SLASH_DESC = {
@@ -138,6 +164,7 @@ SLASH_DESC = {
     "/review":     "AI review code đã thay đổi trong session hiện tại",
     "/help":       "xem tất cả lệnh",
     "/mcp":        "quản lý MCP server (Command Code) — list/add/remove/status",
+    "/web":        "mở web UI local (terminal bridge qua trình duyệt)",
 }
 
 def _slash_hint(prefix: str) -> list[str]:
@@ -214,11 +241,6 @@ def _multiline_input_with_hint(prompt: str) -> str | None:
         has_hint[0] = bool(hint)
         _redraw(text, hint)
 
-    def _clear_hint(current_buf: list):
-        """Xóa hint, giữ text."""
-        has_hint[0] = False
-        _redraw("".join(current_buf))
-
     # ── main raw loop ─────────────────────────────────────────────────────────
     try:
         _tty.setraw(fd)
@@ -247,8 +269,18 @@ def _multiline_input_with_hint(prompt: str) -> str | None:
                     history_save(_input_history)
                 return line or None
 
-            # Ctrl-C / Ctrl-D
-            if ch in ("\x03", "\x04"):
+            # Ctrl-C: raise thật để caller (main loop) phân biệt được với
+            # Ctrl-D/EOF -- cần thiết vì raw-mode đã tắt xử lý SIGINT tự
+            # động của terminal, nên phải tự phát tín hiệu này bằng tay.
+            if ch == "\x03":
+                if has_hint[0]:
+                    _render("".join(buf))
+                sys.stdout.write("\r\n")
+                sys.stdout.flush()
+                raise KeyboardInterrupt()
+
+            # Ctrl-D (EOF)
+            if ch == "\x04":
                 if has_hint[0]:
                     _render("".join(buf))
                 sys.stdout.write("\r\n")

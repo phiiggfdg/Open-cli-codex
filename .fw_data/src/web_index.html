@@ -1,0 +1,1275 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+<title>Open CLI Codex — Web</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
+  /* ── Theme: be sáng, bo tròn, font Be Vietnam Pro (dấu tiếng Việt rõ,
+     nét hiện đại, phổ biến cho UI — chọn thay cho hint "để mình tự chọn").
+     Mono (JetBrains Mono) chỉ dùng cho phần thật sự cần căn cột: preview
+     args JSON, /help raw ANSI, số liệu token — giữ cảm giác "terminal"
+     nhẹ nhàng mà không làm cả trang cứng nhắc. */
+  :root {
+    --bg:        #f7f2e9;   /* be sáng, nền chính */
+    --bg-panel:  #fffdf8;   /* nền card/bubble, sáng hơn nền 1 chút */
+    --bg-sunken: #efe7d8;   /* nền lõm nhẹ (thanh trên, input bar) */
+    --border:    #d9cbac;   /* tăng tương phản so với bản trước — cạnh rõ hơn */
+    --border-soft: #e8ddc4;
+    --text:      #4a4030;   /* nâu đậm ấm, dễ đọc trên be, đỡ gắt hơn đen */
+    --text-dim:  #9b8f77;
+    --accent:    #c17a3f;   /* cam đất — accent chính thay cho xanh dương lạnh */
+    --accent-2:  #7a8f5c;   /* xanh ô-liu — thành công/AI */
+    --warn:      #b8863a;
+    --err:       #b6503f;
+    --user-bg:   #4a6a5a;   /* xanh rêu đậm cho bubble user, tương phản ấm */
+    --radius-lg: 18px;
+    --radius-md: 12px;
+    --radius-sm: 8px;
+    /* Elevation: 2 mức shadow dùng nhất quán -- mức 1 cho card thường (tách
+       nhẹ khỏi nền), mức 2 cho thứ CẦN nổi bật (nút hành động, group tool
+       đang chạy, hộp cần phản hồi). Màu shadow ngả nâu ấm (không xám lạnh)
+       để hợp tông be, và mỗi elevation-2 còn có 1 lớp glow màu accent riêng
+       thay vì tăng độ đen — "nổi" bằng màu, không phải bằng bóng tối. */
+    --shadow-1: 0 1px 3px rgba(74,64,48,0.08);
+    --shadow-2: 0 4px 14px rgba(74,64,48,0.14);
+  }
+
+  /* ── Glass 7 màu kiểu Apple: gradient nhiều màu chạy dưới lớp kính mờ
+     (backdrop-filter blur) -> cảm giác ánh sáng tán xạ qua kính, giống
+     hiệu ứng "liquid glass" trên iOS/macOS. Dùng cho thanh trạng thái
+     trên cùng và nút ẩn/hiện log tool. */
+  @keyframes glassShift {
+    0%   { background-position: 0% 50%; }
+    50%  { background-position: 100% 50%; }
+    100% { background-position: 0% 50%; }
+  }
+  .glass7 { position: relative; isolation: isolate; }
+  .glass7::before {
+    content: ""; position: absolute; inset: -40%; z-index: -1;
+    background: linear-gradient(115deg,
+      #ff6b6b 0%, #ffa94d 14%, #ffd43b 28%, #69db7c 42%,
+      #4dabf7 57%, #845ef7 71%, #f783ac 85%, #ff6b6b 100%);
+    background-size: 300% 300%;
+    filter: blur(28px) saturate(1.3);
+    opacity: 0.28;
+    animation: glassShift 14s ease-in-out infinite;
+    pointer-events: none;
+  }
+
+  /* Biến thể glass7 nhẹ hơn, viền mỏng chạy quanh bubble AI — cùng dải 7
+     màu nhưng opacity thấp + chỉ lộ ra ở rìa (viền), giữ nền bubble đọc
+     được chữ, không lấn át nội dung chat. */
+  .glass7-edge { position:relative; isolation:isolate; }
+  .glass7-edge::before {
+    content:""; position:absolute; inset:-1px; z-index:-1; border-radius:inherit;
+    background: linear-gradient(120deg,
+      #ff6b6b 0%, #ffa94d 14%, #ffd43b 28%, #69db7c 42%,
+      #4dabf7 57%, #845ef7 71%, #f783ac 85%, #ff6b6b 100%);
+    background-size: 300% 300%;
+    opacity: 0.55;
+    animation: glassShift 16s ease-in-out infinite;
+  }
+  .glass7-edge::after {
+    content:""; position:absolute; inset:1px; z-index:-1; border-radius:calc(var(--radius-lg) - 1px);
+    background:var(--bg-panel);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation-duration: 0.001ms !important; animation-iteration-count: 1 !important;
+      transition-duration: 0.001ms !important; scroll-behavior:auto !important; }
+  }
+
+  html, body { margin:0; padding:0; background:var(--bg); height:100%; overflow:hidden; }
+  * { box-sizing: border-box; }
+  body { font-family:"Be Vietnam Pro", -apple-system, sans-serif; }
+  #wrap { display:flex; flex-direction:column; height:100vh; height:100dvh; }
+
+  #bar { flex:0 0 auto; background:rgba(239,231,216,0.62); backdrop-filter:blur(18px) saturate(1.6);
+         -webkit-backdrop-filter:blur(18px) saturate(1.6); color:var(--text-dim);
+         font-size:12px; font-weight:500; padding:10px 14px; display:flex;
+         justify-content:space-between; align-items:center;
+         border-bottom:1px solid var(--border); box-shadow:0 1px 6px rgba(74,64,48,0.05);
+         overflow:hidden; }
+  #status { display:flex; align-items:center; gap:7px; }
+  @keyframes dotPulse {
+    0%, 100% { box-shadow:0 0 0 3px rgba(122,143,92,0.18); }
+    50%      { box-shadow:0 0 0 6px rgba(122,143,92,0.06); }
+  }
+  #dot { width:9px; height:9px; border-radius:50%; background:var(--err); flex:0 0 auto;
+         box-shadow:0 0 0 3px rgba(182,80,63,0.15); transition:background .25s, box-shadow .25s; }
+  #dot.ok { background:var(--accent-2); animation: dotPulse 2.4s ease-in-out infinite; }
+  #meta { color:var(--text-dim); }
+
+  #logScroll { flex:1 1 auto; overflow-y:auto; -webkit-overflow-scrolling:touch; scroll-behavior:smooth; }
+  #log { padding:14px 10px; display:flex; flex-direction:column; gap:10px;
+    font-size: 14px; line-height:1.55; color:var(--text); min-height:100%; }
+
+  /* Mọi dòng log/card mới chèn vào (info-card, tool-group, step, spinner...)
+     đều trượt nhẹ lên + fade in — cùng "ngôn ngữ chuyển động" với bubble
+     chat để cả luồng cảm giác liền mạch, không phải bubble mượt còn log
+     tool hiện cộc lốc. */
+  @keyframes rowIn {
+    from { opacity:0; transform: translateY(8px); }
+    to   { opacity:1; transform: translateY(0); }
+  }
+  .row, .info-card, .tool-group, .ask-box, .turn-toggle-row {
+    animation: rowIn .3s cubic-bezier(.25,.8,.35,1) both;
+  }
+  .row { white-space:pre-wrap; word-break:break-word; }
+  .dim { color:var(--text-dim); }
+  .mono { font-family:"JetBrains Mono", Menlo, Consolas, monospace; font-size:12.5px; }
+
+  /* ── Spinner "Thinking" ────────────────────────────────────────────── */
+  /* Con trỏ nhấp nháy cuối bubble AI trong lúc đang stream — báo hiệu
+     "đang gõ", giống iMessage/ChatGPT. Chỉ hiện khi bubble còn "sống"
+     (class .streaming), tự mất khi turn kết thúc. */
+  @keyframes caretBlink { 0%, 45% { opacity:1; } 50%, 95% { opacity:0; } 100% { opacity:1; } }
+  .ai-body.streaming::after {
+    content:""; display:inline-block; width:2px; height:1em; margin-left:2px;
+    background:var(--accent); vertical-align:-2px;
+    animation: caretBlink 1s steps(1) infinite;
+  }
+
+  .spinner-row { display:flex; align-items:center; gap:0; font-family:"JetBrains Mono",monospace; }
+  .spinner-frame { color:var(--accent); display:inline-block; width:1ch; text-align:center; }
+  .spinner-label { color:var(--accent); margin-left:6px; font-family:"Be Vietnam Pro",sans-serif; font-weight:600; }
+  .spinner-rain  { color:var(--text-dim); margin-left:8px; letter-spacing:1px; }
+  .spinner-time  { color:var(--text-dim); margin-left:8px; }
+
+  /* ── Bong bóng chat: user phải / AI trái (giữ nguyên như yêu cầu) ─────
+     Animation xuất hiện: user bay vào từ phải, AI bay vào từ trái + hơi
+     phóng to từ 0.94 -> 1 (giống hiệu ứng "pop" của iMessage), cubic-bezier
+     có overshoot nhẹ để có cảm giác nảy mượt chứ không cứng. */
+  @keyframes bubbleInUser {
+    from { opacity:0; transform: translateX(18px) scale(0.94); }
+    to   { opacity:1; transform: translateX(0) scale(1); }
+  }
+  @keyframes bubbleInAi {
+    from { opacity:0; transform: translateX(-18px) scale(0.94); }
+    to   { opacity:1; transform: translateX(0) scale(1); }
+  }
+  .bubble-wrap { display:flex; width:100%; }
+  .bubble-wrap.from-user { justify-content:flex-end; }
+  .bubble-wrap.from-ai   { justify-content:flex-start; }
+  .bubble-wrap.from-user .bubble { animation: bubbleInUser .38s cubic-bezier(.2,.9,.3,1.24) both; }
+  .bubble-wrap.from-ai   .bubble { animation: bubbleInAi   .38s cubic-bezier(.2,.9,.3,1.24) both; }
+  .bubble {
+    max-width: 86%; border-radius:var(--radius-lg); padding:11px 15px;
+    white-space:pre-wrap; word-break:break-word; box-shadow:var(--shadow-1);
+    transition: box-shadow .18s ease, transform .12s ease;
+  }
+  .bubble.user { background:var(--user-bg); color:#fbf7ee; border-bottom-right-radius:4px; }
+  .bubble.ai   { background:var(--bg-panel); color:var(--text); border:1px solid var(--border-soft);
+                 border-bottom-left-radius:4px; }
+  /* Tap feedback nhẹ, giống bong bóng iMessage lún xuống khi chạm */
+  .bubble:active { transform: scale(0.985); }
+
+  /* ── Nhóm tool (nhánh cha-con) ─────────────────────────────────────────
+     tool_start mở 1 "group": khung bo tròn bao ngoài, đường nối dọc màu
+     accent bên trái nối tool_start -> mọi con (info raw, tool_end...) ->
+     kết thúc khi group đóng (turn_end / step / bubble mới). Mỗi con thụt
+     lề thêm so với cha, có chấm nối nhỏ trên đường dọc để rõ là 1 nhánh. */
+  .tool-group {
+    background:var(--bg-panel); border:1px solid var(--border-soft); border-radius:var(--radius-md);
+    padding:10px 12px 10px 0; margin:0 4px; position:relative; overflow:hidden;
+    box-shadow:var(--shadow-2), -3px 0 0 0 var(--accent) inset;
+  }
+  .tool-group-head {
+    display:flex; align-items:baseline; gap:8px; padding:0 12px 8px 14px;
+    font-weight:600;
+  }
+  .tool-group-head .tool-icon { font-size:14px; }
+  .tool-group-head .tool-name { color:var(--text); }
+  .tool-group-head .tool-brief { color:var(--text-dim); font-weight:400; font-size:12.5px; }
+  .tool-group.denied { border-color:#e0b3a8; background:#fdf4f1;
+    box-shadow:var(--shadow-2), -3px 0 0 0 var(--err) inset; }
+
+  .tool-children { position:relative; margin-left:14px; padding-left:16px; }
+  .tool-children::before {
+    content:""; position:absolute; left:0; top:2px; bottom:8px; width:2px;
+    background:var(--border); border-radius:2px;
+  }
+  .tool-child {
+    position:relative; padding:5px 10px 5px 8px; color:var(--text-dim);
+    font-size:12.5px; line-height:1.5;
+  }
+  .tool-child::before {
+    content:""; position:absolute; left:-16px; top:12px; width:12px; height:2px;
+    background:var(--border);
+  }
+  .tool-child.child-info { color:var(--text); background:var(--bg-sunken);
+    border-radius:var(--radius-sm); margin:2px 8px 2px 0; padding:8px 10px 8px 8px; }
+  .tool-child.child-warn { color:var(--warn); }
+  .tool-child.child-err  { color:var(--err); }
+  .tool-child.child-denied { color:var(--err); font-weight:500; }
+
+  /* ── info-card độc lập (không thuộc group nào, vd /help, step, turn_end) */
+  .info-card {
+    background:var(--bg-panel); border:1px solid var(--border-soft); border-radius:var(--radius-md);
+    padding:10px 13px; margin:0 4px; color:var(--text); box-shadow:var(--shadow-1);
+  }
+  .info-card.raw-info { font-family:"JetBrains Mono",monospace; font-size:12.5px; background:var(--bg-sunken); }
+  .info-card.warn { border-color:#e2c48a; background:#fbf3e2; color:#8a611f;
+    box-shadow:var(--shadow-1), 0 0 0 1px rgba(184,134,58,0.12); }
+  .info-card.err  { border-color:#e0b3a8; background:#fdf4f1; color:#943f2e;
+    box-shadow:var(--shadow-1), 0 0 0 1px rgba(182,80,63,0.12); }
+  .info-card.step { background:transparent; border:none; box-shadow:none; padding:2px 13px; color:var(--text-dim);
+    font-family:"JetBrains Mono",monospace; font-size:12px; }
+
+  .ask-box { border:1px solid var(--warn); background:#fbf3e2; border-radius:var(--radius-md);
+             padding:12px 14px; margin:0 4px;
+             box-shadow:var(--shadow-2), 0 0 0 3px rgba(184,134,58,0.10);
+             transition: opacity .35s ease, filter .35s ease, box-shadow .35s ease, transform .35s ease; }
+  .ask-prompt { color:#8a611f; margin-bottom:8px; white-space:pre-wrap; font-weight:500; }
+  .ask-actions { display:flex; gap:8px; flex-wrap:wrap; }
+  .ask-btn { background:var(--bg-panel); color:var(--text); border:1px solid var(--border);
+             border-radius:var(--radius-sm); padding:8px 15px; font-size:13px; font-weight:600;
+             cursor:pointer; box-shadow:var(--shadow-1); transition:transform .08s, box-shadow .08s; }
+  .ask-btn:active { transform:translateY(1px); box-shadow:none; }
+  .ask-btn.yes { background:var(--accent-2); border-color:var(--accent-2); color:#fff;
+    box-shadow:0 2px 8px rgba(122,143,92,0.35); }
+  .ask-btn.no  { background:var(--err); border-color:var(--err); color:#fff;
+    box-shadow:0 2px 8px rgba(182,80,63,0.3); }
+  .ask-input { display:flex; gap:8px; margin-top:8px; }
+  .ask-input input { flex:1; background:var(--bg-panel); border:1px solid var(--border); border-radius:var(--radius-sm);
+                      color:var(--text); padding:8px 10px; font-size:14px; font-family:inherit; }
+  .ask-input button { background:var(--accent-2); color:#fff; border:none; border-radius:var(--radius-sm);
+                       padding:8px 16px; font-weight:600; font-size:13px; cursor:pointer;
+                       box-shadow:0 2px 8px rgba(122,143,92,0.35); transition:transform .08s; }
+  .ask-input button:active { transform:translateY(1px); }
+  /* Sau khi trả lời: ô nhập + nút OK không còn ý nghĩa gì nữa (giá trị đã
+     gửi, đã có dòng ✓ answer-tag hiện riêng) — ẩn hẳn luôn, không chỉ mờ,
+     để không còn cảnh "gõ xong vẫn thấy y nguyên chữ mình vừa gõ trong ô". */
+  .ask-answered .ask-input,
+  .ask-answered .ask-actions { display:none; }
+  /* Sau khi trả lời: mờ hẳn + hạ bóng + khoá cứng mọi tương tác (nút/ô
+     nhập không bấm/gõ được nữa dù còn nằm trong DOM) — trước đây chỉ giảm
+     opacity nhẹ (0.55) không transition, nhìn gần như không đổi gì, dễ
+     hiểu lầm là "chưa trả lời". Giờ mờ rõ (0.4) + bớt sắc nét (saturate)
+     + tắt hẳn con trỏ/click, chuyển mượt .35s thay vì đổi cứng. */
+  .ask-answered {
+    opacity: 0.4;
+    filter: saturate(0.6);
+    box-shadow: var(--shadow-1);
+    pointer-events: none;
+  }
+  .ask-answered .ask-btn,
+  .ask-answered .ask-input button { cursor: default; }
+  /* Dòng "→ đã chọn gì" đứng NGOÀI .ask-box (xem renderAsk/answerAndLock)
+     nên không bị opacity/filter của cha kéo theo — CSS opacity áp dụng
+     theo compositing layer, con dù set opacity:1 riêng vẫn bị nhân với
+     opacity cha nếu còn nằm trong DOM subtree đó, nên cách đúng là tách
+     hẳn ra làm sibling thay vì cố ép style con. */
+  .ask-answer-tag {
+    display:flex; align-items:center; gap:6px; margin:6px 8px 0;
+    font-weight:600; color:var(--accent-2); font-size:13px;
+    animation: rowIn .3s cubic-bezier(.25,.8,.35,1) both;
+  }
+  .ask-answer-tag::before { content:"✓"; }
+
+  #inputBar { flex:0 0 auto; display:flex; align-items:center; gap:8px;
+              background:rgba(239,231,216,0.75); backdrop-filter:blur(10px);
+              -webkit-backdrop-filter:blur(10px);
+              border-top:1px solid var(--border); box-shadow:0 -1px 8px rgba(74,64,48,0.05);
+              padding:10px 10px calc(10px + env(safe-area-inset-bottom, 0px)); position:relative; }
+  #inputField {
+    flex:1 1 auto; min-width:0; background:var(--bg-panel); border:1px solid var(--border-soft);
+    border-radius:999px; outline:none; color:var(--text); font-family:inherit; font-size:15px;
+    padding:12px 18px; height:46px;
+    box-shadow:inset 0 1px 3px rgba(74,64,48,0.06); transition:border-color .15s, box-shadow .15s;
+  }
+  #inputField:focus { border-color:var(--accent); box-shadow:inset 0 1px 3px rgba(74,64,48,0.06), 0 0 0 3px rgba(193,122,63,0.14); }
+  /* ── Nút gửi/ngắt: hình tròn đều nhau, cân với chiều cao ô nhập, icon
+     thay vì chữ thô "^C"/"Gửi" — gọn, cân đối, đỡ chiếm ngang trên màn
+     hình nhỏ, và rõ nghĩa hơn qua hình dạng mũi tên/dấu dừng thay vì phải
+     đọc chữ viết tắt. */
+  #sendBtn, #ctrlBtn {
+    flex:0 0 auto; width:46px; height:46px; border:none; border-radius:50%;
+    display:flex; align-items:center; justify-content:center;
+    font-size:15px; font-weight:700; cursor:pointer; padding:0;
+    transition:transform .1s cubic-bezier(.34,1.56,.64,1), box-shadow .12s, filter .12s;
+  }
+  #sendBtn:active, #ctrlBtn:active { transform:scale(0.9); filter:brightness(0.96); }
+  #sendBtn { background:linear-gradient(155deg, var(--accent-2), #6a8050); color:#fff;
+    box-shadow:0 3px 10px rgba(122,143,92,0.4); }
+  #sendBtn:disabled { background:var(--border-soft); color:var(--text-dim); cursor:not-allowed;
+    box-shadow:none; }
+  #ctrlBtn { background:rgba(255,253,248,0.7); color:var(--err); border:1.5px solid rgba(182,80,63,0.35);
+    box-shadow:var(--shadow-1); font-size:12px; }
+  #ctrlBtn:hover { background:rgba(182,80,63,0.08); }
+
+  /* ── Gợi ý lệnh slash ─────────────────────────────────────────────── */
+  #slashHint {
+    position:absolute; left:10px; right:10px; bottom:100%;
+    max-height:45vh; overflow-y:auto; background:rgba(255,253,248,0.92); backdrop-filter:blur(10px);
+    -webkit-backdrop-filter:blur(10px); border:1px solid var(--border);
+    border-radius:var(--radius-md); margin-bottom:8px; display:none;
+    box-shadow:var(--shadow-2);
+  }
+  #slashHint.show { display:block; }
+  .slash-item { display:flex; gap:10px; align-items:baseline; padding:10px 14px;
+    font-size:13.5px; cursor:pointer; border-bottom:1px solid var(--border); }
+  .slash-item:last-child { border-bottom:none; }
+  .slash-item:active, .slash-item.active { background:var(--bg-sunken); }
+  .slash-item .cmd { color:var(--accent); font-weight:700; flex:0 0 auto; font-family:"JetBrains Mono",monospace; }
+  .slash-item .desc { color:var(--text-dim); flex:1 1 auto; text-overflow:ellipsis; overflow:hidden; white-space:nowrap; }
+
+  /* ── Turn wrapper: bọc mọi log-tool của 1 turn + nút ẩn/hiện nằm ngay
+     dưới bubble AI cuối turn đó. Mặc định log ẩn (chỉ hiện chat).
+     Animation "cuộn ra": dùng kỹ thuật grid-template-rows 0fr -> 1fr thay
+     vì display:none/flex (tức thì, không mượt) hay max-height cố định
+     (giật vì height thật luôn khác con số đoán trước) -- grid-rows animate
+     đúng chiều cao nội dung thật, mượt ở mọi kích cỡ log. Kèm opacity +
+     translateY nhẹ để có cảm giác log "trượt/cuộn ra" từ dưới nút xuống,
+     giống hiệu ứng mở rộng kiểu iOS. */
+  .turn-logs {
+    display:grid; grid-template-rows:0fr; opacity:0; margin-top:0;
+    transition:grid-template-rows .32s cubic-bezier(.25,.8,.35,1),
+               opacity .26s ease, margin-top .32s cubic-bezier(.25,.8,.35,1);
+  }
+  .turn-logs > .turn-logs-inner {
+    overflow:hidden; display:flex; flex-direction:column; gap:10px;
+    min-height:0; transform:translateY(-6px); transition:transform .32s cubic-bezier(.25,.8,.35,1);
+  }
+  .turn-logs.open {
+    grid-template-rows:1fr; opacity:1; margin-top:2px;
+  }
+  .turn-logs.open > .turn-logs-inner { transform:translateY(0); }
+
+  /* Khung kính bao ngoài khối log khi mở — cùng chất "liquid glass" với
+     nút toggle, tạo cảm giác cả cụm log là 1 mặt kính nổi lên, không phải
+     nút và log rời rạc. */
+  .turn-logs-inner {
+    padding:10px; border-radius:var(--radius-lg);
+    background:rgba(255,253,248,0.4); backdrop-filter:blur(16px) saturate(1.5);
+    -webkit-backdrop-filter:blur(16px) saturate(1.5);
+    border:1px solid var(--border-soft);
+  }
+
+  .turn-toggle-row { display:flex; justify-content:flex-start; margin:0 4px; }
+  .turn-toggle {
+    display:inline-flex; align-items:center; gap:6px;
+    background:rgba(255,253,248,0.55); backdrop-filter:blur(14px) saturate(1.6);
+    -webkit-backdrop-filter:blur(14px) saturate(1.6);
+    border:1px solid var(--border-soft); border-radius:999px;
+    padding:5px 12px 5px 10px; font-size:12px; font-weight:600; color:var(--text-dim);
+    cursor:pointer; overflow:hidden; position:relative;
+    box-shadow:var(--shadow-1);
+    transition:transform .08s, box-shadow .18s, color .12s, background .18s;
+  }
+  .turn-toggle:active { transform:translateY(1px); }
+  .turn-toggle:hover { color:var(--text); box-shadow:var(--shadow-2); }
+  .turn-toggle.open {
+    color:var(--text); background:rgba(255,253,248,0.75);
+    box-shadow:var(--shadow-2), 0 0 0 1px rgba(193,122,63,0.12);
+  }
+  .turn-toggle .chev { font-size:10px; transition:transform .28s cubic-bezier(.25,.8,.35,1); display:inline-block; }
+  .turn-toggle.open .chev { transform:rotate(90deg); }
+  .turn-toggle .tool-count {
+    background:var(--bg-sunken); color:var(--text); border-radius:999px;
+    padding:1px 7px; font-size:11px; font-weight:700; transition:background .18s;
+  }
+  .turn-toggle.open .tool-count { background:rgba(193,122,63,0.16); }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="bar" class="glass7">
+    <div id="status"><span id="dot"></span><span id="statusText">Connecting…</span></div>
+    <div id="meta"></div>
+  </div>
+  <div id="logScroll"><div id="log"></div></div>
+  <div id="inputBar">
+    <div id="slashHint"></div>
+    <button id="ctrlBtn" title="Ngắt (Ctrl-C)">^C</button>
+    <input id="inputField" autocomplete="off" autocapitalize="off" autocorrect="off"
+           spellcheck="false" placeholder="Gõ lệnh hoặc tin nhắn rồi Enter…" />
+    <button id="sendBtn" title="Gửi" aria-label="Gửi">
+      <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6"
+           stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+    </button>
+  </div>
+</div>
+
+<script>
+// ── Renderer: nhận Event JSON (không phải byte-stream ANSI nữa) ────────────
+// Giao thức mới (khớp 12_web.py / 01d_events.py):
+//   Server -> client (mọi frame là JSON text, opcode 0x1):
+//     {"type": "<EV_TYPE>", "data": {...}, "id": "..."}       — Event thường
+//     {"type": "ask", "id": "...", "prompt": "...", "kind": "text|confirm|choice",
+//      "default": ..., "extra": {...}}                         — cần trả lời
+//     {"type": "session_init", "data": {"sid","model","agent","messages"}}
+//   Client -> server (JSON text):
+//     {"type": "input", "value": "..."}      — 1 dòng lệnh/tin nhắn
+//     {"type": "interrupt"}                  — nút ^C ảo
+//     {"type": "answer", "id": "...", "value": "..."} — trả lời 1 "ask"
+
+const logEl = document.getElementById("log");
+const scrollEl = document.getElementById("logScroll");
+const dot = document.getElementById("dot");
+const statusText = document.getElementById("statusText");
+const metaEl = document.getElementById("meta");
+const inputField = document.getElementById("inputField");
+const sendBtn = document.getElementById("sendBtn");
+const ctrlBtn = document.getElementById("ctrlBtn");
+
+function escapeHtml(s) {
+  return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+// ── ANSI → HTML adapter ─────────────────────────────────────────────────────
+// Mục đích: CLI (01_ui.py) in text kèm mã màu ANSI thật (\x1b[38;5;Nm...),
+// và các event "raw" (EV_INFO raw=True dùng cho /help, /diff, /session,
+// /commands...) gửi nguyên văn chuỗi đó qua web KHÔNG strip màu — trước đây
+// web chỉ escapeHtml() nên hiện thẳng "[38;5;229m..." dạng text thô (bug,
+// thấy rõ trong ảnh chụp /help). Adapter này dịch mã ANSI SGR sang
+// <span style="color:...">, chỉ xử lý phía hiển thị trong file HTML này,
+// KHÔNG đụng gì tới CLI/backend (01_ui.py, 01d_events.py giữ nguyên).
+//
+// Hỗ trợ: reset(0), bold(1), dim(2), 256-color foreground (38;5;N) — đúng
+// tập mã mà 01_ui.py thực sự dùng (CYAN/TEAL/GREEN/BLUE/YELLOW/RED/WHITE/
+// GRAY/MAGENTA đều là 38;5;N, cộng R=0, BOLD=1, DIM=2). Mã nào ngoài tập
+// này bị bỏ qua an toàn, không vỡ layout.
+
+// Bảng 256-color chuẩn xterm, đủ dịch chính xác các mã N mà CLI dùng
+// (114, 220, 74, 229, 196, 231, 240, 177, 214...).
+function xterm256ToHex(n) {
+  n = Number(n);
+  if (Number.isNaN(n)) return null;
+  if (n < 16) {
+    const basic = ["#000000","#800000","#008000","#808000","#000080","#800080","#008080","#c0c0c0",
+                    "#808080","#ff0000","#00ff00","#ffff00","#0000ff","#ff00ff","#00ffff","#ffffff"];
+    return basic[n];
+  }
+  if (n <= 231) {
+    const i = n - 16;
+    const levels = [0, 95, 135, 175, 215, 255];
+    const r = levels[Math.floor(i / 36) % 6];
+    const g = levels[Math.floor(i / 6) % 6];
+    const b = levels[i % 6];
+    return `rgb(${r},${g},${b})`;
+  }
+  const gray = 8 + (n - 232) * 10;
+  return `rgb(${gray},${gray},${gray})`;
+}
+
+function ansiToHtml(raw) {
+  const s = String(raw ?? "");
+  // eslint-disable-next-line no-control-regex
+  const ANSI_RE = /\x1b\[([0-9;]*)m/g;
+  let out = "";
+  let openSpans = 0;
+  let lastIndex = 0;
+  let curColor = null;
+  let curBold = false;
+  let curDim = false;
+
+  function closeAll() {
+    while (openSpans > 0) { out += "</span>"; openSpans--; }
+  }
+  function openSpan() {
+    const styles = [];
+    if (curColor) styles.push(`color:${curColor}`);
+    if (curBold) styles.push("font-weight:bold");
+    if (curDim) styles.push("opacity:0.65");
+    if (styles.length) {
+      out += `<span style="${styles.join(";")}">`;
+      openSpans++;
+    }
+  }
+
+  let m;
+  let pendingRestyle = false; // đổi style đã yêu cầu nhưng chưa mở span (chờ có text)
+  while ((m = ANSI_RE.exec(s)) !== null) {
+    const chunk = s.slice(lastIndex, m.index);
+    if (chunk) {
+      if (pendingRestyle) { closeAll(); openSpan(); pendingRestyle = false; }
+      out += escapeHtml(chunk);
+    }
+    lastIndex = ANSI_RE.lastIndex;
+
+    const codes = m[1].split(";").filter(c => c !== "");
+    if (codes.length === 0) codes.push("0");
+
+    for (let i = 0; i < codes.length; i++) {
+      const c = codes[i];
+      if (c === "0") {
+        curColor = null; curBold = false; curDim = false; pendingRestyle = true;
+      } else if (c === "1") {
+        curBold = true; pendingRestyle = true;
+      } else if (c === "2") {
+        curDim = true; pendingRestyle = true;
+      } else if (c === "38" && codes[i + 1] === "5") {
+        const hex = xterm256ToHex(codes[i + 2]);
+        if (hex) { curColor = hex; pendingRestyle = true; }
+        i += 2;
+      }
+    }
+  }
+  const tail = s.slice(lastIndex);
+  if (tail) {
+    if (pendingRestyle) { closeAll(); openSpan(); }
+    out += escapeHtml(tail);
+  }
+  closeAll();
+  return out;
+}
+
+// Cuộn mượt xuống đáy — dùng smooth cho các mốc rời rạc (bubble mới, tool
+// group mới...) để có cảm giác "trượt" tự nhiên; rơi về tức thì khi cuộn
+// dồn dập (streaming text từng ký tự) để tránh animation chồng animation
+// gây giật/lag, và cũng bỏ qua nếu user đã tự cuộn lên xem log cũ (không
+// kéo họ xuống bất ngờ giữa chừng).
+let scrollRaf = null;
+function isNearBottom() {
+  return scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight < 120;
+}
+function scrollToBottom(opts) {
+  const smooth = !opts || opts.smooth !== false;
+  if (!isNearBottom() && !(opts && opts.force)) return;
+  if (scrollRaf) cancelAnimationFrame(scrollRaf);
+  scrollRaf = requestAnimationFrame(() => {
+    scrollEl.scrollTo({ top: scrollEl.scrollHeight, behavior: smooth ? "smooth" : "auto" });
+  });
+}
+
+// ── Container log-tool theo từng turn ───────────────────────────────────
+// currentTurnLogs: div.turn-logs (outer, dùng cho animation grid-rows +
+// class "open") đang mở. Bên trong luôn có đúng 1 con .turn-logs-inner --
+// đây mới là nơi log-tool thật (tool-group, info-card...) được append vào
+// (xem lý do kỹ thuật ở comment CSS .turn-logs). currentTurnLogsInner giữ
+// tham chiếu riêng để mọi hàm append không phải query lại DOM mỗi lần.
+// Container tạo lười (lazy) ngay khi log-tool đầu tiên của 1 turn xuất
+// hiện; nút toggle chỉ tạo khi turn đóng (closeTurnLogs) -- xem comment ở
+// đó -- vì yêu cầu là nút "chỉ hiện khi có sài tool".
+let currentTurnLogs = null;
+let currentTurnLogsInner = null;
+let currentTurnToggleRow = null;
+
+function ensureTurnLogs() {
+  if (currentTurnLogsInner) return currentTurnLogsInner;
+  currentTurnLogs = document.createElement("div");
+  currentTurnLogs.className = "turn-logs";
+  currentTurnLogsInner = document.createElement("div");
+  currentTurnLogsInner.className = "turn-logs-inner";
+  currentTurnLogs.appendChild(currentTurnLogsInner);
+  logEl.appendChild(currentTurnLogs);
+  return currentTurnLogsInner;
+}
+
+function ensureTurnToggle(logsEl) {
+  const row = document.createElement("div");
+  row.className = "turn-toggle-row";
+  const btn = document.createElement("button");
+  btn.className = "turn-toggle glass7";
+  btn.innerHTML = '<span class="chev">▶</span><span class="label">Xem chi tiết</span><span class="tool-count">0</span>';
+  btn.addEventListener("click", () => {
+    const open = logsEl.classList.toggle("open");
+    btn.classList.toggle("open", open);
+    btn.querySelector(".label").textContent = open ? "Ẩn chi tiết" : "Xem chi tiết";
+    if (open) scrollToBottom();
+  });
+  row.appendChild(btn);
+  // logsEl hiện đang nằm TRƯỚC bubble trong DOM (log-tool luôn xảy ra
+  // trước text_delta). Gọi hàm này là lúc bubble đã ở cuối #log -> phải
+  // DI CHUYỂN cả nút lẫn logsEl xuống cuối #log (sau bubble), với thứ tự
+  // nút trước - log sau, để bấm mở thì log bung XUỐNG DƯỚI nút.
+  logEl.appendChild(row);
+  logEl.appendChild(logsEl);
+  return row;
+}
+
+function updateTurnToggleCount(row, logsEl) {
+  if (!row || !logsEl) return;
+  const n = logsEl.querySelectorAll(".tool-group, .info-card").length;
+  const countEl = row.querySelector(".tool-count");
+  if (countEl) countEl.textContent = String(n);
+}
+
+// Bất kỳ log-tool nào được thêm cũng đi qua đây trước: đảm bảo container
+// turn tồn tại (tạo lười), rồi trả về để append vào. Nút toggle KHÔNG
+// tạo ở đây nữa -- nó chỉ được tạo khi turn đóng lại (closeTurnLogs),
+// và luôn chèn dưới bubble, không phải ngay khi log-tool xuất hiện.
+function turnLogTarget() {
+  return ensureTurnLogs();
+}
+
+// Đóng turn hiện tại và tạo nút toggle cho nó (nếu có log). Phải gọi hàm
+// này SAU KHI bubble AI đã được append vào #log, để nút luôn nằm dưới
+// bubble -- không phải ngay khi log-tool vừa xuất hiện.
+// lastClosedTurnLogs: giữ INNER (nơi log-tool thật sự nằm, dùng để chèn
+// thêm summary_line đúng cấp DOM -- xem case turn_end). Toggle/animation
+// vẫn thao tác trên outer (currentTurnLogs) qua ensureTurnToggle().
+let lastClosedTurnLogs = null;
+let lastClosedTurnToggleRow = null;
+
+function closeTurnLogs() {
+  if (currentTurnLogs) {
+    const row = ensureTurnToggle(currentTurnLogs);
+    updateTurnToggleCount(row, currentTurnLogs);
+    lastClosedTurnLogs = currentTurnLogsInner;
+    lastClosedTurnToggleRow = row;
+  }
+  currentTurnLogs = null;
+  currentTurnLogsInner = null;
+}
+
+function appendRow(html, cls) {
+  const div = document.createElement("div");
+  div.className = "row" + (cls ? " " + cls : "");
+  div.innerHTML = html;
+  logEl.appendChild(div);
+  scrollToBottom();
+  return div;
+}
+
+// appendRow dành riêng cho log-tool rời rạc (spinner, unknown-type...) —
+// vẫn cần vào turn container để ẩn/hiện theo turn, KHÔNG dùng cho bubble.
+function appendLogRow(html, cls) {
+  const div = document.createElement("div");
+  div.className = "row" + (cls ? " " + cls : "");
+  div.innerHTML = html;
+  turnLogTarget().appendChild(div);
+  scrollToBottom();
+  return div;
+}
+
+// Dòng info/warn/error/step/turn_end đứng độc lập (không thuộc group tool
+// nào) -> thẻ riêng, bo tròn. Đây là log-tool -> vào turn container.
+function appendInfoCard(html, extraCls) {
+  currentGroup = null; // bất kỳ info-card độc lập nào cũng đóng group hiện tại
+  const div = document.createElement("div");
+  div.className = "row info-card" + (extraCls ? " " + extraCls : "");
+  div.innerHTML = html;
+  turnLogTarget().appendChild(div);
+  scrollToBottom();
+  return div;
+}
+
+// Card đứng NGOÀI turn-logs — vào thẳng #log như bubble, KHÔNG bị nhét vào
+// khối "Xem chi tiết" ẩn. Dùng cho cảnh báo/lỗi là PHẢN HỒI TRỰC TIẾP cho
+// thao tác vừa gõ (vd "/model không dùng được qua Web UI") — người dùng
+// cần thấy ngay lập tức, không phải bấm mở rộng mới thấy. Khác appendInfoCard
+// ở chỗ chỉ nó mới đúng nghĩa "log kỹ thuật phụ của tool đang chạy", còn
+// đây là thông báo chính của lượt tương tác, đứng ngang hàng bubble chat.
+function appendStandaloneCard(html, extraCls) {
+  currentGroup = null;
+  const div = document.createElement("div");
+  div.className = "row info-card" + (extraCls ? " " + extraCls : "");
+  div.innerHTML = html;
+  logEl.appendChild(div);
+  closeTurnLogs();
+  scrollToBottom({ force: true });
+  return div;
+}
+
+// ── Nhóm tool (cha-con) ──────────────────────────────────────────────────
+// tool_start mở 1 group: khung bo tròn + tên tool. Mọi event "phụ" đến
+// NGAY SAU đó (info/warn/err phát sinh từ trong lúc tool đang chạy, và
+// chính tool_end của nó) được coi là CON, thụt lề + nối đường dọc vào
+// group này — thay vì mỗi event là 1 card rời rạc như bản cũ, khớp yêu
+// cầu "giữ tách riêng nhưng thụt lề rõ + có đường nối để thấy là con của
+// nhau". Group tự đóng (currentGroup = null) khi có: step mới, bubble
+// user/AI mới, turn_end, hoặc tool_start khác (không lồng nhóm vào nhau —
+// chỉ 1 cấp cha-con, đúng những gì backend thực sự phát: tool KHÔNG gọi
+// tool lồng nhau trong luồng event hiện tại).
+let currentGroup = null;
+
+function openToolGroup(name, icon, previewHtml, denied) {
+  const wrap = document.createElement("div");
+  wrap.className = "row tool-group" + (denied ? " denied" : "");
+  wrap.innerHTML =
+    `<div class="tool-group-head">`
+    + `<span class="tool-icon">${icon}</span>`
+    + `<span class="tool-name">${escapeHtml(name)}</span>`
+    + (previewHtml ? `<span class="tool-brief">${previewHtml}</span>` : "")
+    + `</div>`
+    + `<div class="tool-children"></div>`;
+  turnLogTarget().appendChild(wrap);
+  scrollToBottom();
+  currentGroup = wrap;
+  return wrap;
+}
+
+function appendGroupChild(html, extraCls) {
+  if (!currentGroup) {
+    // Không có group cha đang mở (vd tool_end tới mà không có tool_start
+    // trước đó, hiếm) -- rơi về info-card độc lập để không mất thông tin.
+    return appendInfoCard(html, extraCls);
+  }
+  const children = currentGroup.querySelector(".tool-children");
+  const child = document.createElement("div");
+  child.className = "tool-child" + (extraCls ? " " + extraCls : "");
+  child.innerHTML = html;
+  children.appendChild(child);
+  scrollToBottom();
+  return child;
+}
+
+// User/AI -> bong bóng chat căn trái/phải. Bubble luôn vào thẳng #log
+// (không phải log-tool). Sau khi bubble vào DOM, đóng turn-logs hiện tại
+// -> nút toggle được tạo LÚC NÀY, nên luôn nằm dưới bubble vừa thêm.
+function appendBubble(html, from) {
+  currentGroup = null; // bubble mới luôn đóng group tool đang mở, nếu có
+  const wrap = document.createElement("div");
+  wrap.className = "bubble-wrap from-" + from;
+  const bubble = document.createElement("div");
+  // Bubble AI có thêm viền "liquid glass 7 màu" chạy quanh mép, bubble
+  // user giữ nguyên xanh rêu đặc để 2 bên phân biệt rõ, không lẫn hiệu ứng.
+  bubble.className = "bubble " + (from === "user" ? "user" : "ai glass7-edge");
+  bubble.innerHTML = html;
+  wrap.appendChild(bubble);
+  logEl.appendChild(wrap);
+  closeTurnLogs();
+  // Bubble mới (nhất là tin user vừa gửi) luôn kéo view xuống, kể cả nếu
+  // đang cuộn xem log cũ — khớp hành vi app chat thật.
+  scrollToBottom({ force: true });
+  return bubble;
+}
+
+// ── Streaming text (AI: ... / [thinking] ...) — gom nhiều delta vào 1 bubble ─
+let curTextRow = null;
+let curThinkRow = null;
+
+function resetStreamRows() {
+  // Turn kết thúc -> tắt con trỏ nhấp nháy của bubble AI vừa stream xong.
+  if (curTextRow) {
+    const body = curTextRow.querySelector(".ai-body");
+    if (body) body.classList.remove("streaming");
+  }
+  curTextRow = null;
+  curThinkRow = null;
+}
+
+function appendTextDelta(text) {
+  if (!curTextRow) {
+    curTextRow = appendBubble('<span class="ai-body streaming"></span>', "ai");
+  }
+  const body = curTextRow.querySelector(".ai-body");
+  body.textContent += text;
+  scrollToBottom({ smooth: false });
+}
+
+function appendThinkingDelta(text) {
+  if (!curThinkRow) {
+    // Thinking đang diễn ra REAL-TIME trong lúc AI còn chưa xong việc (có
+    // thể còn gọi tool, còn trả lời tiếp sau đó) — phải hiện thẳng ra
+    // ngoài như bubble/spinner, KHÔNG dùng appendInfoCard (đi qua
+    // turnLogTarget() -> bị nhét vào khối "Xem chi tiết" gập ẩn mặc định).
+    // Trước đây dùng appendInfoCard nên thinking "biến mất" ngay khi có
+    // tool_start xen giữa, dù AI vẫn đang chạy — đây là bug đã fix.
+    curThinkRow = appendStandaloneCard('<span class="think">[thinking] </span><span class="think-body"></span>', "think");
+  }
+  const body = curThinkRow.querySelector(".think-body");
+  body.textContent += text;
+  scrollToBottom({ smooth: false });
+}
+
+const TOOL_ICON = {
+  bash: "⚙", read: "📄", write: "✏", edit: "✏", multiedit: "✏",
+  glob: "🔍", grep: "🔍", webfetch: "🌐", websearch: "🌐",
+  todowrite: "☑", todoread: "☑", task: "🤖",
+};
+
+// ── Trạng thái "đang xử lý": hiện chỉ báo + khoá gửi tin nhắn mới ──────────
+// BUG ĐÃ SỬA: trước đây web không có tín hiệu nào cho biết AI đang xử lý
+// (CLI có Spinner "Thinking" hiển thị live, web thì im lặng tuyệt đối cho
+// tới khi có delta đầu tiên hoặc turn kết thúc — nhìn như bị treo). Đồng
+// thời không có gì ngăn user gõ+gửi liên tục trong lúc đang chờ, các dòng
+// đó xếp hàng và có thể gây rối khi turn hiện tại xong. Sửa: nhận
+// turn_start -> hiện chỉ báo "Đang xử lý…" + khoá nút Gửi/Enter; nhận
+// turn_end -> gỡ khoá. Nút ^C (interrupt) KHÔNG bị khoá, vẫn dùng được để
+// ngắt lúc đang xử lý.
+let busyRow = null;
+let isBusy = false;
+
+// ── Spinner JS — bản dịch 1:1 của class Spinner trong 01_ui.py ─────────────
+// FRAMES giống hệt (rotating bar), rain-chars random mỗi 2 frame, tick mỗi
+// 90ms (khớp time.sleep(0.09) bên CLI), hiện số giây khi elapsed >= 1s.
+const SPINNER_FRAMES = ["─", "\\", "│", "/", "─", "\\", "│", "/"];
+const SPINNER_RAIN = "01アイウエオカキクケコサシスセソタチツテトナニヌネノ";
+let spinnerTimer = null;
+let spinnerFrameIdx = 0;
+let spinnerStartT = 0;
+let spinnerRainBuf = ["  ", "  ", "  "];
+
+function spinnerTick() {
+  if (!busyRow) return;
+  const frame = SPINNER_FRAMES[spinnerFrameIdx % SPINNER_FRAMES.length];
+  const elapsed = (Date.now() - spinnerStartT) / 1000;
+  const elapsedStr = elapsed >= 1 ? ` ${elapsed.toFixed(1)}s` : "";
+  if (spinnerFrameIdx % 2 === 0) {
+    spinnerRainBuf = [0, 0, 0].map(() => SPINNER_RAIN[Math.floor(Math.random() * SPINNER_RAIN.length)]);
+  }
+  const frameEl = busyRow.querySelector(".spinner-frame");
+  const rainEl = busyRow.querySelector(".spinner-rain");
+  const timeEl = busyRow.querySelector(".spinner-time");
+  if (frameEl) frameEl.textContent = frame;
+  if (rainEl) rainEl.textContent = spinnerRainBuf.join("");
+  if (timeEl) timeEl.textContent = elapsedStr;
+  spinnerFrameIdx++;
+}
+
+function startSpinner() {
+  if (busyRow) return;
+  busyRow = appendRow(
+    '<span class="spinner-row">'
+      + '<span class="spinner-frame">─</span>'
+      + '<span class="spinner-label">Thinking</span>'
+      + '<span class="spinner-rain">  </span>'
+      + '<span class="spinner-time"></span>'
+      + '</span>',
+    "busy-row"
+  );
+  spinnerFrameIdx = 0;
+  spinnerStartT = Date.now();
+  spinnerTimer = setInterval(spinnerTick, 90);
+}
+
+function stopSpinner() {
+  if (spinnerTimer) { clearInterval(spinnerTimer); spinnerTimer = null; }
+  if (busyRow) { busyRow.remove(); busyRow = null; }
+}
+
+function setBusy(busy) {
+  isBusy = busy;
+  sendBtn.disabled = busy;
+  inputField.disabled = busy;
+  inputField.placeholder = busy ? "Đang xử lý… chờ AI trả lời xong" : "Gõ lệnh hoặc tin nhắn rồi Enter…";
+  if (busy) {
+    startSpinner();
+  } else {
+    stopSpinner();
+  }
+}
+
+function handleEvent(msg) {
+  const t = msg.type;
+  const d = msg.data || {};
+
+  // text_delta/thinking_delta cần gom liên tục — mọi type KHÁC phải "chốt"
+  // dòng streaming hiện tại lại (giống render_cli in xuống dòng mới).
+  // BUG FIX: trước đây chỉ reset biến JS (curTextRow = null) mà KHÔNG gỡ
+  // class "streaming" khỏi bubble DOM cũ -- nếu AI viết 1 đoạn, gọi tool,
+  // rồi viết tiếp đoạn mới (bubble MỚI), bubble CŨ bị "bỏ rơi" vẫn còn con
+  // trỏ nhấp nháy chạy mãi mãi (chỉ bubble cuối cùng lúc turn_end mới được
+  // gỡ đúng qua resetStreamRows()). Nhìn như "viết xong rồi vẫn còn gõ".
+  if (t !== "text_delta" && curTextRow) {
+    const body = curTextRow.querySelector(".ai-body");
+    if (body) body.classList.remove("streaming");
+    curTextRow = null;
+  }
+  if (t !== "thinking_delta") curThinkRow = null;
+
+  switch (t) {
+    case "session_init": {
+      metaEl.textContent = `${d.model || ""}  ·  ${d.agent || ""}  ·  [${(d.sid||"").slice(0,8)}]`;
+      logEl.innerHTML = "";
+      closeTurnLogs();
+      renderHistory(d.messages || []);
+      setBusy(false);
+      break;
+    }
+    case "turn_start":
+      // Turn mới bắt đầu -> "chốt" cứng nhóm log-tool đã đóng trước đó,
+      // không cho summary_line của turn NÀY (nếu turn này không có
+      // log-tool nào) bị lẫn nhầm vào nhóm của turn TRƯỚC.
+      lastClosedTurnLogs = null;
+      lastClosedTurnToggleRow = null;
+      setBusy(true);
+      break;
+    case "text_delta":
+      stopSpinner();
+      appendTextDelta(d.text || "");
+      break;
+    case "thinking_delta":
+      stopSpinner();
+      appendThinkingDelta(d.text || "");
+      break;
+    case "step":
+      currentGroup = null; // step mới = bước agent mới, đóng group cũ
+      appendInfoCard(`┤ step ${escapeHtml(d.step)}  ctx ~${escapeHtml((d.ctx_est||0).toLocaleString())} tok  model ${escapeHtml(d.model)}`, "step dim");
+      break;
+    case "tool_start": {
+      stopSpinner();
+      const icon = TOOL_ICON[d.name] || "⚙";
+      openToolGroup(d.name, icon, `<span class="mono">${ansiToHtml(d.preview)}</span>`);
+      break;
+    }
+    case "tool_end":
+      appendGroupChild(`<span class="mono">╰─ ${ansiToHtml(d.brief)}${d.truncated ? "…" : ""}</span>`, "dim");
+      currentGroup = null; // tool_end kết thúc vòng đời của group này
+      break;
+    case "tool_denied":
+      if (currentGroup) currentGroup.classList.add("denied");
+      if (d.by_user) appendGroupChild("✗ Denied by user.", "child-denied");
+      else appendGroupChild(`✗ ${escapeHtml(d.name)} denied (agent=${escapeHtml(d.agent)})`, "child-denied");
+      currentGroup = null;
+      break;
+    case "info":
+      // d.raw=true (/help, /diff, /session, /commands..., và giờ cả kết
+      // quả chi tiết của todowrite -- xem 07_tools_more.py) chứa mã màu
+      // ANSI thật từ CLI -> dịch qua adapter. Nếu đang trong 1 tool-group
+      // (vd todowrite vừa tool_start), coi đây là CON của group đó thay
+      // vì 1 card rời -- đúng yêu cầu thụt lề + nối nhánh cho kết quả phụ.
+      if (currentGroup && d.raw) {
+        appendGroupChild(`<span class="mono">${ansiToHtml(d.text)}</span>`, "child-info");
+      } else {
+        appendInfoCard(ansiToHtml(d.text), d.raw ? "raw-info" : "info");
+      }
+      break;
+    case "warn":
+      if (currentGroup) appendGroupChild(ansiToHtml(d.text), "child-warn");
+      else appendStandaloneCard(ansiToHtml(d.text), "warn");
+      break;
+    case "error":
+      if (currentGroup) appendGroupChild(ansiToHtml(d.text), "child-err");
+      else appendStandaloneCard(ansiToHtml(d.text), "err");
+      break;
+    case "interrupted":
+      currentGroup = null;
+      appendInfoCard(`checkpoint ${escapeHtml(d.checkpoint_id)} saved after interrupt`, "warn");
+      break;
+    case "turn_end":
+      currentGroup = null;
+      if (d.summary_line) {
+        if (lastClosedTurnLogs && lastClosedTurnToggleRow) {
+          // Turn vừa có bubble AI (đã đóng, nút đã tạo) -> summary_line
+          // thuộc về ĐÚNG nhóm log-tool đó, chèn lại vào nhóm cũ thay vì
+          // tạo nhóm mới đứng lạc sau bubble.
+          const div = document.createElement("div");
+          div.className = "row info-card dim";
+          div.innerHTML = ansiToHtml(d.summary_line);
+          lastClosedTurnLogs.appendChild(div);
+          updateTurnToggleCount(lastClosedTurnToggleRow, lastClosedTurnLogs);
+        } else {
+          // Turn này không có log-tool nào trước đó (bubble AI đã đóng mà
+          // không mở turn-logs) -> summary_line là log-tool ĐẦU TIÊN của
+          // turn, cần tự tạo container (đúng cấu trúc outer/inner như
+          // ensureTurnLogs) + nút toggle cho nó (không dùng appendInfoCard,
+          // vì hàm đó sẽ tạo container không nút -> log ẩn mà không mở được).
+          const logsEl = document.createElement("div");
+          logsEl.className = "turn-logs";
+          const inner = document.createElement("div");
+          inner.className = "turn-logs-inner";
+          logsEl.appendChild(inner);
+          logEl.appendChild(logsEl);
+          const div = document.createElement("div");
+          div.className = "row info-card dim";
+          div.innerHTML = ansiToHtml(d.summary_line);
+          inner.appendChild(div);
+          const row = ensureTurnToggle(logsEl);
+          updateTurnToggleCount(row, inner);
+        }
+      }
+      resetStreamRows();
+      setBusy(false);
+      break;
+    case "ask":
+      renderAsk(msg);
+      break;
+    default:
+      // Type không nhận diện được — hiện thô để không mất thông tin, thay
+      // vì im lặng bỏ qua (dễ debug khi thêm event type mới sau này).
+      appendLogRow(escapeHtml(JSON.stringify(msg)), "dim");
+  }
+}
+
+function renderHistory(messages) {
+  for (const m of messages) {
+    const role = m.role;
+    let content = m.content;
+    if (Array.isArray(content)) {
+      content = content.map(c => (typeof c === "string" ? c : (c.text || ""))).join(" ");
+    }
+    if (typeof content !== "string") continue;
+    if (role === "user") {
+      if (content.startsWith("[")) continue; // system-injected, bỏ qua hiển thị
+      appendBubble(escapeHtml(content), "user");
+    } else if (role === "assistant") {
+      appendBubble(escapeHtml(content), "ai");
+    }
+  }
+}
+
+// ── ask: hiện hộp hỏi tương tác, gửi answer lại qua WS ──────────────────────
+function renderAsk(msg) {
+  const box = document.createElement("div");
+  box.className = "ask-box";
+  const explanation = (msg.extra || {}).explanation;
+  let inner = `<div class="ask-prompt">${escapeHtml(explanation || msg.prompt || "")}</div>`;
+  box.innerHTML = inner;
+
+  const actions = document.createElement("div");
+
+  function answerAndLock(value, label) {
+    if (box.dataset.answered) return;
+    box.dataset.answered = "1";
+    box.classList.add("ask-answered");
+    // Khoá cứng mọi input/button còn lại trong box — trước đây chỉ dựa vào
+    // pointer-events:none (CSS) nên VALUE đã gõ vẫn hiển thị nguyên trong ô
+    // input, nhìn như "chưa gửi/chưa ẩn gì". disabled thật sự làm ô input
+    // xám đi rõ ràng và không còn focus/sửa được nữa.
+    box.querySelectorAll("input, button").forEach(el => { el.disabled = true; });
+    sendJson({ type: "answer", id: msg.id, value });
+    const tag = document.createElement("div");
+    tag.className = "ask-answer-tag";
+    tag.textContent = label;
+    // Chèn NGAY SAU box (sibling trong #log), không phải con của box —
+    // để không bị kéo mờ theo .ask-answered (xem comment CSS ở trên).
+    box.after(tag);
+  }
+
+  const options = (msg.extra || {}).options;
+
+  if (explanation || msg.kind === "confirm") {
+    actions.className = "ask-actions";
+    const yes = document.createElement("button");
+    yes.className = "ask-btn yes"; yes.textContent = "Allow (y)";
+    yes.onclick = () => answerAndLock("y", "y");
+    const no = document.createElement("button");
+    no.className = "ask-btn no"; no.textContent = "Deny (n)";
+    no.onclick = () => answerAndLock("n", "n");
+    actions.appendChild(yes);
+    actions.appendChild(no);
+    if (explanation) {
+      const all = document.createElement("button");
+      all.className = "ask-btn"; all.textContent = "Allow all (a)";
+      all.onclick = () => answerAndLock("a", "a");
+      actions.appendChild(all);
+    }
+    box.appendChild(actions);
+  } else if (msg.kind === "choice" && Array.isArray(options) && options.length > 0) {
+    // tool_question với options — menu số, giống hệt CLI "1. 2. 3. ..." +
+    // vẫn cho gõ tự do nếu không muốn chọn từ danh sách. Trước đây kind
+    // "choice" không được xử lý riêng, rơi vào nhánh ô nhập text ở dưới
+    // -> mất hẳn danh sách lựa chọn trên web, đây là chỗ đã fix.
+    actions.className = "ask-actions";
+    options.forEach((opt, i) => {
+      const btn = document.createElement("button");
+      btn.className = "ask-btn";
+      btn.textContent = `${i + 1}. ${opt}`;
+      btn.onclick = () => answerAndLock(opt, opt);
+      actions.appendChild(btn);
+    });
+    box.appendChild(actions);
+    const wrap = document.createElement("div");
+    wrap.className = "ask-input";
+    const inp = document.createElement("input");
+    inp.type = "text";
+    inp.placeholder = "hoặc gõ câu trả lời tự do…";
+    const btn = document.createElement("button");
+    btn.textContent = "OK";
+    const submit = () => { if (inp.value) answerAndLock(inp.value, inp.value); };
+    btn.onclick = submit;
+    inp.addEventListener("keydown", (e) => { if (e.key === "Enter") submit(); });
+    wrap.appendChild(inp);
+    wrap.appendChild(btn);
+    box.appendChild(wrap);
+  } else {
+    // kind === "text" (vd /setkey nhập key mới) — ô nhập tự do.
+    const wrap = document.createElement("div");
+    wrap.className = "ask-input";
+    const inp = document.createElement("input");
+    inp.type = msg.kind === "secret" ? "password" : "text";
+    inp.placeholder = msg.default || "";
+    const btn = document.createElement("button");
+    btn.textContent = "OK";
+    const submit = () => answerAndLock(inp.value, inp.value ? "(đã gửi)" : "(để trống)");
+    btn.onclick = submit;
+    inp.addEventListener("keydown", (e) => { if (e.key === "Enter") submit(); });
+    wrap.appendChild(inp);
+    wrap.appendChild(btn);
+    box.appendChild(wrap);
+  }
+
+  logEl.appendChild(box);
+  scrollToBottom();
+}
+
+// ── Gợi ý lệnh slash ─────────────────────────────────────────────────────
+// Danh sách + mô tả copy NGUYÊN VĂN từ SLASH_COMMANDS/SLASH_DESC trong
+// 01_ui.py (CLI thật) để khớp 100% — không đụng file .py, chỉ định nghĩa
+// lại ở đây cho phía hiển thị web. Nếu sau này CLI thêm lệnh mới, cần
+// đồng bộ tay 2 danh sách này (không có cách nào tự động lấy từ backend
+// mà không đổi kiến trúc/giao thức, và scope hiện tại là "không đụng CLI").
+const SLASH_COMMANDS = [
+  "/model", "/agent", "/mode", "/session", "/sessions", "/todos", "/compact",
+  "/clear", "/delete", "/deleteall", "/cd", "/title", "/tokens",
+  "/undo", "/redo", "/diff", "/sandbox", "/export", "/cache", "/checkpoint",
+  "/perm", "/perms", "/skills", "/setkey", "/deletekey", "/init", "/rules",
+  "/commands", "/sequential", "/batch", "/commit", "/review", "/help", "/mcp",
+  "/addkey", "/listkeys", "/rmkey", "/keystrategy", "/web",
+];
+const SLASH_DESC = {
+  "/model":      "đổi model",
+  "/agent":      "đổi agent mode (build/plan)",
+  "/mode":       "bật/tắt thinking mode (nếu model hỗ trợ)",
+  "/session":    "info session hiện tại",
+  "/sessions":   "switch/tạo session",
+  "/todos":      "xem todo list",
+  "/compact":    "compact context thủ công",
+  "/clear":      "xoá lịch sử chat",
+  "/delete":     "xoá session",
+  "/deleteall":  "xoá TẤT CẢ session",
+  "/cd":         "đổi thư mục",
+  "/title":      "đổi tên session",
+  "/tokens":     "xem token usage",
+  "/cache":      "xem/debug file cache",
+  "/checkpoint": "lưu/xem mốc tiến độ",
+  "/undo":       "undo thay đổi file",
+  "/redo":       "redo đã undo",
+  "/diff":       "xem file đã thay đổi",
+  "/sandbox":    "xem project_dir sandbox",
+  "/export":     "xuất conversation ra markdown",
+  "/perm":       "đặt permission tool",
+  "/perms":      "xem permission hiện tại",
+  "/skills":     "liệt kê skills",
+  "/setkey":     "đổi API key",
+  "/deletekey":  "xoá API key đã lưu",
+  "/addkey":     "thêm key vào pool (nhiều key/provider, tự xoay khi 429)",
+  "/listkeys":   "xem pool key + trạng thái cooldown",
+  "/rmkey":      "xoá key khỏi pool theo số thứ tự",
+  "/keystrategy":"chọn round_robin hoặc fill_first",
+  "/init":       "tạo AGENTS.md cho project",
+  "/rules":      "xem AGENTS.md đang active",
+  "/commands":   "liệt kê custom commands",
+  "/sequential": "chuyển sang mode từng bước (tốn token hơn, an toàn hơn)",
+  "/batch":      "chuyển về mode gộp tool calls (mặc định, tiết kiệm token)",
+  "/commit":     "AI đọc git diff --staged và tự viết commit message",
+  "/review":     "AI review code đã thay đổi trong session hiện tại",
+  "/help":       "xem tất cả lệnh",
+  "/mcp":        "quản lý MCP server (Command Code) — list/add/remove/status",
+  "/web":        "mở web UI local (terminal bridge qua trình duyệt)",
+};
+
+const slashHintEl = document.getElementById("slashHint");
+let slashMatches = [];
+let slashActiveIdx = -1;
+
+function slashLookup(prefix) {
+  return SLASH_COMMANDS.filter(c => c.startsWith(prefix));
+}
+
+function renderSlashHint() {
+  if (slashMatches.length === 0) {
+    slashHintEl.classList.remove("show");
+    slashHintEl.innerHTML = "";
+    return;
+  }
+  slashHintEl.innerHTML = slashMatches.map((cmd, i) => {
+    const desc = SLASH_DESC[cmd] || "";
+    return `<div class="slash-item${i === slashActiveIdx ? " active" : ""}" data-cmd="${cmd}">`
+         + `<span class="cmd">${escapeHtml(cmd)}</span><span class="desc">${escapeHtml(desc)}</span></div>`;
+  }).join("");
+  slashHintEl.classList.add("show");
+  slashHintEl.querySelectorAll(".slash-item").forEach(el => {
+    el.addEventListener("click", () => applySlashChoice(el.dataset.cmd));
+  });
+}
+
+function applySlashChoice(cmd) {
+  inputField.value = cmd + " ";
+  closeSlashHint();
+  inputField.focus();
+}
+
+function closeSlashHint() {
+  slashMatches = [];
+  slashActiveIdx = -1;
+  renderSlashHint();
+}
+
+function updateSlashHint() {
+  const val = inputField.value;
+  // Chỉ gợi ý khi đang gõ token lệnh đầu dòng (giống _slash_hint CLI: chỉ
+  // active khi buffer bắt đầu bằng "/" và chưa có dấu cách sau lệnh).
+  const m = /^(\/[a-zA-Z]*)$/.exec(val);
+  if (!m) { closeSlashHint(); return; }
+  slashMatches = slashLookup(m[1]);
+  slashActiveIdx = slashMatches.length ? 0 : -1;
+  renderSlashHint();
+}
+
+// ── WebSocket connection ─────────────────────────────────────────────────
+let ws = null;
+
+function connect() {
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  ws = new WebSocket(`${proto}//${location.host}/ws`);
+
+  ws.onopen = () => {
+    dot.classList.add("ok");
+    statusText.textContent = "Connected";
+  };
+
+  ws.onmessage = (ev) => {
+    let msg;
+    try { msg = JSON.parse(ev.data); } catch (e) { return; }
+    handleEvent(msg);
+  };
+
+  ws.onclose = () => {
+    dot.classList.remove("ok");
+    statusText.textContent = "Disconnected — đang thử lại…";
+    setBusy(false);  // tránh kẹt khoá input nếu mất kết nối giữa lúc busy
+    setTimeout(connect, 1500);
+  };
+
+  ws.onerror = () => { try { ws.close(); } catch(e){} };
+}
+
+function sendJson(obj) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(obj));
+  }
+}
+
+function sendLine() {
+  if (isBusy) return;  // an toàn kép: dù input bị disable, chặn luôn ở đây
+  const val = inputField.value;
+  if (!val) return;
+  inputField.value = "";
+  closeSlashHint();
+  appendBubble(escapeHtml(val), "user");
+  sendJson({ type: "input", value: val });
+}
+
+sendBtn.addEventListener("click", sendLine);
+inputField.addEventListener("keydown", (e) => {
+  if (slashMatches.length > 0) {
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      slashActiveIdx = (slashActiveIdx + 1) % slashMatches.length;
+      renderSlashHint();
+      return;
+    }
+    if (e.key === "ArrowUp") {
+      e.preventDefault();
+      slashActiveIdx = (slashActiveIdx - 1 + slashMatches.length) % slashMatches.length;
+      renderSlashHint();
+      return;
+    }
+    if (e.key === "Tab" || (e.key === "Enter" && slashActiveIdx >= 0 && inputField.value !== slashMatches[slashActiveIdx])) {
+      e.preventDefault();
+      applySlashChoice(slashMatches[slashActiveIdx]);
+      return;
+    }
+    if (e.key === "Escape") {
+      closeSlashHint();
+      return;
+    }
+  }
+  if (e.key === "Enter") { e.preventDefault(); sendLine(); }
+});
+inputField.addEventListener("input", updateSlashHint);
+inputField.addEventListener("blur", () => setTimeout(closeSlashHint, 150)); // delay để click chọn kịp chạy trước
+ctrlBtn.addEventListener("click", () => sendJson({ type: "interrupt" }));
+
+connect();
+</script>
+</body>
+</html>
