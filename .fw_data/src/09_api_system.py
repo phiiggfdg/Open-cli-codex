@@ -1240,7 +1240,9 @@ def call_api_stream(messages, model, api_key, tool_choice="auto", session_id=Non
                     m = re.search(r"less than or equal to (\d+)", body_lower)
                     safe_limit = int(m.group(1)) if m else 8192
                     spinner_ref[0].stop()
-                    print(f"\n{YELLOW}  ⚠ max_tokens quá cao — retry với {safe_limit}...{R}")
+                    _txt = f"\n{YELLOW}  ⚠ max_tokens quá cao — retry với {safe_limit}...{R}"
+                    if state: state.emit(EV_WARN, text=_txt, raw=True)
+                    else: print(_txt)
                     payload["max_tokens"] = safe_limit
                     _known_max_tokens[model] = safe_limit  # nhớ cho turn sau
                     continue
@@ -1254,10 +1256,12 @@ def call_api_stream(messages, model, api_key, tool_choice="auto", session_id=Non
                 rot = pool_rotate_after_429_verbose(api_key, retry_after)
                 spinner_ref[0].stop()
                 if rot["rotated"]:
-                    print(f"\n{YELLOW}  ⚠ Key #{rot['old_index']} ({rot['old_mask']}) hết quota "
+                    _txt = (f"\n{YELLOW}  ⚠ Key #{rot['old_index']} ({rot['old_mask']}) hết quota "
                           f"(429) → chuyển Key #{rot['new_index']} ({rot['new_mask']}), còn "
                           f"{rot['free_count']}/{rot['total']-1} key khác đang rảnh. "
-                          f"Thử lại ngay...{R}", flush=True)
+                          f"Thử lại ngay...{R}")
+                    if state: state.emit(EV_WARN, text=_txt, raw=True)
+                    else: print(_txt, flush=True)
                     api_key = rot["new_key"]
                 else:
                     # rot["soonest_wait"] luôn có giá trị hợp lệ ở đây (xem
@@ -1268,13 +1272,15 @@ def call_api_stream(messages, model, api_key, tool_choice="auto", session_id=Non
                     # nhầm sang delay cố định thay vì chờ 0s.
                     wait = retry_after or rot["soonest_wait"]
                     if rot["total"] <= 1:
-                        print(f"\n{YELLOW}  ⚠ Key {rot['old_mask']} hết quota (429), không có "
-                              f"key dự phòng → chờ {wait:.0f}s...{R}", flush=True)
+                        _txt = (f"\n{YELLOW}  ⚠ Key {rot['old_mask']} hết quota (429), không có "
+                              f"key dự phòng → chờ {wait:.0f}s...{R}")
                     else:
-                        print(f"\n{YELLOW}  ⚠ Full {rot['total']}/{rot['total']} key đều đang bị "
+                        _txt = (f"\n{YELLOW}  ⚠ Full {rot['total']}/{rot['total']} key đều đang bị "
                               f"limit — key gần rảnh nhất là Key #{rot['soonest_index']} "
                               f"({rot['soonest_mask']}, còn {rot['soonest_wait']:.0f}s) → "
-                              f"chờ {wait:.0f}s rồi thử lại...{R}", flush=True)
+                              f"chờ {wait:.0f}s rồi thử lại...{R}")
+                    if state: state.emit(EV_WARN, text=_txt, raw=True)
+                    else: print(_txt, flush=True)
                     __import__("time").sleep(wait)
                     # Sau khi sleep, key đầu tiên bị cooldown (vd A trong A→B→C)
                     # có thể đã hết hạn — hỏi lại pool thay vì cố định dùng
@@ -1288,8 +1294,10 @@ def call_api_stream(messages, model, api_key, tool_choice="auto", session_id=Non
             if e.code in _RETRY_CODES and attempt < _RETRY_MAX - 1:
                 wait = _parse_retry_after(e) or _RETRY_DELAYS[attempt]
                 spinner_ref[0].stop()
-                print(f"\n{YELLOW}  ⚠ HTTP {e.code} (lỗi server) — retry {attempt+1}/"
-                      f"{_RETRY_MAX-1} sau {wait:.0f}s...{R}", flush=True)
+                _txt = (f"\n{YELLOW}  ⚠ HTTP {e.code} (lỗi server) — retry {attempt+1}/"
+                      f"{_RETRY_MAX-1} sau {wait:.0f}s...{R}")
+                if state: state.emit(EV_WARN, text=_txt, raw=True)
+                else: print(_txt, flush=True)
                 __import__("time").sleep(wait)
                 # Khởi động lại spinner cho lần retry
                 spinner = Spinner(f"Retry {attempt+1}")
@@ -1299,7 +1307,9 @@ def call_api_stream(messages, model, api_key, tool_choice="auto", session_id=Non
 
             # Lỗi khác không retry
             spinner_ref[0].stop()
-            print(f"\n{RED}HTTP {e.code}: {body_txt[:300]}{R}")
+            _txt = f"\n{RED}HTTP {e.code}: {body_txt[:300]}{R}"
+            if state: state.emit(EV_ERROR, text=_txt, raw=True)
+            else: print(_txt)
             return {"text": "", "tool_calls": [], "usage": {}, "truncated": False, "reasoning": "", "thinking": "", "thinking_signature": "", "redacted_thinking_data": ""}
 
         except urllib.error.URLError as e:
@@ -1308,15 +1318,19 @@ def call_api_stream(messages, model, api_key, tool_choice="auto", session_id=Non
             if attempt < _RETRY_MAX - 1:
                 wait = _RETRY_DELAYS[attempt]
                 spinner_ref[0].stop()
-                print(f"\n{YELLOW}  ⚠ Network error: {e.reason} — retry {attempt+1}/{_RETRY_MAX-1} "
-                      f"sau {wait:.0f}s...{R}", flush=True)
+                _txt = (f"\n{YELLOW}  ⚠ Network error: {e.reason} — retry {attempt+1}/{_RETRY_MAX-1} "
+                      f"sau {wait:.0f}s...{R}")
+                if state: state.emit(EV_WARN, text=_txt, raw=True)
+                else: print(_txt, flush=True)
                 __import__("time").sleep(wait)
                 spinner = Spinner(f"Retry {attempt+1}")
                 spinner.start()
                 spinner_ref[0] = spinner
                 continue
             spinner_ref[0].stop()
-            print(f"\n{RED}Network error: {e}{R}")
+            _txt = f"\n{RED}Network error: {e}{R}"
+            if state: state.emit(EV_ERROR, text=_txt, raw=True)
+            else: print(_txt)
             return {"text": "", "tool_calls": [], "usage": {}, "truncated": False, "reasoning": "", "thinking": "", "thinking_signature": "", "redacted_thinking_data": ""}
 
         except Exception as e:
@@ -1326,7 +1340,9 @@ def call_api_stream(messages, model, api_key, tool_choice="auto", session_id=Non
             # a partial stream as a successful assistant response.
             _rate_limit_mark()
             spinner_ref[0].stop()
-            print(f"\n{RED}Stream error: {e}{R}")
+            _txt = f"\n{RED}Stream error: {e}{R}"
+            if state: state.emit(EV_ERROR, text=_txt, raw=True)
+            else: print(_txt)
             return {"text": "", "tool_calls": [], "usage": {}, "truncated": False,
                     "reasoning": "", "thinking": "", "thinking_signature": "",
                     "redacted_thinking_data": "", "error": str(e)}

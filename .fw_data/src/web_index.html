@@ -915,8 +915,25 @@ function handleEvent(msg) {
       // ANSI thật từ CLI -> dịch qua adapter. Nếu đang trong 1 tool-group
       // (vd todowrite vừa tool_start), coi đây là CON của group đó thay
       // vì 1 card rời -- đúng yêu cầu thụt lề + nối nhánh cho kết quả phụ.
+      //
+      // BUG ĐÃ SỬA: trước đây nhánh else LUÔN dùng appendInfoCard(), hàm
+      // này chèn vào turnLogTarget() -- 1 container CHỈ được lộ ra qua nút
+      // "Xem chi tiết", và nút đó CHỈ được tạo trong closeTurnLogs(), vốn
+      // chỉ chạy SAU KHI có bubble AI (xem comment closeTurnLogs()). Với
+      // các lệnh KHÔNG thuộc về 1 turn AI nào (vd /listkeys, /addkey,
+      // /setkey, /rmkey, /deletekey -- các lệnh quản lý key chạy được qua
+      // Web UI) thì không có turn nào để đóng -> không bao giờ có nút
+      // toggle được tạo -> kết quả nằm vĩnh viễn trong div ẩn, người dùng
+      // thấy "gõ lệnh chả hiện gì" dù backend đã emit đúng. Sửa: nếu không
+      // có currentGroup VÀ không có turn nào đang mở (currentTurnLogs
+      // null, nghĩa là info này không phải log phụ của 1 turn đang chạy),
+      // coi đây là phản hồi TRỰC TIẾP cho lệnh vừa gõ -> appendStandaloneCard
+      // (đứng ngang hàng bubble, hiện ngay lập tức) -- giống hệt cách
+      // warn/error phía dưới đã xử lý đúng từ trước.
       if (currentGroup && d.raw) {
         appendGroupChild(`<span class="mono">${ansiToHtml(d.text)}</span>`, "child-info");
+      } else if (!currentGroup && !currentTurnLogs) {
+        appendStandaloneCard(ansiToHtml(d.text), d.raw ? "raw-info" : "info");
       } else {
         appendInfoCard(ansiToHtml(d.text), d.raw ? "raw-info" : "info");
       }
@@ -1092,58 +1109,22 @@ function renderAsk(msg) {
 
 // ── Gợi ý lệnh slash ─────────────────────────────────────────────────────
 // Danh sách + mô tả copy NGUYÊN VĂN từ SLASH_COMMANDS/SLASH_DESC trong
-// 01_ui.py (CLI thật) để khớp 100% — không đụng file .py, chỉ định nghĩa
-// lại ở đây cho phía hiển thị web. Nếu sau này CLI thêm lệnh mới, cần
-// đồng bộ tay 2 danh sách này (không có cách nào tự động lấy từ backend
-// mà không đổi kiến trúc/giao thức, và scope hiện tại là "không đụng CLI").
+// Web UI hiện chỉ cho phép 5 lệnh quản lý API key chạy được (xem whitelist
+// _WEB_ALLOWED_CMDS ở 10_main.py) -- mọi lệnh "/" khác bị chặn cứng và
+// bắt quay lại CLI thật. Vì vậy autocomplete ở đây CHỈ liệt kê 5 lệnh này,
+// không hiện các lệnh khác nữa: gợi ý 1 lệnh rồi gõ vào bị chặn ("không
+// dùng được qua Web UI") gây khó chịu hơn là không gợi ý gì cả. Khi
+// 10_main.py mở thêm lệnh vào whitelist, nhớ đồng bộ tay ở đây (không có
+// cách lấy whitelist tự động từ backend qua giao thức hiện tại).
 const SLASH_COMMANDS = [
-  "/model", "/agent", "/mode", "/session", "/sessions", "/todos", "/compact",
-  "/clear", "/delete", "/deleteall", "/cd", "/title", "/tokens",
-  "/undo", "/redo", "/diff", "/sandbox", "/export", "/cache", "/checkpoint",
-  "/perm", "/perms", "/skills", "/setkey", "/deletekey", "/init", "/rules",
-  "/commands", "/sequential", "/batch", "/commit", "/review", "/help", "/mcp",
-  "/addkey", "/listkeys", "/rmkey", "/keystrategy", "/web",
+  "/listkeys", "/rmkey", "/deletekey", "/addkey", "/setkey",
 ];
 const SLASH_DESC = {
-  "/model":      "đổi model",
-  "/agent":      "đổi agent mode (build/plan)",
-  "/mode":       "bật/tắt thinking mode (nếu model hỗ trợ)",
-  "/session":    "info session hiện tại",
-  "/sessions":   "switch/tạo session",
-  "/todos":      "xem todo list",
-  "/compact":    "compact context thủ công",
-  "/clear":      "xoá lịch sử chat",
-  "/delete":     "xoá session",
-  "/deleteall":  "xoá TẤT CẢ session",
-  "/cd":         "đổi thư mục",
-  "/title":      "đổi tên session",
-  "/tokens":     "xem token usage",
-  "/cache":      "xem/debug file cache",
-  "/checkpoint": "lưu/xem mốc tiến độ",
-  "/undo":       "undo thay đổi file",
-  "/redo":       "redo đã undo",
-  "/diff":       "xem file đã thay đổi",
-  "/sandbox":    "xem project_dir sandbox",
-  "/export":     "xuất conversation ra markdown",
-  "/perm":       "đặt permission tool",
-  "/perms":      "xem permission hiện tại",
-  "/skills":     "liệt kê skills",
   "/setkey":     "đổi API key",
   "/deletekey":  "xoá API key đã lưu",
   "/addkey":     "thêm key vào pool (nhiều key/provider, tự xoay khi 429)",
   "/listkeys":   "xem pool key + trạng thái cooldown",
   "/rmkey":      "xoá key khỏi pool theo số thứ tự",
-  "/keystrategy":"chọn round_robin hoặc fill_first",
-  "/init":       "tạo AGENTS.md cho project",
-  "/rules":      "xem AGENTS.md đang active",
-  "/commands":   "liệt kê custom commands",
-  "/sequential": "chuyển sang mode từng bước (tốn token hơn, an toàn hơn)",
-  "/batch":      "chuyển về mode gộp tool calls (mặc định, tiết kiệm token)",
-  "/commit":     "AI đọc git diff --staged và tự viết commit message",
-  "/review":     "AI review code đã thay đổi trong session hiện tại",
-  "/help":       "xem tất cả lệnh",
-  "/mcp":        "quản lý MCP server (Command Code) — list/add/remove/status",
-  "/web":        "mở web UI local (terminal bridge qua trình duyệt)",
 };
 
 const slashHintEl = document.getElementById("slashHint");

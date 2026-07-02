@@ -659,21 +659,51 @@ def main():
             print(f"\n  {DIM}Goodbye.{R}\n"); break
         if not user: continue
 
+        # BUG ĐÃ SỬA: bấm chọn lệnh từ gợi ý (autocomplete) trên Web UI
+        # (applySlashChoice ở web_index.html) luôn chèn "cmd + dấu cách"
+        # vào ô nhập, kể cả với lệnh không cần tham số (/listkeys,
+        # /deletekey...). Nếu Enter ngay không gõ thêm gì, "user" nhận về
+        # là "/listkeys " (có 1 dấu cách thừa ở cuối) -- mọi so sánh
+        # "user.lower() == '/listkeys'" bên dưới đều SO SÁNH TUYỆT ĐỐI nên
+        # không bao giờ khớp, lệnh rơi tọt xuống nhánh custom-command cuối
+        # file mà không báo lỗi gì -- đúng hiện tượng "gõ qua gợi ý thì vô
+        # dụng, gõ tay thì chạy" (gõ tay hiếm khi có dấu cách thừa ở cuối
+        # nên không lộ bug). Chỉ strip khi dòng LÀ 1 lệnh slash hoặc
+        # exit/quit/q -- KHÔNG strip nội dung chat thường gửi cho AI (có
+        # thể là multiline/code block, dấu cách đầu/cuối ở đó có thể có ý
+        # nghĩa, không tự tiện đụng vào).
+        _first_word = user.split(None, 1)[0] if user.split(None, 1) else ""
+        if _first_word.startswith("/") or _first_word.lower() in ("exit", "quit", "q"):
+            user = user.strip()
+
         # ── Web UI: chỉ dùng để chat/thao tác code, KHÔNG dùng để chạy lệnh
         # slash hay thoát chương trình ────────────────────────────────────
         # Quyết định: mọi lệnh "/..." VÀ exit/quit/q đều bị chặn khi đang
         # armed (web đang bật) — Web UI chỉ để chat với AI, mọi thao tác
-        # quản lý (session/model/key/mcp...) hoặc thoát chương trình bắt
-        # buộc quay lại CLI thật. exit/quit/q đặc biệt nguy hiểm nếu không
+        # quản lý (session/model/mcp...) hoặc thoát chương trình bắt buộc
+        # quay lại CLI thật. exit/quit/q đặc biệt nguy hiểm nếu không
         # chặn: gõ từ web sẽ break vòng lặp và tắt hẳn tiến trình CLI thật
         # (không phải chỉ đóng tab web).
+        #
+        # NGOẠI LỆ (whitelist) — 5 lệnh quản lý API key: đã xác nhận qua
+        # đọc source từng dòng rằng cả 5 handler đều đi 100% qua
+        # state.emit()/state.ask() (bus), KHÔNG còn print()/input() nào
+        # chạy khi có state (nhánh input()/print() cũ chỉ còn là fallback
+        # cho state is None, không xảy ra khi vào từ web). /addkey và
+        # /setkey dùng state.ask(kind="text") -- UI ô nhập đã có sẵn ở
+        # web_index.html (renderAsk, nhánh kind==="text"), không cần thêm
+        # UI mới. Cho phép chạy qua web vì đây là nhu cầu thực tế (đổi/thêm
+        # key ngay trong lúc đang chat, không muốn phải quay lại CLI thật).
+        _WEB_ALLOWED_CMDS = ("/listkeys", "/rmkey", "/deletekey", "/addkey", "/setkey")
         _cmd0 = user.split(None, 1)[0].lower() if user.split(None, 1) else ""
         if (state is not None and state.web_bridge is not None
                 and state.web_bridge.is_armed()
-                and (_cmd0.startswith("/") or _cmd0 in ("exit", "quit", "q"))):
+                and (_cmd0.startswith("/") or _cmd0 in ("exit", "quit", "q"))
+                and _cmd0 not in _WEB_ALLOWED_CMDS):
             state.emit(EV_WARN, text=(
                 "Lệnh / (và exit/quit) không dùng được qua Web UI — bấm Esc "
                 "trên CLI để chạy lệnh, Web UI chỉ để chat/thao tác code.\n"
+                "(Riêng /listkeys /rmkey /deletekey /addkey /setkey dùng được.)\n"
             ))
             continue
 
@@ -1110,13 +1140,24 @@ def main():
             cfg = load_config()
             ck  = _prov()["config_key"]
             cur = cfg.get(ck, "")
+            _info_lines = []
             if cur:
-                print(f"{DIM}  Key hiện tại [{_prov()['name']}]: {cur[:8]}...{cur[-4:]}{R}")
-            print(f"  {DIM}(Enter trống để xoá){R}")
-            try:
-                new_key = input(f"{CYAN}API key mới: {R}").strip()
-            except (EOFError, KeyboardInterrupt):
-                print(); continue
+                _info_lines.append(f"{DIM}  Key hiện tại [{_prov()['name']}]: {cur[:8]}...{cur[-4:]}{R}")
+            _info_lines.append(f"  {DIM}(Enter trống để xoá){R}")
+            if state is not None:
+                state.emit(EV_INFO, text="\n".join(_info_lines), raw=True)
+                new_key = state.ask(
+                    prompt="API key mới:",
+                    kind="text",
+                    default="",
+                ) or ""
+                new_key = str(new_key).strip()
+            else:
+                print("\n".join(_info_lines))
+                try:
+                    new_key = input(f"{CYAN}API key mới: {R}").strip()
+                except (EOFError, KeyboardInterrupt):
+                    print(); continue
             if new_key:
                 cfg[ck] = new_key
                 api_key = new_key
@@ -1155,11 +1196,26 @@ def main():
         if user.lower().startswith("/addkey"):
             parts = user.split(maxsplit=1)
             if len(parts) < 2:
-                _txt = f"{RED}Usage: /addkey <api_key>{R}\n"
-                if state: state.emit(EV_INFO, text=_txt, raw=True)
-                else: print(_txt)
-                continue
-            n = pool_add_key(parts[1].strip())
+                if state is not None:
+                    new_key = state.ask(
+                        prompt=f"API key thêm vào pool [{_prov()['name']}]:",
+                        kind="text",
+                        default="",
+                    ) or ""
+                    new_key = str(new_key).strip()
+                else:
+                    try:
+                        new_key = input(f"{CYAN}API key thêm vào pool: {R}").strip()
+                    except (EOFError, KeyboardInterrupt):
+                        print(); continue
+                if not new_key:
+                    _txt = f"{RED}Đã huỷ — không có key nào được thêm.{R}\n"
+                    if state: state.emit(EV_INFO, text=_txt, raw=True)
+                    else: print(_txt)
+                    continue
+            else:
+                new_key = parts[1].strip()
+            n = pool_add_key(new_key)
             _txt = f"{GREEN}✓ Đã thêm key vào pool [{_prov()['name']}] — tổng {n} key.{R}\n"
             if state: state.emit(EV_INFO, text=_txt, raw=True)
             else: print(_txt)
@@ -1185,7 +1241,10 @@ def main():
         if user.lower().startswith("/rmkey"):
             parts = user.split(maxsplit=1)
             if len(parts) < 2 or not parts[1].strip().isdigit():
-                print(f"{RED}Usage: /rmkey <số thứ tự từ /listkeys>{R}\n"); continue
+                _txt = f"{RED}Usage: /rmkey <số thứ tự từ /listkeys>{R}\n"
+                if state: state.emit(EV_INFO, text=_txt, raw=True)
+                else: print(_txt)
+                continue
             removed = pool_remove_key(int(parts[1].strip()))
             if removed:
                 _txt = f"{GREEN}✓ Đã xoá key {_pool_mask(removed)} khỏi pool.{R}\n"
@@ -1198,7 +1257,10 @@ def main():
         if user.lower().startswith("/keystrategy"):
             parts = user.split(maxsplit=1)
             if len(parts) < 2 or parts[1].strip() not in _KEY_POOL_STRATEGIES:
-                print(f"{RED}Usage: /keystrategy round_robin|fill_first{R}\n"); continue
+                _txt = f"{RED}Usage: /keystrategy round_robin|fill_first{R}\n"
+                if state: state.emit(EV_INFO, text=_txt, raw=True)
+                else: print(_txt)
+                continue
             pool_set_strategy(parts[1].strip())
             _txt = f"{GREEN}✓ Strategy: {parts[1].strip()}{R}\n"
             if state: state.emit(EV_INFO, text=_txt, raw=True)
