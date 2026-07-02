@@ -96,6 +96,8 @@
 - [Features](#features)
 - [Supported Providers](#supported-providers)
 - [Agent Tools](#agent-tools)
+- [Local Web UI (`/web`)](#local-web-ui-web)
+- [Skill System](#skill-system)
 - [API Key Pool & Rotation](#api-key-pool--rotation)
 - [Project Structure](#project-structure)
 - [Requirements](#requirements)
@@ -150,6 +152,8 @@ This project was developed as a personal tool and is shared publicly for referen
 - **Multi-key pool with automatic rotation** — add several API keys per provider; on HTTP 429 the pool cools down the limited key and switches to a free one instead of blindly sleeping
 - **SQLite session management** with automatic context compaction at ~80k tokens
 - **MCP (Model Context Protocol)** client integration
+- **Skill system** — on-demand `SKILL.md` loading via the `skill` tool for domain-specific guidance (opencode-compatible `.opencode/skills` layout too)
+- **Local Web UI** (`/web`) — zero-dependency WebSocket bridge that mirrors the running CLI session in a browser tab, no separate process spawned
 - **Sandboxed execution** — each session runs in its own isolated working directory
 - **Undo/redo dispatch system** for file edits
 - **Extended thinking / reasoning** support (Claude extended thinking, DeepSeek-style reasoning) with correct round-trip replay
@@ -209,6 +213,52 @@ Most CLI agents lock you into one API shape. `fw.py` internally speaks only Open
 
 ---
 
+### Local Web UI (`/web`)
+
+Type `/web` in the running CLI to open a local browser bridge — **no separate process is spawned**. The browser tab connects via WebSocket to the *same* `SessionState` your CLI session already has (same messages, same model, same context).
+
+- **Zero extra dependencies** — the WebSocket server (RFC 6455 handshake, framing) is hand-rolled on top of `http.server`/`socketserver`, no Flask/FastAPI/websockets package needed.
+- **CLI keyboard locks while armed** — input is read from the browser instead; press `Esc` (or `Ctrl-C`) on the real terminal to instantly hand keyboard control back. The web server keeps running in the background either way.
+- **Live event mirroring** — every `Event` your session emits (text deltas, tool calls, tool results, thinking, todo updates) is pushed to the browser as JSON in real time, not just a terminal byte-stream replay.
+- **Slash commands are CLI-only by design** — typing `/something` or `exit`/`quit`/`q` from the web client is rejected with a warning; the Web UI is for chatting and watching the agent work, not for driving REPL commands. Switch back to the real terminal (`Esc`) to run commands.
+- **Single active session** — the web bridge always mirrors whichever `SessionState` is currently registered as the CLI's session (e.g. switching sessions via `/sessions` re-points the bridge automatically).
+
+```
+/web
+# → Web UI running: http://127.0.0.1:8765/
+# → CLI input locked — use the browser.
+# → Press Esc to return to the CLI (web server keeps running in background).
+```
+
+> Implemented in `12_web.py`. Architecture note: an earlier PTY-spawn design (browser as a dumb terminal emulator) was replaced with this direct `EventBus` bridge so the browser can render structured tool cards/JSON instead of raw ANSI bytes.
+
+---
+
+### Skill System
+
+On-demand domain guidance the model can pull in mid-task via the `skill` tool, instead of bloating the system prompt with instructions it may never need.
+
+- **Read-only, on-demand loading** — the model calls `skill("name")`, which reads a `SKILL.md` file and returns its content as the tool result. Nothing is auto-injected into context until asked for.
+- **Search paths** (checked in order):
+  - `.fw_data/skills/` — project-local (primary)
+  - `.opencode/skills/` — opencode compatibility
+- **Flexible name resolution** — `skill("python")` matches `python`, `python.md`, `python/SKILL.md`, `PYTHON/SKILL.md`, or `python.skill.md`, whichever exists first.
+- **Self-discovering** — an unknown skill name doesn't just fail; the tool result lists every skill it *did* find, so the model can self-correct without a separate "list skills" round trip.
+- **`/skills`** — lists all available skills from the terminal at any time.
+
+```bash
+mkdir -p .fw_data/skills/my-skill
+echo "---
+name: my-skill
+description: When to use this skill.
+---
+Instructions go here." > .fw_data/skills/my-skill/SKILL.md
+```
+
+> Implemented in `tool_skill()` (`07_tools_more.py`) and `SKILLS_DIRS` (`04_agent_cache.py`). Compatible with the community `SKILL.md` format used by Claude Code, Codex, and opencode.
+
+---
+
 ### API Key Pool & Rotation
 
 Each provider can hold **multiple API keys** instead of just one. When a request hits HTTP 429 (rate limit / quota), the pool puts that key on cooldown and automatically retries with a different key from the same provider — no blind sleep-and-hope if a free key is available.
@@ -248,6 +298,7 @@ fw.py                        # Entry point / module loader
 ├── 08_undo_dispatch.py      # Undo/redo + subagent dispatch
 ├── 09_api_system.py         # API streaming, system prompt, agentic loop
 ├── 11_key_pool.py           # Multi-key pool, 429 rotation, cooldown
+├── 12_web.py                # Local Web UI — stdlib WebSocket bridge to the running session
 └── 10_main.py               # Main CLI entrypoint, REPL, slash commands
 ```
 
@@ -420,6 +471,8 @@ Dự án được phát triển như một công cụ cá nhân và chỉ đư�
 - **Pool nhiều API key, tự động xoay** — thêm nhiều key cho cùng 1 provider; khi dính HTTP 429, pool cho key đó nghỉ (cooldown) và chuyển sang key khác đang rảnh thay vì ngồi chờ vô ích
 - **Quản lý phiên bằng SQLite** với tự động nén context tại ~80k token
 - **Tích hợp MCP** (Model Context Protocol)
+- **Hệ thống skill** — load `SKILL.md` theo yêu cầu qua tool `skill`, chỉ nạp khi cần (tương thích layout `.opencode/skills`)
+- **Web UI local** (`/web`) — bridge WebSocket không cần thư viện ngoài, phản chiếu phiên CLI đang chạy ra trình duyệt, không spawn tiến trình riêng
 - **Thực thi trong sandbox** — mỗi phiên chạy trong thư mục làm việc riêng biệt, cô lập
 - **Hệ thống undo/redo** cho các thao tác sửa file
 - **Hỗ trợ extended thinking / reasoning** (Claude extended thinking, DeepSeek-style reasoning) với cơ chế replay đúng round-trip
@@ -479,6 +532,52 @@ Phần lớn CLI agent chỉ hỗ trợ 1 dạng API duy nhất. `fw.py` nội b
 
 ---
 
+### Web UI local (`/web`)
+
+Gõ `/web` trong CLI đang chạy để mở bridge trình duyệt local — **không spawn tiến trình con nào cả**. Tab trình duyệt kết nối qua WebSocket vào đúng `SessionState` mà CLI đang dùng (chung messages, chung model, chung context).
+
+- **Không cần thư viện ngoài** — WebSocket server (handshake RFC 6455, đóng gói frame) tự viết trên nền `http.server`/`socketserver`, không cần Flask/FastAPI/websockets.
+- **Bàn phím CLI khoá khi đang armed** — input được đọc từ trình duyệt thay vì bàn phím thật; bấm `Esc` (hoặc `Ctrl-C`) trên terminal thật để lấy lại quyền ngay lập tức. Web server vẫn chạy nền dù đang ở chế độ nào.
+- **Phản chiếu event trực tiếp** — mọi `Event` phiên phát ra (text streaming, tool call, kết quả tool, thinking, todo update) được đẩy qua trình duyệt dạng JSON theo thời gian thực, không phải replay byte-stream terminal thô.
+- **Lệnh slash chỉ dùng được trên CLI thật, có chủ đích** — gõ `/lệnh` hoặc `exit`/`quit`/`q` từ web client sẽ bị từ chối kèm cảnh báo; Web UI dùng để chat và xem agent làm việc, không phải để điều khiển REPL. Quay lại terminal thật (`Esc`) để chạy lệnh.
+- **Chỉ 1 session hoạt động tại 1 thời điểm** — web bridge luôn phản chiếu đúng `SessionState` đang được đăng ký là session của CLI (vd đổi session qua `/sessions` sẽ tự động trỏ lại bridge).
+
+```
+/web
+# → Web UI đang chạy: http://127.0.0.1:8765/
+# → Ô nhập CLI tạm khoá — thao tác trên trình duyệt.
+# → Nhấn Esc để quay lại CLI (web server vẫn chạy nền).
+```
+
+> Cài đặt tại `12_web.py`. Ghi chú kiến trúc: bản thiết kế cũ (spawn PTY, trình duyệt chỉ là terminal emulator xem lại byte ANSI) đã được thay bằng bridge `EventBus` trực tiếp này, để trình duyệt hiển thị được tool card/JSON có cấu trúc thay vì byte ANSI thô.
+
+---
+
+### Hệ thống Skill
+
+Kiến thức chuyên biệt theo domain, model tự gọi giữa lúc làm việc qua tool `skill`, thay vì nhồi hết vào system prompt những thứ chưa chắc dùng đến.
+
+- **Chỉ đọc, nạp theo yêu cầu** — model gọi `skill("tên")`, đọc file `SKILL.md` và trả nội dung về làm kết quả tool. Không có gì tự động bơm vào context nếu không được yêu cầu.
+- **Đường dẫn tìm kiếm** (theo thứ tự):
+  - `.fw_data/skills/` — project-local (chính)
+  - `.opencode/skills/` — tương thích opencode
+- **Linh hoạt khi tìm tên** — `skill("python")` khớp với `python`, `python.md`, `python/SKILL.md`, `PYTHON/SKILL.md`, hoặc `python.skill.md`, tuỳ cái nào tồn tại trước.
+- **Tự gợi ý khi không tìm thấy** — gọi sai tên không chỉ báo lỗi; kết quả tool liệt kê luôn mọi skill đang có, để model tự sửa mà không cần gọi thêm 1 lượt "liệt kê skill" riêng.
+- **`/skills`** — liệt kê toàn bộ skill hiện có từ terminal bất cứ lúc nào.
+
+```bash
+mkdir -p .fw_data/skills/my-skill
+echo "---
+name: my-skill
+description: Khi nào nên dùng skill này.
+---
+Nội dung hướng dẫn ở đây." > .fw_data/skills/my-skill/SKILL.md
+```
+
+> Cài đặt tại `tool_skill()` (`07_tools_more.py`) và `SKILLS_DIRS` (`04_agent_cache.py`). Tương thích định dạng `SKILL.md` cộng đồng, dùng chung với Claude Code, Codex, và opencode.
+
+---
+
 ### Pool API Key & Cơ chế xoay key
 
 Mỗi provider có thể lưu **nhiều API key** thay vì chỉ 1. Khi request dính HTTP 429 (rate-limit/hết quota), pool cho key đó nghỉ (cooldown) và tự động thử lại bằng key khác cùng provider — không ngồi chờ vô ích nếu vẫn còn key rảnh.
@@ -518,6 +617,7 @@ fw.py                        # Điểm khởi chạy / loader module
 ├── 08_undo_dispatch.py      # Undo/redo + dispatch subagent
 ├── 09_api_system.py         # Streaming API, system prompt, vòng lặp agent
 ├── 11_key_pool.py           # Pool nhiều key, xoay key khi 429, cooldown
+├── 12_web.py                # Web UI local — bridge WebSocket stdlib tới phiên đang chạy
 └── 10_main.py               # Entrypoint CLI chính, REPL, slash command
 ```
 

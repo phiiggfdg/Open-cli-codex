@@ -44,6 +44,7 @@ _SRC_DIR = _find_src_dir()
 # rất khó debug nếu không biết kiến trúc này từ trước.
 _MODULES = [
     "01_ui.py",
+    "01d_events.py",
     "01b_aws.py",
     "01c_anthropic.py",
     "02_provider.py",
@@ -55,6 +56,7 @@ _MODULES = [
     "08_undo_dispatch.py",
     "09_api_system.py",
     "11_key_pool.py",
+    "12_web.py",
     "10_main.py",
 ]
 
