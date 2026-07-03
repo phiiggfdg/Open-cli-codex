@@ -107,16 +107,19 @@ PROVIDERS = {
         "fallback_models": [
             "zai-glm-4.7",
             "gpt-oss-120b",
+            "gemma-4-31b",
         ],
         "context_limits": {
             "zai-glm-4.7":   131_072,
             "gpt-oss-120b":  128_000,
+            "gemma-4-31b":   128_000,  # TODO: xác nhận lại context thật khi có docs chính thức
         },
         # /v1/models trả về OpenAI-compatible format: {"data": [{"id": ...}]}
-        # Chỉ giữ 2 model test được — bỏ các model embed / audio / vision
+        # Chỉ giữ các model test được — bỏ các model embed / audio / vision
+        # gemma-4-31b: multimodal (Google DeepMind), public preview từ 29/06/2026
         "parse_models":     lambda data: [
             m["id"] for m in data.get("data", [])
-            if m.get("id") and m["id"] in ("zai-glm-4.7", "gpt-oss-120b")
+            if m.get("id") and m["id"] in ("zai-glm-4.7", "gpt-oss-120b", "gemma-4-31b")
         ],
         "rate_limit_delay": 0.0,
     },
