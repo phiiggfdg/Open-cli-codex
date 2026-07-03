@@ -661,10 +661,22 @@ def _parse_retry_after(e: "urllib.error.HTTPError") -> float | None:
     return None
 
 def _no_temperature(model: str) -> bool:
-    """Claude 4+ deprecated temperature. Detect bằng tên model."""
-    # Lấy phần sau @ nếu có (vd vertex/claude-opus-4-7@eu → claude-opus-4-7)
+    """Claude 4+ deprecated temperature. Detect bằng tên model.
+
+    BUG ĐÃ SỬA: regex cũ chỉ khớp literal "-4" (vd claude-opus-4-7), nên bỏ
+    sót các model dòng mới không có số 4 trong tên (vd claude-fable-5,
+    claude-mythos-5 — cùng thế hệ Claude 4+/5, cũng deprecated temperature,
+    nhưng tên chỉ có "-5") -> vẫn gửi temperature -> upstream trả 400
+    "ValidationError: `temperature` is deprecated for this model". Sửa:
+    bắt tổng quát pattern claude-<tên>-<số>, coi mọi số generation >= 4 là
+    deprecated (khớp cách Anthropic đặt tên: claude-3-x-... cho bản cũ
+    không deprecated, còn claude-<tên>-4/5/... là dòng mới).
+    """
     base = model.lower().split("@")[0].split("/")[-1]
-    return bool(re.search(r"claude-\w+-4", base))
+    m = re.search(r"claude-[a-z]+-(\d+)", base)
+    if m:
+        return int(m.group(1)) >= 4
+    return bool(re.search(r"claude-\w+-4", base))  # fallback giữ hành vi cũ cho tên lạ
 
 
 def _call_simple(messages, model, api_key, retry_max=None, silent=False,

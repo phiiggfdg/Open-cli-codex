@@ -5,77 +5,132 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
 <title>Open CLI Codex — Web</title>
 <style>
-  @import url('https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
 
-  /* ── Theme: be sáng, bo tròn, font Be Vietnam Pro (dấu tiếng Việt rõ,
-     nét hiện đại, phổ biến cho UI — chọn thay cho hint "để mình tự chọn").
-     Mono (JetBrains Mono) chỉ dùng cho phần thật sự cần căn cột: preview
-     args JSON, /help raw ANSI, số liệu token — giữ cảm giác "terminal"
-     nhẹ nhàng mà không làm cả trang cứng nhắc. */
+  /* ── Theme: be/kem tinh tế, tương phản vừa đủ để đọc thoải mái lâu dài.
+     Font Inter thay Be Vietnam Pro — cùng hỗ trợ dấu tiếng Việt đầy đủ,
+     nhưng nét chữ trung tính, hiện đại, ít "bo tròn dễ thương" hơn, hợp
+     cảm giác cao cấp/gọn gàng theo yêu cầu. Mono giữ JetBrains Mono cho
+     phần cần căn cột (preview lệnh, code, số liệu). */
   :root {
-    --bg:        #f7f2e9;   /* be sáng, nền chính */
-    --bg-panel:  #fffdf8;   /* nền card/bubble, sáng hơn nền 1 chút */
-    --bg-sunken: #efe7d8;   /* nền lõm nhẹ (thanh trên, input bar) */
-    --border:    #d9cbac;   /* tăng tương phản so với bản trước — cạnh rõ hơn */
-    --border-soft: #e8ddc4;
-    --text:      #4a4030;   /* nâu đậm ấm, dễ đọc trên be, đỡ gắt hơn đen */
-    --text-dim:  #9b8f77;
-    --accent:    #c17a3f;   /* cam đất — accent chính thay cho xanh dương lạnh */
-    --accent-2:  #7a8f5c;   /* xanh ô-liu — thành công/AI */
-    --warn:      #b8863a;
-    --err:       #b6503f;
-    --user-bg:   #4a6a5a;   /* xanh rêu đậm cho bubble user, tương phản ấm */
-    --radius-lg: 18px;
-    --radius-md: 12px;
-    --radius-sm: 8px;
-    /* Elevation: 2 mức shadow dùng nhất quán -- mức 1 cho card thường (tách
-       nhẹ khỏi nền), mức 2 cho thứ CẦN nổi bật (nút hành động, group tool
-       đang chạy, hộp cần phản hồi). Màu shadow ngả nâu ấm (không xám lạnh)
-       để hợp tông be, và mỗi elevation-2 còn có 1 lớp glow màu accent riêng
-       thay vì tăng độ đen — "nổi" bằng màu, không phải bằng bóng tối. */
-    --shadow-1: 0 1px 3px rgba(74,64,48,0.08);
-    --shadow-2: 0 4px 14px rgba(74,64,48,0.14);
+    --bg:          #f6f3ec;   /* be sáng, nền chính */
+    --bg-panel:    #fffefb;   /* nền card/bubble */
+    --bg-sunken:   #eee9dd;   /* nền lõm nhẹ (thanh trên, input, khối phụ) */
+    --border:      #ddd4c0;   /* viền tiêu chuẩn */
+    --border-soft: #e9e2d2;   /* viền nhạt hơn, cho card lồng nhau */
+    --text:        #3d382e;   /* nâu-xám đậm, dịu hơn đen thuần */
+    --text-dim:    #8f8776;
+    --accent:      #b08a4e;   /* vàng nhạt/đồng — điểm nhấn chính */
+    --accent-2:    #7c8f6c;   /* xanh ô-liu dịu — thành công/AI/hành động */
+    --warn:        #a97a3a;
+    --err:         #ad5847;
+    --user-bg:     #4f5f4c;   /* xanh rêu đậm cho bubble user */
+    --radius-lg:   16px;
+    --radius-md:   12px;
+    --radius-sm:   9px;
+    --shadow-1:    0 1px 2px rgba(61,56,46,0.06);
+    --shadow-2:    0 6px 20px rgba(61,56,46,0.10);
   }
 
-  /* ── Glass 7 màu kiểu Apple: gradient nhiều màu chạy dưới lớp kính mờ
-     (backdrop-filter blur) -> cảm giác ánh sáng tán xạ qua kính, giống
-     hiệu ứng "liquid glass" trên iOS/macOS. Dùng cho thanh trạng thái
-     trên cùng và nút ẩn/hiện log tool. */
-  @keyframes glassShift {
-    0%   { background-position: 0% 50%; }
-    50%  { background-position: 100% 50%; }
-    100% { background-position: 0% 50%; }
+  /* ── Liquid Glass kiểu Apple (iOS 18 / visionOS): không phải chỉ frosted
+     blur tĩnh — có 4 lớp làm nên cảm giác "kính lỏng nổi khối":
+       1. Độ nổi 3D: shadow nhiều lớp (contact shadow sát + ambient shadow
+          xa) thay vì 1 shadow phẳng, cộng highlight viền trên sáng hơn
+          viền dưới (ánh sáng chiếu từ trên xuống).
+       2. Specular sheen: 1 dải sáng chéo (::before) quét qua bề mặt khi
+          hover/active — mô phỏng ánh sáng phản chiếu trên bề mặt kính
+          khi "nghiêng" theo thao tác chạm, giống nút iOS.
+       3. Chromatic refraction: kính thật không chỉ phản chiếu trắng —
+          rìa dải sáng tán sắc rất nhẹ thành các vệt màu (đỏ/cam 1 bên,
+          xanh/tím bên kia của sheen), đúng hiện tượng quang học khi ánh
+          sáng đi qua bề mặt cong — đây là thứ làm liquid glass "có màu"
+          dù nền vẫn be/kem, khác hẳn 1 lớp mờ trắng phẳng lì.
+       4. Refraction "thở": sheen tự trôi rất chậm, rất mờ theo thời gian
+          (idle) để bề mặt kính cảm giác "sống", có ánh sáng môi trường
+          xung quanh liên tục đổi góc — không chỉ phản ứng khi chạm.
+     Màu sắc chỉ xuất hiện ở rìa sheen, cường độ rất thấp — giữ tinh thần
+     tinh tế, không lặp lại lỗi "viền cầu vồng đậm" của bản trước. */
+  @keyframes glassIdleDrift {
+    0%, 100% { background-position: 20% 50%; }
+    50%      { background-position: 80% 50%; }
   }
-  .glass7 { position: relative; isolation: isolate; }
-  .glass7::before {
-    content: ""; position: absolute; inset: -40%; z-index: -1;
+  .glass {
+    position: relative; isolation: isolate; overflow: hidden;
+    background: rgba(255,254,251,0.55);
+    backdrop-filter: blur(22px) saturate(1.5);
+    -webkit-backdrop-filter: blur(22px) saturate(1.5);
+    border: 1px solid rgba(255,255,255,0.55);
+    box-shadow:
+      0 1px 1px rgba(255,255,255,0.6) inset,
+      0 -1px 1px rgba(61,56,46,0.05) inset,
+      0 8px 20px rgba(61,56,46,0.08),
+      0 1px 3px rgba(61,56,46,0.06);
+    transition: box-shadow .35s cubic-bezier(.22,.7,.3,1), backdrop-filter .35s ease, transform .25s cubic-bezier(.22,.7,.3,1);
+  }
+  .glass::before {
+    content: ""; position: absolute; inset: -60% -20%; z-index: 1;
     background: linear-gradient(115deg,
-      #ff6b6b 0%, #ffa94d 14%, #ffd43b 28%, #69db7c 42%,
-      #4dabf7 57%, #845ef7 71%, #f783ac 85%, #ff6b6b 100%);
-    background-size: 300% 300%;
-    filter: blur(28px) saturate(1.3);
-    opacity: 0.28;
-    animation: glassShift 14s ease-in-out infinite;
+      transparent 26%,
+      rgba(255,150,120,0.16) 42%,
+      rgba(255,255,255,0.7) 49%, rgba(255,255,255,0.85) 50%, rgba(255,255,255,0.7) 51%,
+      rgba(140,170,255,0.16) 58%,
+      transparent 74%);
+    transform: translateX(-120%) rotate(3deg);
+    transition: transform .7s cubic-bezier(.22,.7,.3,1);
     pointer-events: none;
   }
+  .glass::after {
+    /* Ánh sáng môi trường trôi rất chậm, rất mờ — kính "sống" ngay cả khi
+       không ai chạm vào, giống bề mặt liquid glass phản chiếu ánh sáng
+       phòng liên tục đổi nhẹ. */
+    content: ""; position: absolute; inset: 0; z-index: 0; border-radius: inherit;
+    background: linear-gradient(100deg,
+      rgba(255,180,150,0.05) 0%, transparent 25%,
+      transparent 60%, rgba(150,180,255,0.05) 85%, transparent 100%);
+    background-size: 220% 220%;
+    animation: glassIdleDrift 9s ease-in-out infinite;
+    pointer-events: none;
+  }
+  .glass:hover::before,
+  .glass.glass-active::before { transform: translateX(20%) rotate(3deg); }
+  .glass:active {
+    transform: scale(0.985);
+    backdrop-filter: blur(16px) saturate(1.7);
+    -webkit-backdrop-filter: blur(16px) saturate(1.7);
+    box-shadow:
+      0 1px 1px rgba(255,255,255,0.5) inset,
+      0 -1px 2px rgba(61,56,46,0.08) inset,
+      0 2px 6px rgba(61,56,46,0.10);
+  }
 
-  /* Biến thể glass7 nhẹ hơn, viền mỏng chạy quanh bubble AI — cùng dải 7
-     màu nhưng opacity thấp + chỉ lộ ra ở rìa (viền), giữ nền bubble đọc
-     được chữ, không lấn át nội dung chat. */
-  .glass7-edge { position:relative; isolation:isolate; }
-  .glass7-edge::before {
-    content:""; position:absolute; inset:-1px; z-index:-1; border-radius:inherit;
-    background: linear-gradient(120deg,
-      #ff6b6b 0%, #ffa94d 14%, #ffd43b 28%, #69db7c 42%,
-      #4dabf7 57%, #845ef7 71%, #f783ac 85%, #ff6b6b 100%);
-    background-size: 300% 300%;
-    opacity: 0.55;
-    animation: glassShift 16s ease-in-out infinite;
+  .glass-edge {
+    position: relative; isolation: isolate; overflow: hidden;
+    background: var(--bg-panel);
+    border: 1px solid var(--border-soft);
+    box-shadow:
+      0 1px 0 rgba(255,255,255,0.7) inset,
+      0 6px 16px rgba(61,56,46,0.06);
+    transition: box-shadow .3s cubic-bezier(.22,.7,.3,1), transform .2s cubic-bezier(.22,.7,.3,1);
   }
-  .glass7-edge::after {
-    content:""; position:absolute; inset:1px; z-index:-1; border-radius:calc(var(--radius-lg) - 1px);
-    background:var(--bg-panel);
+  .glass-edge::after {
+    content: "";
+    position: absolute; inset: 0; border-radius: inherit;
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.7);
+    pointer-events: none;
   }
+  .glass-edge::before {
+    content: ""; position: absolute; inset: -60% -20%; z-index: 1;
+    background: linear-gradient(115deg,
+      transparent 30%,
+      rgba(255,150,120,0.13) 44%,
+      rgba(255,255,255,0.6) 48%, rgba(255,255,255,0.72) 50%, rgba(255,255,255,0.6) 52%,
+      rgba(140,170,255,0.13) 56%,
+      transparent 70%);
+    transform: translateX(-120%) rotate(3deg);
+    transition: transform .7s cubic-bezier(.22,.7,.3,1);
+    pointer-events: none;
+  }
+  .glass-edge:hover::before { transform: translateX(20%) rotate(3deg); }
 
   @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after { animation-duration: 0.001ms !important; animation-iteration-count: 1 !important;
@@ -84,48 +139,43 @@
 
   html, body { margin:0; padding:0; background:var(--bg); height:100%; overflow:hidden; }
   * { box-sizing: border-box; }
-  body { font-family:"Be Vietnam Pro", -apple-system, sans-serif; }
+  body { font-family:"Inter", -apple-system, "Segoe UI", sans-serif; }
   #wrap { display:flex; flex-direction:column; height:100vh; height:100dvh; }
 
-  #bar { flex:0 0 auto; background:rgba(239,231,216,0.62); backdrop-filter:blur(18px) saturate(1.6);
-         -webkit-backdrop-filter:blur(18px) saturate(1.6); color:var(--text-dim);
-         font-size:12px; font-weight:500; padding:10px 14px; display:flex;
+  #bar { flex:0 0 auto; background:rgba(238,233,221,0.7); backdrop-filter:blur(20px) saturate(1.3);
+         -webkit-backdrop-filter:blur(20px) saturate(1.3); color:var(--text-dim);
+         font-size:12px; font-weight:500; padding:11px 16px; display:flex;
          justify-content:space-between; align-items:center;
-         border-bottom:1px solid var(--border); box-shadow:0 1px 6px rgba(74,64,48,0.05);
+         border-bottom:1px solid var(--border-soft); box-shadow:0 1px 0 rgba(255,255,255,0.5) inset, 0 2px 8px rgba(61,56,46,0.04);
          overflow:hidden; }
-  #status { display:flex; align-items:center; gap:7px; }
+  #status { display:flex; align-items:center; gap:8px; }
   @keyframes dotPulse {
-    0%, 100% { box-shadow:0 0 0 3px rgba(122,143,92,0.18); }
-    50%      { box-shadow:0 0 0 6px rgba(122,143,92,0.06); }
+    0%, 100% { box-shadow:0 0 0 3px rgba(124,143,108,0.16); }
+    50%      { box-shadow:0 0 0 6px rgba(124,143,108,0.05); }
   }
-  #dot { width:9px; height:9px; border-radius:50%; background:var(--err); flex:0 0 auto;
-         box-shadow:0 0 0 3px rgba(182,80,63,0.15); transition:background .25s, box-shadow .25s; }
-  #dot.ok { background:var(--accent-2); animation: dotPulse 2.4s ease-in-out infinite; }
-  #meta { color:var(--text-dim); }
+  #dot { width:8px; height:8px; border-radius:50%; background:var(--err); flex:0 0 auto;
+         box-shadow:0 0 0 3px rgba(173,88,71,0.14); transition:background .25s, box-shadow .25s; }
+  #dot.ok { background:var(--accent-2); animation: dotPulse 2.6s ease-in-out infinite; }
+  #meta { color:var(--text-dim); letter-spacing:.1px; }
 
   #logScroll { flex:1 1 auto; overflow-y:auto; -webkit-overflow-scrolling:touch; scroll-behavior:smooth; }
-  #log { padding:14px 10px; display:flex; flex-direction:column; gap:10px;
-    font-size: 14px; line-height:1.55; color:var(--text); min-height:100%; }
+  #log { padding:16px 12px; display:flex; flex-direction:column; gap:10px;
+    font-size: 14.5px; line-height:1.6; color:var(--text); min-height:100%; }
 
-  /* Mọi dòng log/card mới chèn vào (info-card, tool-group, step, spinner...)
-     đều trượt nhẹ lên + fade in — cùng "ngôn ngữ chuyển động" với bubble
-     chat để cả luồng cảm giác liền mạch, không phải bubble mượt còn log
-     tool hiện cộc lốc. */
+  /* Xuất hiện nhẹ nhàng: fade + trượt lên rất ít, không overshoot, để cảm
+     giác "điềm tĩnh" thay vì nảy. */
   @keyframes rowIn {
-    from { opacity:0; transform: translateY(8px); }
+    from { opacity:0; transform: translateY(6px); }
     to   { opacity:1; transform: translateY(0); }
   }
   .row, .info-card, .tool-group, .ask-box, .turn-toggle-row {
-    animation: rowIn .3s cubic-bezier(.25,.8,.35,1) both;
+    animation: rowIn .28s cubic-bezier(.22,.7,.3,1) both;
   }
   .row { white-space:pre-wrap; word-break:break-word; }
   .dim { color:var(--text-dim); }
   .mono { font-family:"JetBrains Mono", Menlo, Consolas, monospace; font-size:12.5px; }
 
-  /* ── Spinner "Thinking" ────────────────────────────────────────────── */
-  /* Con trỏ nhấp nháy cuối bubble AI trong lúc đang stream — báo hiệu
-     "đang gõ", giống iMessage/ChatGPT. Chỉ hiện khi bubble còn "sống"
-     (class .streaming), tự mất khi turn kết thúc. */
+  /* ── Spinner "Thinking" — con trỏ nhấp nháy cuối bubble AI khi streaming */
   @keyframes caretBlink { 0%, 45% { opacity:1; } 50%, 95% { opacity:0; } 100% { opacity:1; } }
   .ai-body.streaming::after {
     content:""; display:inline-block; width:2px; height:1em; margin-left:2px;
@@ -135,69 +185,142 @@
 
   .spinner-row { display:flex; align-items:center; gap:0; font-family:"JetBrains Mono",monospace; }
   .spinner-frame { color:var(--accent); display:inline-block; width:1ch; text-align:center; }
-  .spinner-label { color:var(--accent); margin-left:6px; font-family:"Be Vietnam Pro",sans-serif; font-weight:600; }
+  .spinner-label { color:var(--accent); margin-left:6px; font-family:"Inter",sans-serif; font-weight:600; }
   .spinner-rain  { color:var(--text-dim); margin-left:8px; letter-spacing:1px; }
   .spinner-time  { color:var(--text-dim); margin-left:8px; }
 
-  /* ── Bong bóng chat: user phải / AI trái (giữ nguyên như yêu cầu) ─────
-     Animation xuất hiện: user bay vào từ phải, AI bay vào từ trái + hơi
-     phóng to từ 0.94 -> 1 (giống hiệu ứng "pop" của iMessage), cubic-bezier
-     có overshoot nhẹ để có cảm giác nảy mượt chứ không cứng. */
+  /* ── Bong bóng chat: user phải / AI trái. Bay vào từ hướng tương ứng +
+     phóng to nhẹ từ 0.85 -> 1.03 -> 1 (overshoot rồi ổn định), giống hiệu
+     ứng "pop" của iMessage khi tin nhắn xuất hiện — rõ ràng, có sức sống,
+     nhưng vẫn gọn (250ms) không gây rối mắt khi tin nhắn đến dồn dập. */
   @keyframes bubbleInUser {
-    from { opacity:0; transform: translateX(18px) scale(0.94); }
-    to   { opacity:1; transform: translateX(0) scale(1); }
+    0%   { opacity:0; transform: translateX(24px) scale(0.85); }
+    60%  { opacity:1; transform: translateX(-2px) scale(1.03); }
+    100% { opacity:1; transform: translateX(0) scale(1); }
   }
   @keyframes bubbleInAi {
-    from { opacity:0; transform: translateX(-18px) scale(0.94); }
-    to   { opacity:1; transform: translateX(0) scale(1); }
+    0%   { opacity:0; transform: translateX(-24px) scale(0.85); }
+    60%  { opacity:1; transform: translateX(2px) scale(1.03); }
+    100% { opacity:1; transform: translateX(0) scale(1); }
   }
   .bubble-wrap { display:flex; width:100%; }
   .bubble-wrap.from-user { justify-content:flex-end; }
   .bubble-wrap.from-ai   { justify-content:flex-start; }
-  .bubble-wrap.from-user .bubble { animation: bubbleInUser .38s cubic-bezier(.2,.9,.3,1.24) both; }
-  .bubble-wrap.from-ai   .bubble { animation: bubbleInAi   .38s cubic-bezier(.2,.9,.3,1.24) both; }
+  .bubble-wrap.from-user .bubble { transform-origin: right center; animation: bubbleInUser .42s cubic-bezier(.25,.85,.35,1.15) both; }
+  .bubble-wrap.from-ai   .bubble { transform-origin: left center;  animation: bubbleInAi   .42s cubic-bezier(.25,.85,.35,1.15) both; }
   .bubble {
-    max-width: 86%; border-radius:var(--radius-lg); padding:11px 15px;
-    white-space:pre-wrap; word-break:break-word; box-shadow:var(--shadow-1);
-    transition: box-shadow .18s ease, transform .12s ease;
+    position: relative; isolation: isolate; overflow: hidden;
+    max-width: 86%; border-radius:var(--radius-lg); padding:12px 16px;
+    white-space:pre-wrap; word-break:break-word;
+    transition: box-shadow .3s cubic-bezier(.22,.7,.3,1), transform .18s cubic-bezier(.22,.7,.3,1), backdrop-filter .3s ease;
   }
-  .bubble.user { background:var(--user-bg); color:#fbf7ee; border-bottom-right-radius:4px; }
-  .bubble.ai   { background:var(--bg-panel); color:var(--text); border:1px solid var(--border-soft);
-                 border-bottom-left-radius:4px; }
-  /* Tap feedback nhẹ, giống bong bóng iMessage lún xuống khi chạm */
-  .bubble:active { transform: scale(0.985); }
+  /* Sheen quét chéo qua bubble — nhịp "nhanh – chậm (giữa) – nhanh": vì
+     @keyframes chạy trên timeline ĐỀU theo % thời gian, muốn có tốc độ
+     khác nhau ở từng đoạn thì phải đặt các mốc VỊ TRÍ không cách đều nhau
+     theo % thời gian tương ứng — đoạn nào cần "chậm" thì quãng đường di
+     chuyển giữa 2 mốc % gần nhau phải NGẮN, đoạn "nhanh" thì quãng đường
+     giữa 2 mốc % gần nhau phải DÀI. Ở đây: 0%→25% (nhanh, đi được 60%
+     quãng đường: -140%→-20%), 25%→65% (chậm, chỉ đi thêm 20%: -20%→0%,
+     nằm khựng gần giữa khung để mắt kịp thấy ánh sáng), 65%→100% (nhanh
+     lại, thoát hẳn ra ngoài: 0%→150%). Tổng thời lượng kéo dài hơn bản cũ
+     để 3 nhịp đủ rõ ràng, không bị "lướt qua" như 1 pha đơn. */
+  @keyframes bubbleSheenSweep {
+    0%   { transform: translateX(-140%) rotate(3deg); opacity: 0; }
+    8%   { opacity: 1; }
+    25%  { transform: translateX(-20%)  rotate(3deg); }
+    65%  { transform: translateX(4%)    rotate(3deg); opacity: 1; }
+    88%  { opacity: 1; }
+    100% { transform: translateX(150%) rotate(3deg); opacity: 0; }
+  }
+  .bubble::before {
+    content: ""; position: absolute; inset: -60% -20%; z-index: 1;
+    background: linear-gradient(115deg,
+      transparent 28%,
+      rgba(255,150,120,0.16) 43%,
+      rgba(255,255,255,0.55) 48%, rgba(255,255,255,0.72) 50%, rgba(255,255,255,0.55) 52%,
+      rgba(140,170,255,0.16) 57%,
+      transparent 72%);
+    opacity: 0;
+    animation: bubbleSheenSweep 1.5s linear .15s 1 forwards;
+    pointer-events: none;
+  }
+  /* Chạm/tap: quét lại cùng nhịp 3 pha, nhanh hơn 1 chút cho phản hồi tức
+     thời (500ms rút gọn tỷ lệ, giữ nguyên hình dạng nhịp qua %). */
+  .bubble:active::before {
+    animation: bubbleSheenSweep .9s linear 0s 1 forwards;
+  }
+  .bubble.user {
+    background: linear-gradient(165deg, rgba(107,130,100,0.62), rgba(79,95,76,0.68));
+    backdrop-filter: blur(18px) saturate(1.6);
+    -webkit-backdrop-filter: blur(18px) saturate(1.6);
+    color:#fbfaf5; border:1px solid rgba(255,255,255,0.22);
+    border-bottom-right-radius:4px;
+    box-shadow:
+      0 1px 0 rgba(255,255,255,0.22) inset,
+      0 -6px 14px rgba(0,0,0,0.12) inset,
+      0 6px 16px rgba(61,56,46,0.16),
+      0 1px 2px rgba(61,56,46,0.12);
+  }
+  .bubble.ai   {
+    background: rgba(255,254,251,0.5);
+    backdrop-filter: blur(20px) saturate(1.6);
+    -webkit-backdrop-filter: blur(20px) saturate(1.6);
+    color:var(--text); border:1px solid rgba(255,255,255,0.6);
+    border-bottom-left-radius:4px;
+    box-shadow:
+      0 1px 0 rgba(255,255,255,0.75) inset,
+      0 -4px 10px rgba(61,56,46,0.03) inset,
+      0 6px 16px rgba(61,56,46,0.09),
+      0 1px 2px rgba(61,56,46,0.06);
+  }
+  .bubble:active {
+    transform: scale(0.985);
+  }
+  .bubble.user:active {
+    backdrop-filter: blur(13px) saturate(1.8);
+    -webkit-backdrop-filter: blur(13px) saturate(1.8);
+  }
+  .bubble.ai:active {
+    backdrop-filter: blur(14px) saturate(1.8);
+    -webkit-backdrop-filter: blur(14px) saturate(1.8);
+  }
 
-  /* ── Nhóm tool (nhánh cha-con) ─────────────────────────────────────────
-     tool_start mở 1 "group": khung bo tròn bao ngoài, đường nối dọc màu
-     accent bên trái nối tool_start -> mọi con (info raw, tool_end...) ->
-     kết thúc khi group đóng (turn_end / step / bubble mới). Mỗi con thụt
-     lề thêm so với cha, có chấm nối nhỏ trên đường dọc để rõ là 1 nhánh. */
+  /* ── Nhóm tool (cha-con) ─────────────────────────────────────────── */
   .tool-group {
     background:var(--bg-panel); border:1px solid var(--border-soft); border-radius:var(--radius-md);
     padding:10px 12px 10px 0; margin:0 4px; position:relative; overflow:hidden;
-    box-shadow:var(--shadow-2), -3px 0 0 0 var(--accent) inset;
+    box-shadow:
+      0 1px 0 rgba(255,255,255,0.7) inset,
+      0 4px 12px rgba(61,56,46,0.06),
+      -3px 0 0 0 var(--accent) inset;
+    transition: box-shadow .25s cubic-bezier(.22,.7,.3,1);
   }
   .tool-group-head {
     display:flex; align-items:baseline; gap:8px; padding:0 12px 8px 14px;
     font-weight:600;
   }
-  .tool-group-head .tool-icon { font-size:14px; }
+  .tool-group-head .tool-icon { font-size:13px; opacity:.75; }
   .tool-group-head .tool-name { color:var(--text); }
-  .tool-group-head .tool-brief { color:var(--text-dim); font-weight:400; font-size:12.5px; }
-  .tool-group.denied { border-color:#e0b3a8; background:#fdf4f1;
-    box-shadow:var(--shadow-2), -3px 0 0 0 var(--err) inset; }
+  .tool-group-head .tool-brief { color:var(--text-dim); font-weight:400; font-size:12.5px; white-space:pre-wrap; word-break:break-word; }
+  .tool-arg-chip {
+    background:var(--bg-sunken); border-radius:6px; padding:1px 6px;
+    display:inline-block; max-width:100%;
+    white-space:pre-wrap; word-break:break-word; vertical-align:bottom;
+  }
+  .tool-group.denied { border-color:#ddbcb0; background:#fbf2ee;
+    box-shadow:var(--shadow-1), -3px 0 0 0 var(--err) inset; }
 
   .tool-children { position:relative; margin-left:14px; padding-left:16px; }
   .tool-children::before {
-    content:""; position:absolute; left:0; top:2px; bottom:8px; width:2px;
+    content:""; position:absolute; left:0; top:2px; bottom:8px; width:1.5px;
     background:var(--border); border-radius:2px;
   }
   .tool-child {
     position:relative; padding:5px 10px 5px 8px; color:var(--text-dim);
-    font-size:12.5px; line-height:1.5;
+    font-size:12.5px; line-height:1.5; white-space:pre-wrap; word-break:break-word;
   }
   .tool-child::before {
-    content:""; position:absolute; left:-16px; top:12px; width:12px; height:2px;
+    content:""; position:absolute; left:-16px; top:12px; width:12px; height:1.5px;
     background:var(--border);
   }
   .tool-child.child-info { color:var(--text); background:var(--bg-sunken);
@@ -206,29 +329,16 @@
   .tool-child.child-err  { color:var(--err); }
   .tool-child.child-denied { color:var(--err); font-weight:500; }
 
-  /* ── info-card độc lập (không thuộc group nào, vd /help, step, turn_end) */
+  /* ── info-card độc lập */
   .info-card {
     background:var(--bg-panel); border:1px solid var(--border-soft); border-radius:var(--radius-md);
-    padding:10px 13px; margin:0 4px; color:var(--text); box-shadow:var(--shadow-1);
+    padding:11px 14px; margin:0 4px; color:var(--text); box-shadow:var(--shadow-1);
   }
   .info-card.raw-info { font-family:"JetBrains Mono",monospace; font-size:12.5px; background:var(--bg-sunken); }
-  .info-card.warn { border-color:#e2c48a; background:#fbf3e2; color:#8a611f;
-    box-shadow:var(--shadow-1), 0 0 0 1px rgba(184,134,58,0.12); }
-  .info-card.err  { border-color:#e0b3a8; background:#fdf4f1; color:#943f2e;
-    box-shadow:var(--shadow-1), 0 0 0 1px rgba(182,80,63,0.12); }
+  .info-card.warn { border-color:#dcc190; background:#f9f1e0; color:#7d5a24; box-shadow:var(--shadow-1); }
+  .info-card.err  { border-color:#ddb2a5; background:#fbf1ed; color:#833a2a; box-shadow:var(--shadow-1); }
   .info-card.step { background:transparent; border:none; box-shadow:none; padding:2px 13px; color:var(--text-dim);
     font-family:"JetBrains Mono",monospace; font-size:12px; }
-  /* BUG ĐÃ SỬA: appendThinkingDelta() gán class "think" vào card
-     (appendStandaloneCard(html, "think") -> div.className = "row
-     info-card think") nhưng chưa từng có CSS định nghĩa .think -- thinking
-     hiện ra y hệt info-card thường (nền trắng, chữ đen, không khác gì câu
-     trả lời), không có "bọc" trực quan để phân biệt đây là SUY NGHĨ NỘI BỘ
-     của AI chứ không phải câu trả lời chính thức. Trên CLI, thinking vốn
-     in màu nhạt (DIM) -- style dưới đây tái tạo đúng tinh thần đó: nền lõm
-     nhẹ + chữ nhạt màu + nghiêng + viền đứt để rõ ràng là "phần suy nghĩ",
-     không lẫn với info-card/bubble AI thường.
-     .think-label = phần "[thinking]" ở đầu -- tô đậm + màu accent nhẹ để
-     dễ nhận ra ngay không cần đọc hết nội dung. */
   .info-card.think {
     background:var(--bg-sunken); border:1px dashed var(--border-soft);
     color:var(--text-dim); font-style:italic; box-shadow:none;
@@ -239,100 +349,90 @@
   }
   .info-card.think .think-body { white-space:pre-wrap; }
 
-  .ask-box { border:1px solid var(--warn); background:#fbf3e2; border-radius:var(--radius-md);
-             padding:12px 14px; margin:0 4px;
-             box-shadow:var(--shadow-2), 0 0 0 3px rgba(184,134,58,0.10);
+  .ask-box { border:1px solid #dcc190; background:#f9f1e0; border-radius:var(--radius-md);
+             padding:13px 15px; margin:0 4px;
+             box-shadow:var(--shadow-2);
              transition: opacity .35s ease, filter .35s ease, box-shadow .35s ease, transform .35s ease; }
-  .ask-prompt { color:#8a611f; margin-bottom:8px; white-space:pre-wrap; font-weight:500; }
+  .ask-prompt { color:#7d5a24; margin-bottom:9px; white-space:pre-wrap; font-weight:500; }
   .ask-actions { display:flex; gap:8px; flex-wrap:wrap; }
-  .ask-btn { background:var(--bg-panel); color:var(--text); border:1px solid var(--border);
-             border-radius:var(--radius-sm); padding:8px 15px; font-size:13px; font-weight:600;
-             cursor:pointer; box-shadow:var(--shadow-1); transition:transform .08s, box-shadow .08s; }
-  .ask-btn:active { transform:translateY(1px); box-shadow:none; }
-  .ask-btn.yes { background:var(--accent-2); border-color:var(--accent-2); color:#fff;
-    box-shadow:0 2px 8px rgba(122,143,92,0.35); }
-  .ask-btn.no  { background:var(--err); border-color:var(--err); color:#fff;
-    box-shadow:0 2px 8px rgba(182,80,63,0.3); }
-  .ask-input { display:flex; gap:8px; margin-top:8px; }
+  .ask-btn {
+    position: relative; isolation: isolate; overflow: hidden;
+    background:var(--bg-panel); color:var(--text); border:1px solid var(--border);
+    border-radius:var(--radius-sm); padding:9px 16px; font-size:13px; font-weight:600;
+    cursor:pointer;
+    box-shadow: 0 1px 1px rgba(255,255,255,0.7) inset, 0 2px 6px rgba(61,56,46,0.07);
+    transition:transform .15s cubic-bezier(.3,1.3,.5,1), box-shadow .2s cubic-bezier(.22,.7,.3,1);
+  }
+  .ask-btn::before {
+    content: ""; position: absolute; inset: -70% -10%; z-index: 1;
+    background: linear-gradient(115deg,
+      transparent 32%, rgba(255,255,255,0.55) 48%, rgba(255,255,255,0.7) 50%,
+      rgba(255,255,255,0.55) 52%, transparent 68%);
+    transform: translateX(-140%) rotate(6deg);
+    transition: transform .5s cubic-bezier(.22,.7,.3,1);
+    pointer-events: none;
+  }
+  .ask-btn:hover::before { transform: translateX(30%) rotate(6deg); }
+  .ask-btn:active { transform:scale(0.96) translateY(1px);
+    box-shadow: 0 1px 1px rgba(255,255,255,0.5) inset, 0 1px 2px rgba(61,56,46,0.08); }
+  .ask-btn.yes { background:linear-gradient(160deg, #92a682, var(--accent-2)); border-color:var(--accent-2); color:#fff;
+    box-shadow: 0 1px 1px rgba(255,255,255,0.35) inset, 0 -2px 5px rgba(0,0,0,0.1) inset, 0 3px 10px rgba(124,143,108,0.35); }
+  .ask-btn.no  { background:linear-gradient(160deg, #c17e6d, var(--err)); border-color:var(--err); color:#fff;
+    box-shadow: 0 1px 1px rgba(255,255,255,0.35) inset, 0 -2px 5px rgba(0,0,0,0.1) inset, 0 3px 10px rgba(173,88,71,0.3); }
+  .ask-input { display:flex; gap:8px; margin-top:9px; }
   .ask-input input { flex:1; background:var(--bg-panel); border:1px solid var(--border); border-radius:var(--radius-sm);
-                      color:var(--text); padding:8px 10px; font-size:14px; font-family:inherit; }
+                      color:var(--text); padding:9px 11px; font-size:14px; font-family:inherit; }
   .ask-input button { background:var(--accent-2); color:#fff; border:none; border-radius:var(--radius-sm);
-                       padding:8px 16px; font-weight:600; font-size:13px; cursor:pointer;
-                       box-shadow:0 2px 8px rgba(122,143,92,0.35); transition:transform .08s; }
+                       padding:9px 17px; font-weight:600; font-size:13px; cursor:pointer;
+                       box-shadow:0 2px 8px rgba(124,143,108,0.3); transition:transform .08s; }
   .ask-input button:active { transform:translateY(1px); }
-  /* Sau khi trả lời: ô nhập + nút OK không còn ý nghĩa gì nữa (giá trị đã
-     gửi, đã có dòng ✓ answer-tag hiện riêng) — ẩn hẳn luôn, không chỉ mờ,
-     để không còn cảnh "gõ xong vẫn thấy y nguyên chữ mình vừa gõ trong ô". */
   .ask-answered .ask-input,
   .ask-answered .ask-actions { display:none; }
-  /* Sau khi trả lời: mờ hẳn + hạ bóng + khoá cứng mọi tương tác (nút/ô
-     nhập không bấm/gõ được nữa dù còn nằm trong DOM) — trước đây chỉ giảm
-     opacity nhẹ (0.55) không transition, nhìn gần như không đổi gì, dễ
-     hiểu lầm là "chưa trả lời". Giờ mờ rõ (0.4) + bớt sắc nét (saturate)
-     + tắt hẳn con trỏ/click, chuyển mượt .35s thay vì đổi cứng. */
   .ask-answered {
-    opacity: 0.4;
-    filter: saturate(0.6);
+    opacity: 0.42;
+    filter: saturate(0.65);
     box-shadow: var(--shadow-1);
     pointer-events: none;
   }
   .ask-answered .ask-btn,
   .ask-answered .ask-input button { cursor: default; }
-  /* Dòng "→ đã chọn gì" đứng NGOÀI .ask-box (xem renderAsk/answerAndLock)
-     nên không bị opacity/filter của cha kéo theo — CSS opacity áp dụng
-     theo compositing layer, con dù set opacity:1 riêng vẫn bị nhân với
-     opacity cha nếu còn nằm trong DOM subtree đó, nên cách đúng là tách
-     hẳn ra làm sibling thay vì cố ép style con. */
   .ask-answer-tag {
     display:flex; align-items:center; gap:6px; margin:6px 8px 0;
     font-weight:600; color:var(--accent-2); font-size:13px;
-    animation: rowIn .3s cubic-bezier(.25,.8,.35,1) both;
+    animation: rowIn .28s cubic-bezier(.22,.7,.3,1) both;
   }
-  /* ── Card ask-box biến mất hẳn sau khi trả lời (mọi kind: confirm/choice/
-     text/model_picker) — xem answerAndLock(). Trước đây chỉ mờ (.ask-answered,
-     opacity:0.4) và NẰM NGUYÊN trong DOM; giờ sau khi mờ xong, box thu nhỏ +
-     fade out rồi bị gỡ khỏi DOM thật sự (box.remove()), dòng "✓ đã chọn gì"
-     (.ask-answer-tag) vẫn đứng lại một mình làm dấu vết đã trả lời. */
   @keyframes askBoxOut {
     from { opacity:1; transform: scale(1) translateY(0); max-height:400px; margin-bottom:0; }
-    to   { opacity:0; transform: scale(0.92) translateY(-6px); max-height:0; margin-bottom:-8px; }
+    to   { opacity:0; transform: scale(0.95) translateY(-4px); max-height:0; margin-bottom:-8px; }
   }
   .ask-box-leaving {
-    animation: askBoxOut .32s cubic-bezier(.4,0,.2,1) both;
+    animation: askBoxOut .3s cubic-bezier(.4,0,.2,1) both;
     overflow:hidden; pointer-events:none;
   }
-  /* ── Từng dòng model hiện lần lượt (stagger) khi mở /model hoặc đổi trang ─
-     Mỗi .model-picker-item được gắn --i (index trong trang hiện tại) qua JS,
-     animation-delay tính từ đó -> hiệu ứng "rơi xuống" tuần tự thay vì cả
-     list bật ra cùng lúc. */
   @keyframes modelItemIn {
-    from { opacity:0; transform: translateY(6px); }
+    from { opacity:0; transform: translateY(4px); }
     to   { opacity:1; transform: translateY(0); }
   }
   .model-picker-item {
-    animation: modelItemIn .28s cubic-bezier(.25,.8,.35,1) both;
-    animation-delay: calc(var(--i, 0) * 35ms);
+    animation: modelItemIn .24s cubic-bezier(.22,.7,.3,1) both;
+    animation-delay: calc(var(--i, 0) * 28ms);
   }
-  /* ── Chuyển trang (◀ Trước / Sau ▶): list trượt nhẹ theo hướng chuyển +
-     fade, thay vì innerHTML="" đổi cứng không báo hiệu gì. Hướng trượt do
-     JS quyết định qua class .picker-page-next / .picker-page-prev đặt tạm
-     lên .model-picker-list trước khi render trang mới. */
   @keyframes pickerPageInNext {
-    from { opacity:0; transform: translateX(14px); }
+    from { opacity:0; transform: translateX(10px); }
     to   { opacity:1; transform: translateX(0); }
   }
   @keyframes pickerPageInPrev {
-    from { opacity:0; transform: translateX(-14px); }
+    from { opacity:0; transform: translateX(-10px); }
     to   { opacity:1; transform: translateX(0); }
   }
-  .model-picker-list.picker-page-next { animation: pickerPageInNext .26s cubic-bezier(.25,.8,.35,1) both; }
-  .model-picker-list.picker-page-prev { animation: pickerPageInPrev .26s cubic-bezier(.25,.8,.35,1) both; }
-  /* ── /model picker (Web UI only, xem renderModelPicker) ─────────────── */
+  .model-picker-list.picker-page-next { animation: pickerPageInNext .24s cubic-bezier(.22,.7,.3,1) both; }
+  .model-picker-list.picker-page-prev { animation: pickerPageInPrev .24s cubic-bezier(.22,.7,.3,1) both; }
+
   .model-picker { margin-top:6px; }
   .model-picker-search input {
     width:100%; box-sizing:border-box; background:var(--bg-panel);
     border:1px solid var(--border); border-radius:var(--radius-sm);
-    color:var(--text); padding:8px 10px; font-size:14px; font-family:inherit;
+    color:var(--text); padding:9px 11px; font-size:14px; font-family:inherit;
     margin-bottom:8px;
   }
   .model-picker-list {
@@ -345,7 +445,7 @@
   .model-picker-item {
     display:flex; align-items:center; justify-content:space-between; gap:8px;
     background:var(--bg-panel); border:1px solid var(--border);
-    border-radius:var(--radius-sm); padding:8px 12px; font-size:13.5px;
+    border-radius:var(--radius-sm); padding:9px 12px; font-size:13.5px;
     font-family:"JetBrains Mono",monospace; color:var(--text);
     cursor:pointer; text-align:left; width:100%; box-sizing:border-box;
     transition:transform .08s, box-shadow .08s, background .12s;
@@ -361,7 +461,7 @@
   .model-picker-page-btn {
     background:var(--accent-2); color:#fff; border:none; border-radius:var(--radius-sm);
     padding:7px 14px; font-weight:600; font-size:12.5px; cursor:pointer;
-    box-shadow:0 2px 8px rgba(122,143,92,0.35); transition:transform .08s, opacity .08s;
+    box-shadow:0 2px 8px rgba(124,143,108,0.3); transition:transform .08s, opacity .08s;
   }
   .model-picker-page-btn:active { transform:translateY(1px); }
   .model-picker-page-btn:disabled {
@@ -371,120 +471,161 @@
   .ask-answer-tag::before { content:"✓"; }
 
   #inputBar { flex:0 0 auto; display:flex; align-items:center; gap:8px;
-              background:rgba(239,231,216,0.75); backdrop-filter:blur(10px);
-              -webkit-backdrop-filter:blur(10px);
-              border-top:1px solid var(--border); box-shadow:0 -1px 8px rgba(74,64,48,0.05);
+              background:rgba(238,233,221,0.78); backdrop-filter:blur(16px) saturate(1.2);
+              -webkit-backdrop-filter:blur(16px) saturate(1.2);
+              border-top:1px solid var(--border-soft); box-shadow:0 -2px 10px rgba(61,56,46,0.04);
               padding:10px 10px calc(10px + env(safe-area-inset-bottom, 0px)); position:relative; }
   #inputField {
     flex:1 1 auto; min-width:0; background:var(--bg-panel); border:1px solid var(--border-soft);
     border-radius:999px; outline:none; color:var(--text); font-family:inherit; font-size:15px;
     padding:12px 18px; height:46px;
-    box-shadow:inset 0 1px 3px rgba(74,64,48,0.06); transition:border-color .15s, box-shadow .15s;
+    box-shadow:inset 0 1px 2px rgba(61,56,46,0.05); transition:border-color .15s, box-shadow .15s;
   }
-  #inputField:focus { border-color:var(--accent); box-shadow:inset 0 1px 3px rgba(74,64,48,0.06), 0 0 0 3px rgba(193,122,63,0.14); }
-  /* Khoá xám khi disabled (busy hoặc /model picker đang chờ chọn) — trước
-     đây không có rule riêng nên chỉ dựa vào default trình duyệt, mờ rất
-     nhẹ và không rõ là "đang khoá" hay "đang lỗi gì đó". */
+  #inputField:focus { border-color:var(--accent); box-shadow:inset 0 1px 2px rgba(61,56,46,0.05), 0 0 0 3px rgba(176,138,78,0.14); }
   #inputField:disabled {
     background:var(--bg-sunken); color:var(--text-dim);
     border-color:var(--border-soft); box-shadow:none; cursor:not-allowed;
   }
-  /* ── Nút gửi/ngắt: hình tròn đều nhau, cân với chiều cao ô nhập, icon
-     thay vì chữ thô "^C"/"Gửi" — gọn, cân đối, đỡ chiếm ngang trên màn
-     hình nhỏ, và rõ nghĩa hơn qua hình dạng mũi tên/dấu dừng thay vì phải
-     đọc chữ viết tắt. */
+  /* ── Nút tròn liquid-glass: nổi khối rõ (highlight trên + shadow đổ dưới
+     kiểu "viên kẹo kính" của iOS), kèm dải sáng quét chéo khi chạm/hover —
+     mô phỏng ánh sáng trượt qua bề mặt kính lồi khi ngón tay lướt qua. */
   #sendBtn, #ctrlBtn {
+    position: relative; isolation: isolate; overflow: hidden;
     flex:0 0 auto; width:46px; height:46px; border:none; border-radius:50%;
     display:flex; align-items:center; justify-content:center;
     font-size:15px; font-weight:700; cursor:pointer; padding:0;
-    transition:transform .1s cubic-bezier(.34,1.56,.64,1), box-shadow .12s, filter .12s;
+    transition:transform .18s cubic-bezier(.3,1.4,.5,1), box-shadow .25s cubic-bezier(.22,.7,.3,1), filter .12s;
   }
-  #sendBtn:active, #ctrlBtn:active { transform:scale(0.9); filter:brightness(0.96); }
-  #sendBtn { background:linear-gradient(155deg, var(--accent-2), #6a8050); color:#fff;
-    box-shadow:0 3px 10px rgba(122,143,92,0.4); }
+  #sendBtn::before, #ctrlBtn::before {
+    content: ""; position: absolute; inset: -70% -10%; z-index: 2;
+    background: linear-gradient(115deg,
+      transparent 26%,
+      rgba(255,150,120,0.22) 40%,
+      rgba(255,255,255,0.65) 47%, rgba(255,255,255,0.9) 50%, rgba(255,255,255,0.65) 53%,
+      rgba(140,170,255,0.22) 60%,
+      transparent 74%);
+    transform: translateX(-140%) rotate(8deg);
+    transition: transform .55s cubic-bezier(.22,.7,.3,1);
+    pointer-events: none;
+  }
+  #sendBtn:hover::before, #ctrlBtn:hover::before { transform: translateX(30%) rotate(8deg); }
+  #sendBtn:active, #ctrlBtn:active { transform:scale(0.9); filter:brightness(0.98); }
+  #sendBtn:active::before, #ctrlBtn:active::before { transform: translateX(60%) rotate(8deg); }
+  #sendBtn { background:linear-gradient(160deg, #8ba07a, var(--accent-2) 55%, #5c7050); color:#fff;
+    box-shadow:
+      0 1px 1px rgba(255,255,255,0.4) inset,
+      0 -3px 6px rgba(0,0,0,0.14) inset,
+      0 5px 14px rgba(124,143,108,0.4),
+      0 2px 4px rgba(61,56,46,0.12); }
+  #sendBtn:active { box-shadow:
+      0 1px 1px rgba(255,255,255,0.3) inset,
+      0 -2px 5px rgba(0,0,0,0.18) inset,
+      0 2px 6px rgba(124,143,108,0.35); }
   #sendBtn:disabled { background:var(--border-soft); color:var(--text-dim); cursor:not-allowed;
     box-shadow:none; }
-  #ctrlBtn { background:rgba(255,253,248,0.7); color:var(--err); border:1.5px solid rgba(182,80,63,0.35);
-    box-shadow:var(--shadow-1); font-size:12px; }
-  #ctrlBtn:hover { background:rgba(182,80,63,0.08); }
+  #ctrlBtn { background:rgba(255,254,251,0.8); color:var(--err); border:1.5px solid rgba(173,88,71,0.3);
+    backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+    box-shadow:
+      0 1px 1px rgba(255,255,255,0.8) inset,
+      0 3px 8px rgba(61,56,46,0.08),
+      0 1px 2px rgba(61,56,46,0.05);
+    font-size:12px; }
+  #ctrlBtn:hover { background:rgba(173,88,71,0.08); }
+  #ctrlBtn:active { box-shadow:
+      0 1px 1px rgba(255,255,255,0.6) inset,
+      0 1px 3px rgba(61,56,46,0.1); }
 
   /* ── Gợi ý lệnh slash ─────────────────────────────────────────────── */
   #slashHint {
     position:absolute; left:10px; right:10px; bottom:100%;
-    max-height:45vh; overflow-y:auto; background:rgba(255,253,248,0.92); backdrop-filter:blur(10px);
-    -webkit-backdrop-filter:blur(10px); border:1px solid var(--border);
+    max-height:45vh; overflow-y:auto; background:rgba(255,254,251,0.94); backdrop-filter:blur(14px);
+    -webkit-backdrop-filter:blur(14px); border:1px solid var(--border);
     border-radius:var(--radius-md); margin-bottom:8px; display:none;
     box-shadow:var(--shadow-2);
   }
   #slashHint.show { display:block; }
   .slash-item { display:flex; gap:10px; align-items:baseline; padding:10px 14px;
-    font-size:13.5px; cursor:pointer; border-bottom:1px solid var(--border); }
+    font-size:13.5px; cursor:pointer; border-bottom:1px solid var(--border-soft); }
   .slash-item:last-child { border-bottom:none; }
   .slash-item:active, .slash-item.active { background:var(--bg-sunken); }
   .slash-item .cmd { color:var(--accent); font-weight:700; flex:0 0 auto; font-family:"JetBrains Mono",monospace; }
   .slash-item .desc { color:var(--text-dim); flex:1 1 auto; text-overflow:ellipsis; overflow:hidden; white-space:nowrap; }
 
-  /* ── Turn wrapper: bọc mọi log-tool của 1 turn + nút ẩn/hiện nằm ngay
-     dưới bubble AI cuối turn đó. Mặc định log ẩn (chỉ hiện chat).
-     Animation "cuộn ra": dùng kỹ thuật grid-template-rows 0fr -> 1fr thay
-     vì display:none/flex (tức thì, không mượt) hay max-height cố định
-     (giật vì height thật luôn khác con số đoán trước) -- grid-rows animate
-     đúng chiều cao nội dung thật, mượt ở mọi kích cỡ log. Kèm opacity +
-     translateY nhẹ để có cảm giác log "trượt/cuộn ra" từ dưới nút xuống,
-     giống hiệu ứng mở rộng kiểu iOS. */
+  /* ── Turn wrapper: log-tool ẩn mặc định, mở bằng nút toggle. Cùng kỹ
+     thuật grid-template-rows 0fr -> 1fr cho animation mượt đúng chiều
+     cao thật, kèm khung kính đơn sắc bao ngoài khi mở. */
   .turn-logs {
     display:grid; grid-template-rows:0fr; opacity:0; margin-top:0;
-    transition:grid-template-rows .32s cubic-bezier(.25,.8,.35,1),
-               opacity .26s ease, margin-top .32s cubic-bezier(.25,.8,.35,1);
+    transition:grid-template-rows .3s cubic-bezier(.22,.7,.3,1),
+               opacity .24s ease, margin-top .3s cubic-bezier(.22,.7,.3,1);
   }
   .turn-logs > .turn-logs-inner {
     overflow:hidden; display:flex; flex-direction:column; gap:10px;
-    min-height:0; transform:translateY(-6px); transition:transform .32s cubic-bezier(.25,.8,.35,1);
+    min-height:0; transform:translateY(-4px); transition:transform .3s cubic-bezier(.22,.7,.3,1);
   }
   .turn-logs.open {
     grid-template-rows:1fr; opacity:1; margin-top:2px;
   }
   .turn-logs.open > .turn-logs-inner { transform:translateY(0); }
 
-  /* Khung kính bao ngoài khối log khi mở — cùng chất "liquid glass" với
-     nút toggle, tạo cảm giác cả cụm log là 1 mặt kính nổi lên, không phải
-     nút và log rời rạc. */
   .turn-logs-inner {
     padding:10px; border-radius:var(--radius-lg);
-    background:rgba(255,253,248,0.4); backdrop-filter:blur(16px) saturate(1.5);
-    -webkit-backdrop-filter:blur(16px) saturate(1.5);
+    background:rgba(255,254,251,0.45); backdrop-filter:blur(18px) saturate(1.3);
+    -webkit-backdrop-filter:blur(18px) saturate(1.3);
     border:1px solid var(--border-soft);
   }
 
   .turn-toggle-row { display:flex; justify-content:flex-start; margin:0 4px; }
   .turn-toggle {
     display:inline-flex; align-items:center; gap:6px;
-    background:rgba(255,253,248,0.55); backdrop-filter:blur(14px) saturate(1.6);
-    -webkit-backdrop-filter:blur(14px) saturate(1.6);
+    background:rgba(255,254,251,0.55); backdrop-filter:blur(16px) saturate(1.3);
+    -webkit-backdrop-filter:blur(16px) saturate(1.3);
     border:1px solid var(--border-soft); border-radius:999px;
     padding:5px 12px 5px 10px; font-size:12px; font-weight:600; color:var(--text-dim);
     cursor:pointer; overflow:hidden; position:relative;
-    box-shadow:var(--shadow-1);
-    transition:transform .08s, box-shadow .18s, color .12s, background .18s;
+    box-shadow:
+      0 1px 1px rgba(255,255,255,0.6) inset,
+      0 2px 6px rgba(61,56,46,0.07);
+    transition:transform .15s cubic-bezier(.3,1.3,.5,1), box-shadow .22s cubic-bezier(.22,.7,.3,1), color .12s, background .18s;
   }
-  .turn-toggle:active { transform:translateY(1px); }
-  .turn-toggle:hover { color:var(--text); box-shadow:var(--shadow-2); }
+  .turn-toggle:active { transform:scale(0.97) translateY(1px); }
+  .turn-toggle:hover { color:var(--text); box-shadow:
+      0 1px 1px rgba(255,255,255,0.7) inset,
+      0 4px 12px rgba(61,56,46,0.1); }
   .turn-toggle.open {
-    color:var(--text); background:rgba(255,253,248,0.75);
-    box-shadow:var(--shadow-2), 0 0 0 1px rgba(193,122,63,0.12);
+    color:var(--text); background:rgba(255,254,251,0.8);
+    box-shadow:
+      0 1px 1px rgba(255,255,255,0.7) inset,
+      0 -1px 3px rgba(61,56,46,0.05) inset,
+      0 4px 12px rgba(61,56,46,0.1);
   }
-  .turn-toggle .chev { font-size:10px; transition:transform .28s cubic-bezier(.25,.8,.35,1); display:inline-block; }
+  .turn-toggle .chev { font-size:10px; transition:transform .26s cubic-bezier(.22,.7,.3,1); display:inline-block; }
   .turn-toggle.open .chev { transform:rotate(90deg); }
   .turn-toggle .tool-count {
     background:var(--bg-sunken); color:var(--text); border-radius:999px;
     padding:1px 7px; font-size:11px; font-weight:700; transition:background .18s;
   }
-  .turn-toggle.open .tool-count { background:rgba(193,122,63,0.16); }
+  .turn-toggle.open .tool-count { background:rgba(176,138,78,0.16); }
+
+  /* ── Live preview: log-tool ĐANG CHẠY hiện ngay dưới chat, animate vào
+     khi xuất hiện, animate "hút" xuống khi bị thay bởi log mới hoặc khi
+     turn kết thúc (rơi vào đúng vị trí nút "Xem chi tiết"). */
+  .live-slot {
+    display:grid; grid-template-rows:1fr; opacity:1;
+    transition:grid-template-rows .28s cubic-bezier(.4,0,.2,1),
+               opacity .22s ease, margin-top .28s cubic-bezier(.4,0,.2,1);
+    margin-top:2px;
+  }
+  .live-slot > div { overflow:hidden; min-height:0; }
+  .live-slot.collapsing {
+    grid-template-rows:0fr; opacity:0; margin-top:0;
+  }
+  .live-slot.entering > div { animation: rowIn .26s cubic-bezier(.22,.7,.3,1) both; }
 </style>
 </head>
 <body>
 <div id="wrap">
-  <div id="bar" class="glass7">
+  <div id="bar" class="glass">
     <div id="status"><span id="dot"></span><span id="statusText">Connecting…</span></div>
     <div id="meta"></div>
   </div>
@@ -656,6 +797,92 @@ let currentTurnLogs = null;
 let currentTurnLogsInner = null;
 let currentTurnToggleRow = null;
 
+// ── Live preview: log-tool ĐANG CHẠY hiện realtime dưới chat ────────────
+// Ý tưởng: dữ liệu THẬT vẫn luôn ghi vào turn-logs-inner như cũ (không đổi
+// gì luồng cũ, tránh phá summary_line/toggle/animation đã có). Ở ĐÂY chỉ
+// hiện thêm 1 bản CLONE của "đơn vị log" mới nhất (1 tool-group hoặc 1
+// info-card độc lập, tức 1 con trực tiếp của turn-logs-inner) ngay dưới
+// chat, để biết đang chạy gì realtime. Khi có đơn vị log MỚI xuất hiện ->
+// clone cũ animate "hút" xuống (collapse) rồi bị xoá, clone mới hiện ra.
+// Khi turn kết thúc -> clone cuối cùng cũng bị hút, không còn gì đứng
+// ngoài, đúng lúc nút "Xem chi tiết" đã có đủ toàn bộ log thật.
+//
+// BUG ĐÃ SỬA: model chạy nhiều tool liên tiếp rất nhanh (vd nhiều lệnh
+// bash dồn dập) -> log trước chưa kịp hiện rõ đã bị collapse ngay bởi log
+// sau, nhìn như "chớp nhoáng" không đọc kịp. Sửa: mỗi live-slot phải hiện
+// đủ MIN_LIVE_MS trước khi được phép bị thay -- nếu log mới tới sớm hơn,
+// CHỈ ghi nhớ lại (pendingSource, ghi đè -- không cần xếp hàng từng cái vì
+// các log cũ hơn đã nằm sẵn trong turn-logs-inner, không mất gì), rồi tự
+// động chuyển sang hiện nó ngay khi hết thời gian giữ tối thiểu.
+const MIN_LIVE_MS = 550;
+let liveSlotEl = null;       // .live-slot đang hiện trong #log
+let liveSourceEl = null;     // phần tử THẬT (trong turn-logs-inner) đang được live-slot phản chiếu
+let liveShownAt = 0;         // mốc thời gian slot hiện tại bắt đầu hiện
+let liveCollapseTimer = null;
+let livePendingSource = null; // đơn vị log mới nhất đang chờ tới lượt hiện (nếu đến quá sớm)
+let livePendingTimer = null;
+
+function collapseLiveSlot() {
+  livePendingSource = null;
+  clearTimeout(livePendingTimer);
+  if (!liveSlotEl) return;
+  const el = liveSlotEl;
+  liveSlotEl = null;
+  liveSourceEl = null;
+  el.classList.add("collapsing");
+  el.classList.remove("entering");
+  clearTimeout(liveCollapseTimer);
+  liveCollapseTimer = setTimeout(() => { el.remove(); }, 320);
+}
+
+function mountLiveSlot(sourceEl) {
+  const slot = document.createElement("div");
+  slot.className = "live-slot entering";
+  const inner = document.createElement("div");
+  inner.appendChild(sourceEl.cloneNode(true));
+  slot.appendChild(inner);
+  logEl.appendChild(slot);
+  liveSlotEl = slot;
+  liveSourceEl = sourceEl;
+  liveShownAt = performance.now();
+  scrollToBottom({ force: true });
+}
+
+// Tạo/refresh live-slot để phản chiếu sourceEl (1 con trực tiếp của
+// turn-logs-inner). Nếu sourceEl đã là cái đang hiện -> chỉ cập nhật nội
+// dung (vd tool_end thêm dòng kết quả vào group đang mở), KHÔNG collapse.
+// Nếu là đơn vị log khác -> chờ đủ MIN_LIVE_MS rồi mới chuyển, để mắt kịp
+// đọc thay vì chớp nhoáng.
+function showLiveSlot(sourceEl) {
+  if (liveSourceEl === sourceEl && liveSlotEl) {
+    // Cùng 1 đơn vị log đang mở (vd group tool vừa có thêm child) -> chỉ
+    // đồng bộ lại nội dung, giữ nguyên animation "entering" đã chạy xong.
+    const inner = liveSlotEl.firstElementChild;
+    inner.replaceChildren(sourceEl.cloneNode(true));
+    scrollToBottom();
+    return;
+  }
+  const elapsed = performance.now() - liveShownAt;
+  if (liveSlotEl && elapsed < MIN_LIVE_MS) {
+    // Chưa hiện đủ lâu -> chỉ ghi nhớ, không đổi ngay. Nếu có nhiều log
+    // dồn dập tới trong lúc chờ, cái sau ghi đè cái trước -- luôn hiện
+    // cái MỚI NHẤT khi tới lượt, không cần xem lần lượt từng cái trung
+    // gian (chúng vẫn nằm đủ trong "Xem chi tiết").
+    livePendingSource = sourceEl;
+    clearTimeout(livePendingTimer);
+    livePendingTimer = setTimeout(() => {
+      const next = livePendingSource;
+      livePendingSource = null;
+      if (!next) return;
+      collapseLiveSlot();
+      mountLiveSlot(next);
+    }, MIN_LIVE_MS - elapsed);
+    return;
+  }
+  collapseLiveSlot();
+  mountLiveSlot(sourceEl);
+}
+
 function ensureTurnLogs() {
   if (currentTurnLogsInner) return currentTurnLogsInner;
   currentTurnLogs = document.createElement("div");
@@ -671,7 +898,7 @@ function ensureTurnToggle(logsEl) {
   const row = document.createElement("div");
   row.className = "turn-toggle-row";
   const btn = document.createElement("button");
-  btn.className = "turn-toggle glass7";
+  btn.className = "turn-toggle glass";
   btn.innerHTML = '<span class="chev">▶</span><span class="label">Xem chi tiết</span><span class="tool-count">0</span>';
   btn.addEventListener("click", () => {
     const open = logsEl.classList.toggle("open");
@@ -722,6 +949,7 @@ function closeTurnLogs() {
   }
   currentTurnLogs = null;
   currentTurnLogsInner = null;
+  collapseLiveSlot(); // turn đóng -> log đang hiện realtime "hút" vào nút toggle
 }
 
 function appendRow(html, cls) {
@@ -740,6 +968,7 @@ function appendLogRow(html, cls) {
   div.className = "row" + (cls ? " " + cls : "");
   div.innerHTML = html;
   turnLogTarget().appendChild(div);
+  showLiveSlot(div);
   scrollToBottom();
   return div;
 }
@@ -752,6 +981,7 @@ function appendInfoCard(html, extraCls) {
   div.className = "row info-card" + (extraCls ? " " + extraCls : "");
   div.innerHTML = html;
   turnLogTarget().appendChild(div);
+  showLiveSlot(div);
   scrollToBottom();
   return div;
 }
@@ -796,8 +1026,9 @@ function openToolGroup(name, icon, previewHtml, denied) {
     + `</div>`
     + `<div class="tool-children"></div>`;
   turnLogTarget().appendChild(wrap);
-  scrollToBottom();
   currentGroup = wrap;
+  showLiveSlot(wrap);
+  scrollToBottom();
   return wrap;
 }
 
@@ -812,6 +1043,9 @@ function appendGroupChild(html, extraCls) {
   child.className = "tool-child" + (extraCls ? " " + extraCls : "");
   child.innerHTML = html;
   children.appendChild(child);
+  // Group đang là đơn vị log-tool "sống" hiện trong live-slot -> đồng bộ
+  // lại nội dung live-slot để phản ánh dòng kết quả vừa thêm (vd tool_end).
+  if (liveSourceEl === currentGroup) showLiveSlot(currentGroup);
   scrollToBottom();
   return child;
 }
@@ -826,7 +1060,7 @@ function appendBubble(html, from) {
   const bubble = document.createElement("div");
   // Bubble AI có thêm viền "liquid glass 7 màu" chạy quanh mép, bubble
   // user giữ nguyên xanh rêu đặc để 2 bên phân biệt rõ, không lẫn hiệu ứng.
-  bubble.className = "bubble " + (from === "user" ? "user" : "ai glass7-edge");
+  bubble.className = "bubble " + (from === "user" ? "user" : "ai glass-edge");
   bubble.innerHTML = html;
   wrap.appendChild(bubble);
   logEl.appendChild(wrap);
@@ -880,6 +1114,34 @@ const TOOL_ICON = {
   glob: "🔍", grep: "🔍", webfetch: "🌐", websearch: "🌐",
   todowrite: "☑", todoread: "☑", task: "🤖",
 };
+
+// ── Preview gọn cho tool_start ──────────────────────────────────────────
+// BUG ĐÃ SỬA: trước đây preview luôn là raw JSON.stringify(args) cắt 100
+// ký tự từ backend (vd {"command": "echo \"Hello..."}), hiện nguyên văn kể
+// cả dấu ngoặc/escape -> rối mắt trên web. Backend đã gửi kèm d.args
+// (object gốc, chưa qua json.dumps) nên ở đây chọn field chính theo từng
+// loại tool và hiện gọn, không đổi gì bên Python/CLI -- d.preview (text
+// thô) chỉ dùng làm fallback khi tool lạ hoặc args rỗng/thiếu field.
+const PREVIEW_MAIN_ARG = {
+  bash: "command", read: "path", write: "path", edit: "path",
+  multiedit: "path", glob: "pattern", grep: "pattern",
+  webfetch: "url", websearch: "query", skill: "name",
+  apply_patch: "path", view_symbol: "path", verify: "path",
+};
+function formatToolPreview(name, args, fallback) {
+  if (!args || typeof args !== "object") return escapeHtml(fallback || "");
+  const key = PREVIEW_MAIN_ARG[name];
+  let main = key && args[key] != null ? String(args[key]) : null;
+  if (main == null) {
+    // Tool không có field chính định nghĩa sẵn (task, question, lsp...) ->
+    // vẫn tránh in cả JSON, chỉ lấy field string đầu tiên tìm được.
+    const firstStr = Object.values(args).find(v => typeof v === "string");
+    main = firstStr != null ? firstStr : (fallback || "");
+  }
+  const oneLine = main.replace(/\s*\n\s*/g, " ⏎ ");
+  const short = oneLine.length > 200 ? oneLine.slice(0, 200) + "…" : oneLine;
+  return escapeHtml(short);
+}
 
 // ── Trạng thái "đang xử lý": hiện chỉ báo + khoá gửi tin nhắn mới ──────────
 // BUG ĐÃ SỬA: trước đây web không có tín hiệu nào cho biết AI đang xử lý
@@ -1022,7 +1284,8 @@ function handleEvent(msg) {
     case "tool_start": {
       stopSpinner();
       const icon = TOOL_ICON[d.name] || "⚙";
-      openToolGroup(d.name, icon, `<span class="mono">${ansiToHtml(d.preview)}</span>`);
+      const previewText = formatToolPreview(d.name, d.args, d.preview);
+      openToolGroup(d.name, icon, `<span class="mono tool-arg-chip">${previewText}</span>`);
       break;
     }
     case "tool_end":
@@ -1078,6 +1341,7 @@ function handleEvent(msg) {
       break;
     case "turn_end":
       currentGroup = null;
+      collapseLiveSlot(); // turn thực sự kết thúc -> log realtime cuối cùng hút vào nút toggle
       if (d.summary_line) {
         if (lastClosedTurnLogs && lastClosedTurnToggleRow) {
           // Turn vừa có bubble AI (đã đóng, nút đã tạo) -> summary_line
@@ -1108,6 +1372,12 @@ function handleEvent(msg) {
           updateTurnToggleCount(row, inner);
         }
       }
+      // An toàn: nếu turn có log-tool (bash/read/...) nhưng KHÔNG có bubble
+      // AI (closeTurnLogs() lúc đó chưa từng chạy) và KHÔNG có summary_line
+      // (nhánh trên không tạo toggle) -> currentTurnLogs vẫn còn "treo mở"
+      // không nút, log sẽ mất kể cả khi rơi ra khỏi live-slot. Đóng nốt ở
+      // đây để đảm bảo luôn có nút "Xem chi tiết" khi turn thực sự xong.
+      closeTurnLogs();
       resetStreamRows();
       setBusy(false);
       break;
