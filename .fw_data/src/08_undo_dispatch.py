@@ -145,7 +145,7 @@ def tool_apply_patch(path, patch, conn=None, sid=None):
     except Exception as e:
         return f"[error: {e}]"
 
-def tool_task(description, tools=None, model=None, api_key=None, conn=None, sid=None):
+def tool_task(description, tools=None, model=None, api_key=None, conn=None, sid=None, state=None):
     """
     Subagent: chạy một mini agentic loop độc lập.
     Kết quả trả về là text output của subagent.
@@ -163,7 +163,18 @@ def tool_task(description, tools=None, model=None, api_key=None, conn=None, sid=
     if not sub_tools:
         sub_tools = [t for t in get_active_tools() if t["function"]["name"] in _DEFAULT_SUB_TOOLS]
 
-    print(f"\n{BLUE}{BOLD}[subagent]{R} {description[:80]}")
+    # BUG ĐÃ SỬA: toàn bộ tool_task() trước đây print() trần, KHÔNG đi qua
+    # state.bus -- 2 hệ quả: (1) vẫn in ra CLI thật dù đang dùng Web UI
+    # (render_cli chỉ tự im lặng khi armed cho Event qua bus, print() trần
+    # thì luôn in bất kể armed hay không -- đúng "rác" Phi thấy trên CLI
+    # trong lúc tay đang thao tác trên web), (2) web KHÔNG BAO GIỜ nhận
+    # được log subagent vì render_web cũng chỉ subscribe bus. Sửa: emit
+    # qua state.bus khi có state, fallback print() khi state is None (gọi
+    # từ nơi CLI thuần chưa migrate, xem comment 09_api_system.py:1685).
+    if state is not None:
+        state.emit(EV_INFO, text=f"\n{BLUE}{BOLD}[subagent]{R} {description[:80]}", raw=True)
+    else:
+        print(f"\n{BLUE}{BOLD}[subagent]{R} {description[:80]}")
 
     sub_messages = [{"role":"user","content": description}]
     sub_sys = f"""You are a focused subagent. Complete the given task and return a clear result.
@@ -254,7 +265,11 @@ Be concise. Current directory: {os.getcwd()}"""
                 if e.code in _RETRY_CODES_SUB and attempt < 2:
                     import time as _t
                     wait = _RETRY_DELAYS_SUB[attempt]
-                    print(f"  {YELLOW}[subagent] HTTP {e.code} — retry {attempt+1}/2 sau {wait}s...{R}", flush=True)
+                    _msg = f"  {YELLOW}[subagent] HTTP {e.code} — retry {attempt+1}/2 sau {wait}s...{R}"
+                    if state is not None:
+                        state.emit(EV_INFO, text=_msg, raw=True)
+                    else:
+                        print(_msg, flush=True)
                     _t.sleep(wait)
                     continue
                 raise
@@ -309,7 +324,11 @@ Be concise. Current directory: {os.getcwd()}"""
 
         if text:
             final_text = text
-            print(f"  {DIM}[subagent] {text[:100]}...{R}" if len(text)>100 else f"  {DIM}[subagent] {text}{R}")
+            _preview = f"  {DIM}[subagent] {text[:100]}...{R}" if len(text) > 100 else f"  {DIM}[subagent] {text}{R}"
+            if state is not None:
+                state.emit(EV_INFO, text=_preview, raw=True)
+            else:
+                print(_preview)
 
         if tool_calls:
             # Strip heavy content/patch/new_str khỏi arguments trước khi lưu vào
@@ -341,8 +360,12 @@ Be concise. Current directory: {os.getcwd()}"""
                 name = tc["function"]["name"]
                 try: args = json.loads(tc["function"]["arguments"])
                 except: args = {}
-                print(f"  {BLUE}[sub:{name}]{R} {DIM}{json.dumps(args)[:80]}{R}")
-                out = _dispatch_tool(name, args, model, api_key, conn, sid)
+                _sub_line = f"  {BLUE}[sub:{name}]{R} {DIM}{json.dumps(args)[:80]}{R}"
+                if state is not None:
+                    state.emit(EV_INFO, text=_sub_line, raw=True)
+                else:
+                    print(_sub_line)
+                out = _dispatch_tool(name, args, model, api_key, conn, sid, state=state)
                 sub_messages.append({"role":"tool","tool_call_id":tc.get("id",""),
                                       "content": _head_tail(str(out), TOOL_OUTPUT_MAX_CHARS, label=f"sub:{name}")})
         else:
@@ -481,7 +504,7 @@ def _dispatch_tool(name, args, model, api_key, conn, sid, state=None):
         "question":    lambda a: tool_question(a["question"], a.get("options"), state),
         "apply_patch": lambda a: tool_apply_patch(a["path"], a["patch"], conn, sid),
         "task":        lambda a: tool_task(a["description"], a.get("tools"),
-                                           model, api_key, conn, sid),
+                                           model, api_key, conn, sid, state),
         "skill":       lambda a: tool_skill(a["name"]),
         "view_symbol": lambda a: tool_view_symbol(a["path"], a["symbol"]),
         "lsp":         lambda a: tool_lsp(a["operation"], a.get("file"),

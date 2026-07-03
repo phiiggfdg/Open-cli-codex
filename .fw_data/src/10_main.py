@@ -1629,7 +1629,7 @@ Write the AGENTS.md content directly. Be concise but complete."""
                 print(f"{DIM}  [/{cmd_name}] {cmd['description']}{R}")
                 if cmd.get("subtask"):
                     # Run as subagent
-                    result = tool_task(template, model=run_model, api_key=api_key, conn=conn, sid=sid)
+                    result = tool_task(template, model=run_model, api_key=api_key, conn=conn, sid=sid, state=state)
                     print(f"\n{GREEN}{BOLD}AI:{R} {result}")
                     messages.append({"role":"user","content":f"[/{cmd_name}] {template}"})
                     messages.append({"role":"assistant","content":result})
