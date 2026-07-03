@@ -896,13 +896,26 @@ def tool_write(path, content, conn=None, sid=None):
     if _contains_compaction_marker(content):
         return _COMPACTION_MARKER_ERROR
     p = _resolve_to_sandbox(path)
+    # Giới hạn kích thước hợp lý — chặn model runaway ghi file khổng lồ
+    # trên Termux (dung lượng hạn chế). 10MB là dư cho bất kỳ source file thật nào.
+    _WRITE_SIZE_LIMIT = 10 * 1024 * 1024
+    if len(content.encode("utf-8", errors="replace")) > _WRITE_SIZE_LIMIT:
+        return (f"[error] content too large ({len(content):,} chars). "
+                f"Limit is {_WRITE_SIZE_LIMIT:,} bytes. "
+                f"If this is intentional, split into multiple files or use extract/apply_patch.")
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
-        if p.exists():
+        # Exclusive create ("x" mode) — loại race condition TOCTOU giữa check
+        # p.exists() và write_text(): nếu file được tạo bởi tiến trình khác
+        # (vd bash chạy song song) đúng lúc giữa 2 bước, "x" mode sẽ raise
+        # FileExistsError thay vì âm thầm ghi đè.
+        try:
+            with open(p, "x", encoding="utf-8") as f:
+                f.write(content)
+        except FileExistsError:
             return (f"[error] write only creates new files; '{p}' already exists. "
                     f"Use edit, multiedit, or apply_patch for existing files.")
-        before = p.read_text() if p.exists() else None
-        p.write_text(content)
+        before = None  # write chỉ chạy tới đây khi file chưa từng tồn tại
         # Track write time so subsequent edits don't false-alarm on FileTime check
         _file_read_time[str(p.resolve())] = time.time()
         # Update cache ngay — AI không cần read lại file vừa tạo/ghi
@@ -919,8 +932,11 @@ def tool_write(path, content, conn=None, sid=None):
         amap = _anchor_map(lines)
         return (f"Written {len(content)} bytes → {p} ({total} lines){redirected}"
                 + (f"\n{amap}" if amap else ""))
+    except UnicodeEncodeError as e:
+        return f"[error: content contains characters that cannot be encoded as UTF-8: {e}]"
     except Exception as e:
         return f"[error: {e}]"
+
 
 def tool_extract(src, start, end, dst, mode="move", conn=None, sid=None):
     """Lấy nguyên vẹn các dòng [start..end] (1-indexed, inclusive) từ src,

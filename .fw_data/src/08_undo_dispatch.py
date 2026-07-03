@@ -89,8 +89,22 @@ def tool_apply_patch(path, patch, conn=None, sid=None):
     p = _resolve_to_sandbox(path)
     if not p.exists(): return f"[not found: {p}]"
     try:
+        # FileTime safety: cùng cơ chế đã có ở tool_edit — chặn patch ghi đè
+        # lên file đã bị sửa từ ngoài (process khác, user tự sửa tay, git
+        # checkout...) mà agent chưa đọc lại. Trước đây tool_apply_patch
+        # thiếu hẳn check này dù cùng mức rủi ro ghi-đè-file với tool_edit.
+        resolved = str(p.resolve())
+        last_read = _file_read_time.get(resolved, 0)
+        mtime = p.stat().st_mtime
+        if mtime > last_read + 1:
+            return (f"[error] File '{path}' has been modified since it was last read "
+                    f"(mtime={mtime:.0f}, last_read={last_read:.0f}). "
+                    f"Use the read tool to reload it before applying the patch.")
+
         before = p.read_text()
-        # Prefer system patch (more robust)
+        patch_errors = []  # thu thập lý do patch binary fail để không nuốt im lặng
+
+        # Prefer system patch (more robust khi context đúng chuẩn unified diff)
         if shutil.which("patch"):
             result = subprocess.run(
                 ["patch", "--unified", str(p)],
@@ -105,9 +119,12 @@ def tool_apply_patch(path, patch, conn=None, sid=None):
                         conn, sid, str(p.resolve()), before, after))
                     _redo_stack.clear()
                 return f"Patch applied to {path}\n" + _patch_snippet(after, patch)
-            else:
-                return f"[patch error]\n{result.stderr.strip()}"
-        # Fallback: manual hunk parser
+            # patch binary fail (thường do context lệch nhẹ) — không bỏ cuộc
+            # ngay, thử fallback manual parser bên dưới trước khi báo lỗi.
+            patch_errors.append(f"system patch: {result.stderr.strip()[:300]}")
+
+        # Fallback: manual hunk parser (string-replace theo nội dung hunk,
+        # không phụ thuộc số dòng khớp tuyệt đối như `patch` binary).
         original = before.splitlines(keepends=True)
         patched  = list(original)
         lines    = patch.splitlines(keepends=True)
@@ -126,11 +143,20 @@ def tool_apply_patch(path, patch, conn=None, sid=None):
                     i += 1
                 src = "".join(removes); dst = "".join(adds)
                 content = "".join(patched)
-                if src in content:
-                    content = content.replace(src, dst, 1)
-                    patched = content.splitlines(keepends=True)
-                else:
-                    return f"[error: patch hunk not found in file]"
+                count = content.count(src)
+                if count == 0:
+                    err_msg = "[error: patch hunk not found in file]"
+                    if patch_errors:
+                        err_msg = f"[error: patch hunk not found in file | {'; '.join(patch_errors)}]"
+                    return err_msg
+                if count > 1:
+                    # Giống tool_edit: hunk khớp nhiều vị trí là mơ hồ, không
+                    # tự đoán vị trí đúng — an toàn hơn là từ chối và báo rõ.
+                    return (f"[error: patch hunk matches {count} locations in file — "
+                            f"ambiguous, must be unique. Add more context lines to the hunk "
+                            f"or use apply_patch with a narrower, more specific hunk.]")
+                content = content.replace(src, dst, 1)
+                patched = content.splitlines(keepends=True)
             else:
                 i += 1
         after = "".join(patched)
@@ -145,6 +171,7 @@ def tool_apply_patch(path, patch, conn=None, sid=None):
     except Exception as e:
         return f"[error: {e}]"
 
+
 def tool_task(description, tools=None, model=None, api_key=None, conn=None, sid=None, state=None):
     """
     Subagent: chạy một mini agentic loop độc lập.
@@ -152,6 +179,16 @@ def tool_task(description, tools=None, model=None, api_key=None, conn=None, sid=
     """
     _DEFAULT_SUB_TOOLS = {"bash","read","write","edit","glob","grep","webfetch","websearch","todoread"}
     allowed = set(tools) if tools else _DEFAULT_SUB_TOOLS
+    # FIX: "task" không bao giờ được phép trong tool set của subagent, kể cả
+    # nếu model chủ động truyền tools=["task", ...]. Trước đây không có check
+    # này — xác nhận bằng chạy code thật: allowed=set(["task","bash"]) khiến
+    # sub_tools chứa thẳng schema "task", cho phép subagent tự gọi lại
+    # tool_task() qua _dispatch_tool() bên dưới. Không có giới hạn depth nào
+    # khác trong toàn bộ codebase (đã grep xác nhận), nên đây là đệ quy không
+    # giới hạn: subagent cấp 1 spawn subagent cấp 2 spawn cấp 3... mỗi cấp tối
+    # đa 10 steps, worst case bùng nổ số lượng API call theo cấp số nhân
+    # trước khi bị chặn bởi bất kỳ cơ chế nào khác (timeout/token/rate-limit).
+    allowed.discard("task")
     sub_tools = [t for t in get_active_tools() if t["function"]["name"] in allowed]
 
     # Guard: nếu model truyền `tools` toàn tên không tồn tại (vd ảo giác/gõ sai),

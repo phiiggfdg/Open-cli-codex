@@ -14,6 +14,7 @@ Perms:   per-tool allow/ask/deny
 
 import os, sys, json, re, sqlite3, uuid, time, subprocess, shlex
 import difflib, urllib.request, urllib.parse, urllib.error, threading, shutil
+import html as _html
 from pathlib import Path
 from datetime import datetime
 

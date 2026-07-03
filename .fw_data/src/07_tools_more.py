@@ -160,20 +160,25 @@ def tool_glob(pattern, cwd=None):
         except ValueError:
             return False
     # Try fd (fast, respects .gitignore) then fall back to Python glob
+    fd_error = None  # lưu lý do fd fail để không nuốt im lặng
     if shutil.which("fd"):
         try:
             r = subprocess.run(
                 ["fd", "--glob", pattern, "--base-directory", str(base),
                  "--exclude", FW_DATA_NAME, "--exclude", "fw.py"],
                 capture_output=True, text=True, timeout=10)
-            out = r.stdout.strip()
-            lines = [l for l in out.splitlines() if l.strip() not in ("fw.py", "./fw.py")]
-            # FIX (bug #3): fd cũng có thể trả về path "../..." nếu pattern
-            # chứa traversal — lọc lại từng dòng theo base_resolved.
-            lines = [l for l in lines if _inside_base(base / l)]
-            return "\n".join(lines) or "(no matches)"
-        except Exception:
-            pass
+            # fd exit code: 0 = OK (có hoặc không có match), 1 = lỗi thật
+            # (base-directory không tồn tại, pattern glob không hợp lệ...)
+            if r.returncode == 0:
+                out = r.stdout.strip()
+                lines = [l for l in out.splitlines() if l.strip() not in ("fw.py", "./fw.py")]
+                # FIX (bug #3): fd cũng có thể trả về path "../..." nếu pattern
+                # chứa traversal — lọc lại từng dòng theo base_resolved.
+                lines = [l for l in lines if _inside_base(base / l)]
+                return "\n".join(lines) or "(no matches)"
+            fd_error = f"fd exit {r.returncode}: {r.stderr.strip()[:300]}"
+        except Exception as e:
+            fd_error = f"fd {type(e).__name__}: {e}"
     try:
         matches = sorted(base.glob(pattern))
         # Lọc bỏ .fw_data và fw.py — không bao giờ xuất hiện trong kết quả
@@ -183,12 +188,16 @@ def tool_glob(pattern, cwd=None):
                    and _inside_base(m)]
         return "\n".join(str(m.relative_to(base)) for m in matches[:300]) or "(no matches)"
     except Exception as e:
+        if fd_error:
+            return f"[error: {e} | fd also failed: {fd_error}]"
         return f"[error: {e}]"
 
 def tool_grep(pattern, path=None, glob=None):
     base = _sandbox_resolve_read(path or str(Path.cwd()))
     err = _check_sandbox_read(base)
     if err: return err
+    rg_errors = []  # lưu lý do rg fail để không nuốt im lặng nếu grep cũng fail
+
     # Prefer ripgrep (respects .gitignore, much faster)
     rg = shutil.which("rg") or shutil.which("ripgrep")
     if rg:
@@ -199,9 +208,14 @@ def tool_grep(pattern, path=None, glob=None):
             if glob: cmd += ["--glob", glob]
             cmd += [pattern, base]
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-            return r.stdout.strip() or "(no matches)"
-        except Exception:
-            pass
+            # rg exit code: 0 = có match, 1 = không match (hợp lệ), 2+ = lỗi thật
+            # (pattern regex sai, glob sai, path không tồn tại...)
+            if r.returncode in (0, 1):
+                return r.stdout.strip() or "(no matches)"
+            rg_errors.append(f"rg exit {r.returncode}: {r.stderr.strip()[:300]}")
+        except Exception as e:
+            rg_errors.append(f"rg {type(e).__name__}: {e}")
+
     # Fallback to grep
     try:
         cmd = ["grep", "-rn", "--color=never",
@@ -210,9 +224,20 @@ def tool_grep(pattern, path=None, glob=None):
         if glob: cmd += [f"--include={glob}"]
         cmd += [pattern, base]
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-        return r.stdout.strip() or "(no matches)"
+        # grep exit code: 0 = match, 1 = không match (hợp lệ), 2+ = lỗi thật
+        if r.returncode in (0, 1):
+            return r.stdout.strip() or "(no matches)"
+        err_msg = f"grep exit {r.returncode}: {r.stderr.strip()[:300]}"
+        if rg_errors:
+            err_msg = f"[error: {err_msg} | rg also failed: {'; '.join(rg_errors)}]"
+        else:
+            err_msg = f"[error: {err_msg}]"
+        return err_msg
     except Exception as e:
+        if rg_errors:
+            return f"[error: grep {type(e).__name__}: {e} | rg also failed: {'; '.join(rg_errors)}]"
         return f"[error: {e}]"
+
 
 def tool_view_symbol(path, symbol):
     """
@@ -341,14 +366,76 @@ def tool_view_symbol(path, symbol):
     _cache_put(str(p), "\n".join(lines), _current_sid)
     return out
 
+
+# Các tag không mang nội dung đọc được — xóa cả tag lẫn nội dung bên trong.
+# (script/style: code, không phải text. nav/header/footer/aside: chrome trang,
+#  không phải nội dung chính. noscript: fallback cho JS tắt, thường trùng lặp.)
+_WEBFETCH_STRIP_TAGS = (
+    "script", "style", "noscript", "nav", "header", "footer",
+    "aside", "svg", "form", "iframe", "button",
+)
+
+# Nếu trang có vùng nội dung chính rõ ràng, ưu tiên trích riêng vùng đó
+# thay vì toàn bộ <body> (tránh menu/sidebar lẫn vào phần đầu kết quả).
+_WEBFETCH_MAIN_TAGS = ("main", "article")
+
 def tool_webfetch(url):
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "fw-cli/1.0"})
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+        })
         with urllib.request.urlopen(req, timeout=15) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-            raw = re.sub(r"<[^>]+>", " ", raw)
-            raw = re.sub(r"\s{3,}", "\n\n", raw)
-            return raw[:8000]
+            ctype = resp.headers.get("Content-Type", "")
+            raw_bytes = resp.read()
+
+        # Không phải HTML/text (pdf, image, binary...) — báo rõ thay vì trả rác nhị phân.
+        if ctype and not any(t in ctype for t in ("text/html", "text/plain", "application/xhtml", "xml")):
+            return f"[error: unsupported content-type '{ctype}', cannot extract text]"
+
+        raw = raw_bytes.decode("utf-8", errors="replace")
+
+        # 1) Xóa toàn bộ tag không phải nội dung, kèm nội dung bên trong.
+        for tag in ("title",) + _WEBFETCH_STRIP_TAGS:
+            raw = re.sub(rf"<{tag}\b[^>]*>.*?</{tag}>", " ", raw, flags=re.DOTALL | re.IGNORECASE)
+
+        # 2) Nếu có <main> hoặc <article>, ưu tiên lấy nội dung trong đó
+        #    (thường là phần bài viết/nội dung chính, ít rác menu/sidebar hơn).
+        for tag in _WEBFETCH_MAIN_TAGS:
+            m = re.search(rf"<{tag}\b[^>]*>(.*?)</{tag}>", raw, flags=re.DOTALL | re.IGNORECASE)
+            if m and len(m.group(1)) > 200:  # tránh match nhầm <main> rỗng/quá ngắn
+                raw = m.group(1)
+                break
+
+        # 3) Giữ lại cấu trúc heading cơ bản dạng markdown trước khi xóa tag,
+        #    để output không bị dính hết thành 1 khối văn xuôi.
+        raw = re.sub(r"<h1\b[^>]*>(.*?)</h1>", r"\n\n# \1\n", raw, flags=re.DOTALL | re.IGNORECASE)
+        raw = re.sub(r"<h2\b[^>]*>(.*?)</h2>", r"\n\n## \1\n", raw, flags=re.DOTALL | re.IGNORECASE)
+        raw = re.sub(r"<h3\b[^>]*>(.*?)</h3>", r"\n\n### \1\n", raw, flags=re.DOTALL | re.IGNORECASE)
+        raw = re.sub(r"<li\b[^>]*>(.*?)</li>", r"\n- \1", raw, flags=re.DOTALL | re.IGNORECASE)
+        raw = re.sub(r"</p>|<br\s*/?>", "\n", raw, flags=re.IGNORECASE)
+
+        # 4) Xóa tag còn lại (giữ text bên trong), decode HTML entity (&amp; &#39; ...).
+        raw = re.sub(r"<[^>]+>", " ", raw)
+        raw = _html.unescape(raw)
+
+        # 5) Gộp khoảng trắng/dòng trống thừa.
+        raw = re.sub(r"[ \t]+", " ", raw)
+        raw = re.sub(r"\n\s*\n\s*\n+", "\n\n", raw)
+        raw = raw.strip()
+
+        if not raw:
+            return "[error: no extractable text content found on page]"
+
+        LIMIT = 10000
+        if len(raw) > LIMIT:
+            raw = raw[:LIMIT] + f"\n\n... [truncated, {len(raw) - LIMIT} more chars — refine query or fetch specific section]"
+        return raw
+    except urllib.error.HTTPError as e:
+        return f"[error: HTTP {e.code} {e.reason}]"
+    except urllib.error.URLError as e:
+        return f"[error: {e.reason}]"
     except Exception as e:
         return f"[error: {e}]"
 
@@ -646,8 +733,23 @@ def tool_skill(name):
     candidates = [name, name + ".md", name + "/SKILL.md",
                   name.upper() + "/SKILL.md", f"{name}.skill.md"]
     for skills_dir in SKILLS_DIRS:
+        skills_dir_resolved = skills_dir.resolve()
         for c in candidates:
             p = skills_dir / c
+            # Path traversal guard: "name" đến từ model, chưa được tin cậy.
+            # Path./ không chặn ".." — nếu name="../../../secret/SKILL.md",
+            # p sẽ thoát khỏi skills_dir hoàn toàn. Trước đây không có bước
+            # này nên tool_skill là tool đọc file DUY NHẤT trong toàn bộ
+            # TOOLS thiếu sandbox check (mọi tool khác đều gọi
+            # _check_sandbox_read hoặc tương đương). Xác nhận bằng exploit
+            # thật: tool_skill("../../../secret_skill_test") đọc được file
+            # ngoài SKILLS_DIRS. Giờ chặn bằng cách kiểm tra path đã resolve
+            # còn nằm trong skills_dir hay không, cùng pattern _inside_base()
+            # đã dùng ở tool_glob.
+            try:
+                p.resolve().relative_to(skills_dir_resolved)
+            except ValueError:
+                continue  # thoát khỏi skills_dir — bỏ qua candidate này
             if p.exists() and p.is_file():
                 try:
                     content = p.read_text()
