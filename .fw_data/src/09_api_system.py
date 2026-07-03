@@ -1786,6 +1786,16 @@ def agent_turn(messages, model, api_key, conn, sid, max_steps=20, agent=AGENT_BU
         clear_current_state()
 
 
+# ── Dedup guard: phân biệt lệnh "chắc chắn read-only" khỏi lệnh có thể đổi
+# trạng thái hệ thống — dùng chung cho lazy cache validate (_had_writes_last_step)
+# VÀ cho dedup epoch (_mutation_epoch, xem _agent_turn_inner). Đặt module-level
+# (compile 1 lần) thay vì re.compile() lại mỗi vòng lặp như code cũ.
+_BASH_READONLY_RE = re.compile(
+    r"^(git\s+(status|diff|log|show)(\b|$)|"
+    r"ls\b|pwd\b|whoami\b|python(3)?\s+-V\b)",
+    re.IGNORECASE
+)
+
 def _agent_turn_inner(messages, model, api_key, conn, sid, max_steps, agent, state):
     global _current_agent, _active_tools, _todowrite_calls_this_turn, _current_sid, _large_read_credits
     _current_agent    = agent
@@ -1802,11 +1812,29 @@ def _agent_turn_inner(messages, model, api_key, conn, sid, max_steps, agent, sta
     _requesty_turn_cost = 0.0   # Requesty: tích luỹ usage.cost (USD) qua các step
     steps    = 0
     _read_this_turn: set = set()  # track files read this turn to avoid re-reads
-    _seen_calls_this_turn: set = set()   # dedup: block identical tool calls
+    # ── Dedup guard state ───────────────────────────────────────────────────
+    # Trước đây: set đơn giản (call_sig đã gọi -> chặn vĩnh viễn trong cả turn,
+    # dù turn có hàng chục step và trạng thái filesystem/git đã đổi nhiều lần
+    # ở giữa). Vấn đề: "git status" gọi ở step 1 rồi gọi lại y hệt ở step 10
+    # sau khi đã write/edit nhiều file -- bị chặn oan dù kết quả CHẮC CHẮN
+    # khác, vì key dedup chỉ so "tool+args" (text tĩnh), không biết gì về
+    # việc trạng thái đã đổi.
+    # Fix: dict {call_sig: epoch_lúc_gọi} thay vì set. _mutation_epoch tăng
+    # mỗi khi có 1 tool có thể đổi trạng thái chạy (write/edit/multiedit/
+    # view_symbol/bash không-readonly — dùng lại _BASH_READONLY_RE, cùng tiêu
+    # chí với lazy cache validate, không phát minh tiêu chí thứ 2). Khi gặp
+    # lại call_sig cũ: chỉ chặn nếu epoch KHÔNG đổi kể từ lần gọi trước (thật
+    # sự vô ích, không có gì khác đi). Nếu epoch đã tăng -> cho gọi lại (có
+    # thể có ích) và cập nhật epoch mới cho lần này.
+    # Lưu ý: KHÔNG nới lỏng vô điều kiện theo step -- nếu không có mutation
+    # nào ở giữa, dedup vẫn chặn y như cũ (tránh AI lặp vô ích tốn token).
+    _seen_calls_this_turn: dict = {}     # dedup: call_sig -> epoch lúc gọi
     _seen_calls_result: dict = {}        # dedup: store first result for context
+    _mutation_epoch = 0                  # tăng mỗi khi có tool đổi trạng thái
     _recent_writes.clear()        # reset read-after-write block mỗi turn
     _index_prune()               # xóa entry file không còn tồn tại
     _had_writes_last_step: bool = False  # lazy validate: chỉ recheck khi có write
+
 
     # ── MCP: merge tools của các MCP server vào api_tools nếu provider hỗ trợ ──
     # Ưu tiên MCP tools (Notion/GitHub/etc) khi dùng Command Code — model sẽ
@@ -2039,15 +2067,20 @@ def _agent_turn_inner(messages, model, api_key, conn, sid, max_steps, agent, sta
             name = tc["function"]["name"]
             try: args = json.loads(tc["function"].get("arguments") or "{}")
             except: args = {}
-            # Dedup guard: block identical tool calls within the same agent_turn
+            # Dedup guard: block identical tool calls chỉ khi KHÔNG có gì đổi
+            # (_mutation_epoch không tăng) kể từ lần gọi y hệt trước đó trong
+            # cùng turn. Xem giải thích đầy đủ ở phần khởi tạo state phía trên.
             # Skip dedup for tools that have their own internal per-turn limit
             _SELF_LIMITING_TOOLS = {"todowrite"}
             _call_sig = f"{name}:{json.dumps(args, sort_keys=True)}"
-            if _call_sig in _seen_calls_this_turn and name not in _SELF_LIMITING_TOOLS:
+            _prev_epoch = _seen_calls_this_turn.get(_call_sig)
+            if (_prev_epoch is not None and _prev_epoch == _mutation_epoch
+                    and name not in _SELF_LIMITING_TOOLS):
                 prev = _seen_calls_result.get(_call_sig, "")
                 prev_snippet = prev[:300].rstrip() if prev else "(no result stored)"
                 dupe_msg = (
-                    f"[dedup] Blocked: identical call to `{name}` with same args already made this turn.\n"
+                    f"[dedup] Blocked: identical call to `{name}` with same args already made this turn, "
+                    f"and nothing has changed since (no write/edit/mutating command in between).\n"
                     f"Previous result was:\n{prev_snippet}\n"
                     f"Do NOT repeat this call. Change your approach or use a different command.\n"
                     f"If you are stuck, call `question` to ask the user for clarification."
@@ -2059,7 +2092,20 @@ def _agent_turn_inner(messages, model, api_key, conn, sid, max_steps, agent, sta
                 tool_results.append({"role":"tool","tool_call_id":tc.get("id",""),"content":dupe_msg})
                 tool_results_history.append({"role":"tool","tool_call_id":tc.get("id",""),"content":dupe_msg})
                 continue
-            _seen_calls_this_turn.add(_call_sig)
+            # Xác định TRƯỚC khi chạy tool: lệnh này có khả năng đổi trạng thái
+            # không -- dùng cùng tiêu chí _BASH_READONLY_RE với lazy cache
+            # validate, không phát minh tiêu chí thứ 2 (tránh 2 nguồn có thể
+            # lệch nhau). Tăng epoch NGAY (trước khi chạy), để nếu tool này tự
+            # gọi lại chính nó ở step sau, nó cũng thấy epoch đã đổi do chính
+            # nó gây ra -- đúng ngữ nghĩa "trạng thái tại thời điểm SAU lệnh này
+            # khác trạng thái TRƯỚC lệnh này".
+            _is_mutating = name in ("write", "edit", "multiedit", "view_symbol")
+            if name == "bash":
+                _cmd = (args.get("command", "") or "").strip()
+                _is_mutating = not _BASH_READONLY_RE.search(_cmd)
+            if _is_mutating:
+                _mutation_epoch += 1
+            _seen_calls_this_turn[_call_sig] = _mutation_epoch
             # Track files read this turn
             if name == "read":
                 try:
@@ -2081,13 +2127,7 @@ def _agent_turn_inner(messages, model, api_key, conn, sid, max_steps, agent, sta
                 _had_writes_last_step = True  # lazy validate: validate lần sau
             elif name == "bash":
                 # Cache correctness: bash mặc định là "dirty" trừ một số lệnh chắc chắn read-only.
-                cmd = (args.get("command", "") or "").strip()
-                _BASH_READONLY = re.compile(
-                    r"^(git\s+(status|diff|log|show)(\b|$)|\
-?ls\b|pwd\b|whoami\b|python(3)?\s+-V\b)",
-                    re.IGNORECASE
-                )
-                if not _BASH_READONLY.search(cmd):
+                if _is_mutating:
                     _had_writes_last_step = True
             out_model, out_history = run_tool(name, args, model, api_key, conn, sid, state=state)
             _seen_calls_result[_call_sig] = out_model  # store for dedup context
