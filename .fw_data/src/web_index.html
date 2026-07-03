@@ -218,6 +218,26 @@
     box-shadow:var(--shadow-1), 0 0 0 1px rgba(182,80,63,0.12); }
   .info-card.step { background:transparent; border:none; box-shadow:none; padding:2px 13px; color:var(--text-dim);
     font-family:"JetBrains Mono",monospace; font-size:12px; }
+  /* BUG ĐÃ SỬA: appendThinkingDelta() gán class "think" vào card
+     (appendStandaloneCard(html, "think") -> div.className = "row
+     info-card think") nhưng chưa từng có CSS định nghĩa .think -- thinking
+     hiện ra y hệt info-card thường (nền trắng, chữ đen, không khác gì câu
+     trả lời), không có "bọc" trực quan để phân biệt đây là SUY NGHĨ NỘI BỘ
+     của AI chứ không phải câu trả lời chính thức. Trên CLI, thinking vốn
+     in màu nhạt (DIM) -- style dưới đây tái tạo đúng tinh thần đó: nền lõm
+     nhẹ + chữ nhạt màu + nghiêng + viền đứt để rõ ràng là "phần suy nghĩ",
+     không lẫn với info-card/bubble AI thường.
+     .think-label = phần "[thinking]" ở đầu -- tô đậm + màu accent nhẹ để
+     dễ nhận ra ngay không cần đọc hết nội dung. */
+  .info-card.think {
+    background:var(--bg-sunken); border:1px dashed var(--border-soft);
+    color:var(--text-dim); font-style:italic; box-shadow:none;
+  }
+  .info-card.think .think-label {
+    font-style:normal; font-weight:600; color:var(--accent);
+    font-family:"JetBrains Mono",monospace; font-size:12px; letter-spacing:.3px;
+  }
+  .info-card.think .think-body { white-space:pre-wrap; }
 
   .ask-box { border:1px solid var(--warn); background:#fbf3e2; border-radius:var(--radius-md);
              padding:12px 14px; margin:0 4px;
@@ -268,6 +288,86 @@
     font-weight:600; color:var(--accent-2); font-size:13px;
     animation: rowIn .3s cubic-bezier(.25,.8,.35,1) both;
   }
+  /* ── Card ask-box biến mất hẳn sau khi trả lời (mọi kind: confirm/choice/
+     text/model_picker) — xem answerAndLock(). Trước đây chỉ mờ (.ask-answered,
+     opacity:0.4) và NẰM NGUYÊN trong DOM; giờ sau khi mờ xong, box thu nhỏ +
+     fade out rồi bị gỡ khỏi DOM thật sự (box.remove()), dòng "✓ đã chọn gì"
+     (.ask-answer-tag) vẫn đứng lại một mình làm dấu vết đã trả lời. */
+  @keyframes askBoxOut {
+    from { opacity:1; transform: scale(1) translateY(0); max-height:400px; margin-bottom:0; }
+    to   { opacity:0; transform: scale(0.92) translateY(-6px); max-height:0; margin-bottom:-8px; }
+  }
+  .ask-box-leaving {
+    animation: askBoxOut .32s cubic-bezier(.4,0,.2,1) both;
+    overflow:hidden; pointer-events:none;
+  }
+  /* ── Từng dòng model hiện lần lượt (stagger) khi mở /model hoặc đổi trang ─
+     Mỗi .model-picker-item được gắn --i (index trong trang hiện tại) qua JS,
+     animation-delay tính từ đó -> hiệu ứng "rơi xuống" tuần tự thay vì cả
+     list bật ra cùng lúc. */
+  @keyframes modelItemIn {
+    from { opacity:0; transform: translateY(6px); }
+    to   { opacity:1; transform: translateY(0); }
+  }
+  .model-picker-item {
+    animation: modelItemIn .28s cubic-bezier(.25,.8,.35,1) both;
+    animation-delay: calc(var(--i, 0) * 35ms);
+  }
+  /* ── Chuyển trang (◀ Trước / Sau ▶): list trượt nhẹ theo hướng chuyển +
+     fade, thay vì innerHTML="" đổi cứng không báo hiệu gì. Hướng trượt do
+     JS quyết định qua class .picker-page-next / .picker-page-prev đặt tạm
+     lên .model-picker-list trước khi render trang mới. */
+  @keyframes pickerPageInNext {
+    from { opacity:0; transform: translateX(14px); }
+    to   { opacity:1; transform: translateX(0); }
+  }
+  @keyframes pickerPageInPrev {
+    from { opacity:0; transform: translateX(-14px); }
+    to   { opacity:1; transform: translateX(0); }
+  }
+  .model-picker-list.picker-page-next { animation: pickerPageInNext .26s cubic-bezier(.25,.8,.35,1) both; }
+  .model-picker-list.picker-page-prev { animation: pickerPageInPrev .26s cubic-bezier(.25,.8,.35,1) both; }
+  /* ── /model picker (Web UI only, xem renderModelPicker) ─────────────── */
+  .model-picker { margin-top:6px; }
+  .model-picker-search input {
+    width:100%; box-sizing:border-box; background:var(--bg-panel);
+    border:1px solid var(--border); border-radius:var(--radius-sm);
+    color:var(--text); padding:8px 10px; font-size:14px; font-family:inherit;
+    margin-bottom:8px;
+  }
+  .model-picker-list {
+    display:flex; flex-direction:column; gap:4px;
+    max-height:280px; overflow-y:auto;
+  }
+  .model-picker-empty {
+    color:var(--text-dim); font-size:13px; padding:10px 4px; text-align:center;
+  }
+  .model-picker-item {
+    display:flex; align-items:center; justify-content:space-between; gap:8px;
+    background:var(--bg-panel); border:1px solid var(--border);
+    border-radius:var(--radius-sm); padding:8px 12px; font-size:13.5px;
+    font-family:"JetBrains Mono",monospace; color:var(--text);
+    cursor:pointer; text-align:left; width:100%; box-sizing:border-box;
+    transition:transform .08s, box-shadow .08s, background .12s;
+  }
+  .model-picker-item:hover { background:var(--bg-sunken); }
+  .model-picker-item:active { transform:translateY(1px); }
+  .model-picker-name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .model-picker-badge { flex:0 0 auto; }
+  .model-picker-pager {
+    display:flex; align-items:center; justify-content:space-between;
+    gap:8px; margin-top:8px;
+  }
+  .model-picker-page-btn {
+    background:var(--accent-2); color:#fff; border:none; border-radius:var(--radius-sm);
+    padding:7px 14px; font-weight:600; font-size:12.5px; cursor:pointer;
+    box-shadow:0 2px 8px rgba(122,143,92,0.35); transition:transform .08s, opacity .08s;
+  }
+  .model-picker-page-btn:active { transform:translateY(1px); }
+  .model-picker-page-btn:disabled {
+    opacity:0.35; cursor:default; box-shadow:none;
+  }
+  .model-picker-page-info { color:var(--text-dim); font-size:12px; text-align:center; flex:1; }
   .ask-answer-tag::before { content:"✓"; }
 
   #inputBar { flex:0 0 auto; display:flex; align-items:center; gap:8px;
@@ -282,6 +382,13 @@
     box-shadow:inset 0 1px 3px rgba(74,64,48,0.06); transition:border-color .15s, box-shadow .15s;
   }
   #inputField:focus { border-color:var(--accent); box-shadow:inset 0 1px 3px rgba(74,64,48,0.06), 0 0 0 3px rgba(193,122,63,0.14); }
+  /* Khoá xám khi disabled (busy hoặc /model picker đang chờ chọn) — trước
+     đây không có rule riêng nên chỉ dựa vào default trình duyệt, mờ rất
+     nhẹ và không rõ là "đang khoá" hay "đang lỗi gì đó". */
+  #inputField:disabled {
+    background:var(--bg-sunken); color:var(--text-dim);
+    border-color:var(--border-soft); box-shadow:none; cursor:not-allowed;
+  }
   /* ── Nút gửi/ngắt: hình tròn đều nhau, cân với chiều cao ô nhập, icon
      thay vì chữ thô "^C"/"Gửi" — gọn, cân đối, đỡ chiếm ngang trên màn
      hình nhỏ, và rõ nghĩa hơn qua hình dạng mũi tên/dấu dừng thay vì phải
@@ -761,7 +868,7 @@ function appendThinkingDelta(text) {
     // turnLogTarget() -> bị nhét vào khối "Xem chi tiết" gập ẩn mặc định).
     // Trước đây dùng appendInfoCard nên thinking "biến mất" ngay khi có
     // tool_start xen giữa, dù AI vẫn đang chạy — đây là bug đã fix.
-    curThinkRow = appendStandaloneCard('<span class="think">[thinking] </span><span class="think-body"></span>', "think");
+    curThinkRow = appendStandaloneCard('<span class="think-label">[thinking] </span><span class="think-body"></span>', "think");
   }
   const body = curThinkRow.querySelector(".think-body");
   body.textContent += text;
@@ -785,6 +892,7 @@ const TOOL_ICON = {
 // ngắt lúc đang xử lý.
 let busyRow = null;
 let isBusy = false;
+let modelPickerLocked = false;
 
 // ── Spinner JS — bản dịch 1:1 của class Spinner trong 01_ui.py ─────────────
 // FRAMES giống hệt (rotating bar), rain-chars random mỗi 2 frame, tick mỗi
@@ -843,6 +951,24 @@ function setBusy(busy) {
     startSpinner();
   } else {
     stopSpinner();
+  }
+}
+
+// ── Khoá ô chat riêng khi /model picker đang chờ chọn ───────────────────────
+// Khác setBusy(): không bật spinner, không đụng placeholder "đang xử lý"
+// (không phải AI đang chạy, chỉ là card /model đang mở chờ người dùng bấm
+// chọn) -- placeholder riêng nói rõ lý do vì sao ô chat bị khoá, tránh nhầm
+// với trạng thái busy thật. CHỈ áp dụng cho model_picker, không áp dụng cho
+// các loại "ask" khác (confirm/choice/text) — những loại đó vẫn cho gõ tin
+// nhắn khác trong lúc chờ như trước giờ.
+function setModelPickerLock(locked) {
+  modelPickerLocked = locked;
+  sendBtn.disabled = locked || isBusy;
+  inputField.disabled = locked || isBusy;
+  if (locked) {
+    inputField.placeholder = "Hãy chọn model ở trên trước";
+  } else if (!isBusy) {
+    inputField.placeholder = "Gõ lệnh hoặc tin nhắn rồi Enter…";
   }
 }
 
@@ -985,6 +1111,20 @@ function handleEvent(msg) {
       resetStreamRows();
       setBusy(false);
       break;
+    case "session_meta":
+      // Đổi model/agent trên CÙNG 1 session (vd /model) -- CHỈ cập nhật
+      // dòng meta ở header, không đụng gì tới #log (không giống
+      // "session_init" vốn xoá sạch + vẽ lại toàn bộ lịch sử -- ở đây
+      // không cần và không nên làm vậy, người dùng chỉ đổi model, không
+      // đổi session). Giữ nguyên phần [sid] hiện có trên header, chỉ thay
+      // model/agent.
+      {
+        const cur = metaEl.textContent || "";
+        const sidPart = cur.match(/\[[0-9a-fA-F]{1,8}\]/);
+        const sidLabel = sidPart ? sidPart[0] : "";
+        metaEl.textContent = `${d.model || ""}  ·  ${d.agent || ""}  ·  ${sidLabel}`;
+      }
+      break;
     case "ask":
       renderAsk(msg);
       break;
@@ -1012,6 +1152,126 @@ function renderHistory(messages) {
   }
 }
 
+// ── /model picker (chỉ dùng cho Web UI, xem _web_choose_model) ──────────────
+// List model + search + phân trang, tách hoàn toàn khỏi UI raw-mode terminal
+// của choose_model() (CLI thật không đụng gì tới hàm này).
+function renderModelPicker(msg, answerAndLock) {
+  const extra = msg.extra || {};
+  const allModels = Array.isArray(extra.models) ? extra.models : [];
+  const freeSet = new Set(Array.isArray(extra.free_set) ? extra.free_set : []);
+  const isRequesty = !!extra.is_requesty;
+  const PAGE_SIZE = 10;
+
+  let query = "";
+  let page = 0;
+
+  const wrap = document.createElement("div");
+  wrap.className = "model-picker";
+
+  const searchWrap = document.createElement("div");
+  searchWrap.className = "model-picker-search";
+  const searchInp = document.createElement("input");
+  searchInp.type = "text";
+  searchInp.placeholder = "Tìm model theo tên…";
+  searchWrap.appendChild(searchInp);
+  wrap.appendChild(searchWrap);
+
+  const listEl = document.createElement("div");
+  listEl.className = "model-picker-list";
+  wrap.appendChild(listEl);
+
+  const pagerEl = document.createElement("div");
+  pagerEl.className = "model-picker-pager";
+  wrap.appendChild(pagerEl);
+
+  function filtered() {
+    if (!query) return allModels;
+    const q = query.toLowerCase();
+    return allModels.filter(m => m.toLowerCase().includes(q));
+  }
+
+  // direction: null (lần render đầu / gõ tìm kiếm) -> item stagger như bình
+  // thường, không trượt cả list. "next"/"prev" (bấm nút Trước/Sau) -> list
+  // trượt theo hướng tương ứng, item KHÔNG stagger nữa (trượt cả khối 1 lần
+  // trông tự nhiên hơn là vừa trượt khối vừa so le từng dòng).
+  function render(direction) {
+    const items = filtered();
+    const totalPages = Math.max(1, Math.ceil(items.length / PAGE_SIZE));
+    if (page >= totalPages) page = totalPages - 1;
+    if (page < 0) page = 0;
+    const start = page * PAGE_SIZE;
+    const pageItems = items.slice(start, start + PAGE_SIZE);
+
+    listEl.innerHTML = "";
+    listEl.classList.remove("picker-page-next", "picker-page-prev");
+    if (pageItems.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "model-picker-empty";
+      empty.textContent = "Không tìm thấy model nào khớp.";
+      listEl.appendChild(empty);
+    }
+    pageItems.forEach((m, i) => {
+      const item = document.createElement("button");
+      item.type = "button";
+      item.className = "model-picker-item";
+      // Chuyển trang (direction có giá trị): tắt stagger per-item bằng
+      // cách không set --i, để CSS .picker-page-next/prev trên listEl lo
+      // toàn bộ animation trượt. Mở lần đầu / tìm kiếm (direction=null):
+      // giữ stagger --i như cũ.
+      if (!direction) item.style.setProperty("--i", i);
+      const isFree = isRequesty && freeSet.has(m);
+      const display = isRequesty ? m : m.split("/").pop();
+      item.innerHTML = `<span class="model-picker-name">${escapeHtml(display)}</span>`
+        + (isFree ? `<span class="model-picker-badge">🆓</span>` : "");
+      item.onclick = () => answerAndLock(m, display);
+      listEl.appendChild(item);
+    });
+    if (direction === "next") {
+      // Trigger animation: cần force reflow trước khi add class vì browser
+      // có thể gộp việc remove+add class liền nhau thành no-op nếu không
+      // "ép" nó đọc layout ở giữa.
+      void listEl.offsetWidth;
+      listEl.classList.add("picker-page-next");
+    } else if (direction === "prev") {
+      void listEl.offsetWidth;
+      listEl.classList.add("picker-page-prev");
+    }
+
+    // ── Ô tích qua lại để chuyển trang (checkbox-style nút Trước/Sau) ──
+    pagerEl.innerHTML = "";
+    const prevBtn = document.createElement("button");
+    prevBtn.type = "button";
+    prevBtn.className = "model-picker-page-btn";
+    prevBtn.textContent = "◀ Trước";
+    prevBtn.disabled = page === 0;
+    prevBtn.onclick = () => { page -= 1; render("prev"); };
+
+    const info = document.createElement("span");
+    info.className = "model-picker-page-info";
+    info.textContent = `Trang ${page + 1}/${totalPages} — ${items.length} model`;
+
+    const nextBtn = document.createElement("button");
+    nextBtn.type = "button";
+    nextBtn.className = "model-picker-page-btn";
+    nextBtn.textContent = "Sau ▶";
+    nextBtn.disabled = page >= totalPages - 1;
+    nextBtn.onclick = () => { page += 1; render("next"); };
+
+    pagerEl.appendChild(prevBtn);
+    pagerEl.appendChild(info);
+    pagerEl.appendChild(nextBtn);
+  }
+
+  searchInp.addEventListener("input", () => {
+    query = searchInp.value;
+    page = 0;
+    render();
+  });
+
+  render();
+  return wrap;
+}
+
 // ── ask: hiện hộp hỏi tương tác, gửi answer lại qua WS ──────────────────────
 function renderAsk(msg) {
   const box = document.createElement("div");
@@ -1032,17 +1292,48 @@ function renderAsk(msg) {
     // xám đi rõ ràng và không còn focus/sửa được nữa.
     box.querySelectorAll("input, button").forEach(el => { el.disabled = true; });
     sendJson({ type: "answer", id: msg.id, value });
+    // Chọn xong -> mở lại ô chat ngay (không đợi turn_end/setBusy, vì việc
+    // trả lời "ask" và việc AI xử lý turn tiếp theo là 2 pha khác nhau).
+    // CHỈ mở nếu đây đúng là model_picker -- các "ask" khác (confirm/
+    // choice/text) chưa từng khoá ô chat nên không cần đụng vào đây.
+    if (msg.kind === "model_picker") setModelPickerLock(false);
     const tag = document.createElement("div");
     tag.className = "ask-answer-tag";
     tag.textContent = label;
     // Chèn NGAY SAU box (sibling trong #log), không phải con của box —
     // để không bị kéo mờ theo .ask-answered (xem comment CSS ở trên).
     box.after(tag);
+    // Card biến mất hẳn: để người dùng kịp thấy trạng thái ".ask-answered"
+    // (mờ đi, khoá tương tác) trong chốc lát rồi mới thu nhỏ+fade ra khỏi
+    // DOM — bấm xong mà mất ngay lập tức sẽ giật, không kịp nhận ra là đã
+    // chọn. 550ms = đủ để mắt kịp thấy dòng ✓ tag xuất hiện trước khi box
+    // co lại. Dùng animationend để gỡ đúng lúc animation askBoxOut kết
+    // thúc, không hardcode setTimeout thứ 2 (tránh lệch giữa CSS và JS nếu
+    // sau này ai đổi thời lượng keyframe mà quên đổi số ở đây).
+    setTimeout(() => {
+      box.classList.add("ask-box-leaving");
+      box.addEventListener("animationend", () => box.remove(), { once: true });
+    }, 550);
   }
 
   const options = (msg.extra || {}).options;
 
-  if (explanation || msg.kind === "confirm") {
+  if (msg.kind === "model_picker") {
+    // Nhánh RIÊNG cho /model khi gõ qua Web UI (_web_choose_model ở
+    // 09_api_system.py). CLI thật KHÔNG bao giờ gửi kind này -- vẫn dùng
+    // choose_model() cũ y hệt từ trước, không đổi gì (xem 10_main.py,
+    // nhánh if/else theo web_bridge.is_armed()). Toàn bộ list model gửi
+    // 1 lần qua msg.extra.models, JS tự lọc/phân trang phía client --
+    // không cần round-trip từng trang qua WS như CLI (CLI phải làm vậy
+    // vì bị giới hạn bởi màn hình + phím vật lý; web có DOM nên hiện hết
+    // 1 lần rồi lọc tại chỗ nhanh hơn).
+    box.appendChild(renderModelPicker(msg, answerAndLock));
+    // Khoá ô chat trong lúc card còn mở -- chưa chọn xong thì không cho
+    // gửi tin nhắn/lệnh khác chen ngang (trước đây ô chat vẫn mở tự do,
+    // gửi được trong lúc /model đang chờ chọn, dễ gây lẫn lộn thứ tự lệnh
+    // phía server). Mở lại trong answerAndLock ngay khi bấm chọn model.
+    setModelPickerLock(true);
+  } else if (explanation || msg.kind === "confirm") {
     actions.className = "ask-actions";
     const yes = document.createElement("button");
     yes.className = "ask-btn yes"; yes.textContent = "Allow (y)";
@@ -1109,15 +1400,16 @@ function renderAsk(msg) {
 
 // ── Gợi ý lệnh slash ─────────────────────────────────────────────────────
 // Danh sách + mô tả copy NGUYÊN VĂN từ SLASH_COMMANDS/SLASH_DESC trong
-// Web UI hiện chỉ cho phép 5 lệnh quản lý API key chạy được (xem whitelist
+// Web UI hiện chỉ cho phép 6 lệnh chạy được (xem whitelist
 // _WEB_ALLOWED_CMDS ở 10_main.py) -- mọi lệnh "/" khác bị chặn cứng và
-// bắt quay lại CLI thật. Vì vậy autocomplete ở đây CHỈ liệt kê 5 lệnh này,
+// bắt quay lại CLI thật. Vì vậy autocomplete ở đây CHỈ liệt kê 6 lệnh này,
 // không hiện các lệnh khác nữa: gợi ý 1 lệnh rồi gõ vào bị chặn ("không
 // dùng được qua Web UI") gây khó chịu hơn là không gợi ý gì cả. Khi
 // 10_main.py mở thêm lệnh vào whitelist, nhớ đồng bộ tay ở đây (không có
 // cách lấy whitelist tự động từ backend qua giao thức hiện tại).
 const SLASH_COMMANDS = [
-  "/listkeys", "/rmkey", "/deletekey", "/addkey", "/setkey",
+  "/listkeys", "/rmkey", "/deletekey", "/addkey", "/setkey", "/model",
+  "/mode on", "/mode off",
 ];
 const SLASH_DESC = {
   "/setkey":     "đổi API key",
@@ -1125,6 +1417,9 @@ const SLASH_DESC = {
   "/addkey":     "thêm key vào pool (nhiều key/provider, tự xoay khi 429)",
   "/listkeys":   "xem pool key + trạng thái cooldown",
   "/rmkey":      "xoá key khỏi pool theo số thứ tự",
+  "/model":      "đổi model (list + tìm kiếm + phân trang)",
+  "/mode on":    "bật thinking mode",
+  "/mode off":   "tắt thinking mode",
 };
 
 const slashHintEl = document.getElementById("slashHint");
@@ -1132,7 +1427,31 @@ let slashMatches = [];
 let slashActiveIdx = -1;
 
 function slashLookup(prefix) {
-  return SLASH_COMMANDS.filter(c => c.startsWith(prefix));
+  // BUG ĐÃ SỬA: "/model".startsWith("/mode") === true (trùng 4 ký tự đầu
+  // "mode") -- gõ "/mode" trước đây bị lẫn gợi ý "/model" dù không liên
+  // quan. Tách prefix thành "tên lệnh" (token đầu) + "phần tham số đang
+  // gõ dở" (nếu có), so khớp riêng từng phần thay vì startsWith thô trên
+  // cả chuỗi -- vừa tránh lẫn "mode"/"model" (tên lệnh phải khớp ĐỦ từ,
+  // không phải substring), vừa vẫn gợi ý đúng khi gõ dở (vd "/mo" hay
+  // "/mode o").
+  const sp = prefix.indexOf(" ");
+  if (sp === -1) {
+    // Chưa có dấu cách -- đang gõ dở TÊN lệnh. Khớp nếu tên lệnh của mục
+    // đó bắt đầu bằng prefix (substring bình thường ở đây vẫn đúng ý
+    // "gõ dở", vd "/mo" phải ra cả "/model" và "/mode on"/"/mode off").
+    return SLASH_COMMANDS.filter(c => c.startsWith(prefix));
+  }
+  // Đã có dấu cách -- tên lệnh (trước dấu cách) phải khớp ĐỦ, không được
+  // là substring (đây là chỗ khác biệt so với trước, tránh lẫn model/mode
+  // dù thực ra tới bước này prefix đã có dấu cách nên hiếm khi đụng
+  // "/model" — vẫn kiểm tra an toàn cho tổng quát).
+  const cmdName = prefix.slice(0, sp);
+  const argPart = prefix.slice(sp + 1);
+  return SLASH_COMMANDS.filter(c => {
+    if (!c.startsWith(cmdName + " ")) return false;
+    const cArg = c.slice(cmdName.length + 1);
+    return cArg.startsWith(argPart);
+  });
 }
 
 function renderSlashHint() {
@@ -1153,7 +1472,10 @@ function renderSlashHint() {
 }
 
 function applySlashChoice(cmd) {
-  inputField.value = cmd + " ";
+  // Lệnh đã có sẵn tham số đầy đủ (vd "/mode on") -- không cần thêm dấu
+  // cách nữa, người dùng có thể Enter gửi luôn. Lệnh trần (vd "/model")
+  // vẫn cần dấu cách để gõ tiếp tham số (giữ hành vi cũ).
+  inputField.value = cmd.includes(" ") ? cmd : cmd + " ";
   closeSlashHint();
   inputField.focus();
 }
@@ -1166,13 +1488,33 @@ function closeSlashHint() {
 
 function updateSlashHint() {
   const val = inputField.value;
-  // Chỉ gợi ý khi đang gõ token lệnh đầu dòng (giống _slash_hint CLI: chỉ
-  // active khi buffer bắt đầu bằng "/" và chưa có dấu cách sau lệnh).
-  const m = /^(\/[a-zA-Z]*)$/.exec(val);
-  if (!m) { closeSlashHint(); return; }
-  slashMatches = slashLookup(m[1]);
-  slashActiveIdx = slashMatches.length ? 0 : -1;
-  renderSlashHint();
+  // Case 1 (như cũ): đang gõ dở TÊN lệnh, chưa có dấu cách -- khớp mọi
+  // lệnh có prefix này (kể cả lệnh có tham số như "/mode on", vì nó cũng
+  // bắt đầu bằng "/mode").
+  const m1 = /^(\/[a-zA-Z]*)$/.exec(val);
+  if (m1) {
+    slashMatches = slashLookup(m1[1]);
+    slashActiveIdx = slashMatches.length ? 0 : -1;
+    renderSlashHint();
+    return;
+  }
+  // Case 2 (mới): đã gõ xong tên lệnh + dấu cách, đang gõ dở tham số (vd
+  // "/mode " hoặc "/mode o"). Chỉ kích hoạt nếu val khớp prefix của ÍT
+  // NHẤT 1 mục trong SLASH_COMMANDS có chứa dấu cách (nghĩa là lệnh đó
+  // THỰC SỰ có sub-command để gợi ý) -- tránh bật lại gợi ý vô nghĩa khi
+  // gõ tham số tự do cho lệnh không có danh sách con cố định (vd
+  // "/setkey sk-abc...", "/rmkey 2").
+  const m2 = /^(\/[a-zA-Z]+ [a-zA-Z]*)$/.exec(val);
+  if (m2) {
+    const matches = slashLookup(m2[1]);
+    if (matches.length > 0) {
+      slashMatches = matches;
+      slashActiveIdx = 0;
+      renderSlashHint();
+      return;
+    }
+  }
+  closeSlashHint();
 }
 
 // ── WebSocket connection ─────────────────────────────────────────────────
@@ -1197,6 +1539,7 @@ function connect() {
     dot.classList.remove("ok");
     statusText.textContent = "Disconnected — đang thử lại…";
     setBusy(false);  // tránh kẹt khoá input nếu mất kết nối giữa lúc busy
+    setModelPickerLock(false);  // tránh kẹt khoá input nếu mất kết nối giữa lúc /model đang mở
     setTimeout(connect, 1500);
   };
 
@@ -1210,7 +1553,7 @@ function sendJson(obj) {
 }
 
 function sendLine() {
-  if (isBusy) return;  // an toàn kép: dù input bị disable, chặn luôn ở đây
+  if (isBusy || modelPickerLocked) return;  // an toàn kép: dù input bị disable, chặn luôn ở đây
   const val = inputField.value;
   if (!val) return;
   inputField.value = "";

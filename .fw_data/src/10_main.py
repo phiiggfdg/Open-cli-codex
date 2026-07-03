@@ -694,7 +694,21 @@ def main():
         # web_index.html (renderAsk, nhánh kind==="text"), không cần thêm
         # UI mới. Cho phép chạy qua web vì đây là nhu cầu thực tế (đổi/thêm
         # key ngay trong lúc đang chat, không muốn phải quay lại CLI thật).
-        _WEB_ALLOWED_CMDS = ("/listkeys", "/rmkey", "/deletekey", "/addkey", "/setkey")
+        #
+        # /model: TRƯỚC ĐÂY không nằm trong whitelist vì choose_model() là
+        # UI raw-mode terminal (tự vẽ/xoá màn hình bằng ANSI cursor), không
+        # thể render lên web. Giờ block /model đã tự rẽ nhánh: khi armed
+        # gọi _web_choose_model() (picker riêng qua state.ask(kind=
+        # "model_picker"), JS renderModelPicker() vẽ list/search/phân
+        # trang) thay vì choose_model() -- xem 09_api_system.py và
+        # 10_main.py, block "if user.lower() == '/model':". Nhánh CLI thật
+        # (không armed) vẫn dùng choose_model() y hệt cũ, không đổi gì.
+        # /mode: TRƯỚC ĐÂY thuộc nhóm "chưa migrate" (toàn print() trần,
+        # không emit qua bus) -- đã sửa xong, toàn bộ output giờ đi qua
+        # state.emit() khi có state (xem block "if _cmd_parts[0] ==
+        # '/mode':"). Không có input()/UI raw-mode nào, logic nghiệp vụ
+        # (_probe_thinking_support/_probe_thinking_disable) không đổi gì.
+        _WEB_ALLOWED_CMDS = ("/listkeys", "/rmkey", "/deletekey", "/addkey", "/setkey", "/model", "/mode")
         _cmd0 = user.split(None, 1)[0].lower() if user.split(None, 1) else ""
         if (state is not None and state.web_bridge is not None
                 and state.web_bridge.is_armed()
@@ -703,7 +717,7 @@ def main():
             state.emit(EV_WARN, text=(
                 "Lệnh / (và exit/quit) không dùng được qua Web UI — bấm Esc "
                 "trên CLI để chạy lệnh, Web UI chỉ để chat/thao tác code.\n"
-                "(Riêng /listkeys /rmkey /deletekey /addkey /setkey dùng được.)\n"
+                "(Riêng /listkeys /rmkey /deletekey /addkey /setkey /model /mode dùng được.)\n"
             ))
             continue
 
@@ -883,15 +897,48 @@ def main():
             print(f"{GREEN}✓ [{sid}]{R}\n"); continue
 
         if user.lower() == "/model":
-            model = choose_model(api_key)
+            # TÁCH 2 NHÁNH theo yêu cầu: Web UI dùng picker riêng (list +
+            # search + phân trang qua JSON/WS, không phải raw-mode terminal
+            # UI của choose_model() -- vốn tự vẽ/xoá màn hình bằng ANSI
+            # cursor, không thể hiện lên web được). CLI thật (không armed)
+            # giữ NGUYÊN choose_model() như cũ, không đổi hành vi gì.
+            _web_armed_now = state.web_bridge is not None and state.web_bridge.is_armed()
+            if _web_armed_now:
+                new_model = _web_choose_model(state, api_key)
+                if new_model is None:
+                    # Huỷ (đóng picker không chọn gì) -- không đổi model hiện tại.
+                    continue
+                model = new_model
+            else:
+                model = choose_model(api_key)
             short = model.split("/")[-1]
             session_update(conn, sid, model=model)
             state.model = model
+            # BUG ĐÃ SỬA: metaEl trên web chỉ được set 1 lần duy nhất lúc
+            # session_init (kết nối lần đầu / đổi hẳn sang SessionState
+            # khác qua /sessions) -- xem web_index.html case "session_init".
+            # Đổi model qua /model chỉ set state.model = model trên CÙNG 1
+            # object state, không tạo state mới -> web KHÔNG BAO GIỜ được
+            # báo để cập nhật tên model trên header, dù backend đã đổi
+            # đúng. Sửa: emit EV_SESSION_META (hằng số đã khai báo sẵn từ
+            # trước với đúng mục đích "đổi session/model/agent" nhưng chưa
+            # từng được dùng tới) ngay sau khi đổi state.model -- JS có case
+            # riêng cập nhật lại metaEl mà không đụng gì khác trong log
+            # (không xoá lịch sử chat như session_init đầy đủ sẽ làm).
+            state.emit(EV_SESSION_META, model=state.model, agent=state.agent)
             out = f"{GREEN}✓ {short}{R}\n"
             state.emit(EV_INFO, text=out, raw=True)
             continue
 
         if user.lower() == "/agent":
+            # TODO: /agent dính CÙNG BUG với /model (metaEl không cập nhật
+            # khi đổi state.agent trên cùng 1 object state) -- CHƯA sửa ở
+            # đây vì /agent chưa nằm trong whitelist web (vẫn dùng
+            # choose_agent() raw-mode input, chưa có nhánh web riêng như
+            # _web_choose_model), nên bug này chưa thể lộ ra qua web (lệnh
+            # bị chặn từ trước khi chạm tới đây). Khi /agent được tách
+            # nhánh web (giống /model), nhớ thêm state.emit(EV_SESSION_META,
+            # model=state.model, agent=state.agent) y hệt /model ở trên.
             agent = choose_agent()
             _current_agent = agent
             session_update(conn, sid, agent=agent)
@@ -923,36 +970,46 @@ def main():
         if _cmd_parts and _cmd_parts[0].lower() == "/mode":
             arg = _cmd_parts[1].strip().lower() if len(_cmd_parts) > 1 else ""
 
+            def _mode_out(text):
+                """In ra CLI hoặc emit qua bus tuỳ có state hay không -- pattern
+                dùng chung khắp file, tách hàm nhỏ ở đây vì /mode có nhiều
+                dòng print() rải rác hơn hẳn các lệnh khác."""
+                if state is not None:
+                    state.emit(EV_INFO, text=text, raw=True)
+                else:
+                    print(text)
+
             if not arg:
                 # Gõ /mode trống → hiện trạng thái hiện tại + gợi ý cách dùng
                 state_cl = GREEN if _thinking_mode == "on" else DIM
-                print(f"{state_cl}Thinking mode: {_thinking_mode}{R}")
+                lines = [f"{state_cl}Thinking mode: {_thinking_mode}{R}"]
                 supported = _thinking_support_get(model)
                 if supported is True:
-                    print(f"{DIM}  Model này đã xác nhận hỗ trợ thinking.{R}")
+                    lines.append(f"{DIM}  Model này đã xác nhận hỗ trợ thinking.{R}")
                 elif supported is False:
-                    print(f"{DIM}  Model này đã thử và KHÔNG hỗ trợ thinking.{R}")
+                    lines.append(f"{DIM}  Model này đã thử và KHÔNG hỗ trợ thinking.{R}")
                 else:
-                    print(f"{DIM}  Chưa rõ model này có hỗ trợ thinking không — "
+                    lines.append(f"{DIM}  Chưa rõ model này có hỗ trợ thinking không — "
                           f"gõ {CYAN}/mode on{R}{DIM} để thử.{R}")
-                print(f"{DIM}  Gõ {CYAN}/mode on{R}{DIM} hoặc {CYAN}/mode off{R}{DIM} để đổi.{R}\n")
+                lines.append(f"{DIM}  Gõ {CYAN}/mode on{R}{DIM} hoặc {CYAN}/mode off{R}{DIM} để đổi.{R}\n")
+                _mode_out("\n".join(lines))
                 continue
 
             if arg in ("on", "off"):
                 supported = _thinking_support_get(model)
                 if supported is None:
-                    print(f"{DIM}  Đang kiểm tra model này có hỗ trợ thinking không...{R}")
+                    _mode_out(f"{DIM}  Đang kiểm tra model này có hỗ trợ thinking không...{R}")
                     supported = _probe_thinking_support(model, api_key)
                     _thinking_support_set(model, supported)
                 if not supported:
-                    print(f"{YELLOW}⚠ Model/provider này không hỗ trợ thinking "
-                          f"(không trả reasoning_content/thinking block).{R}")
-                    print(f"{DIM}  Đã ghi nhớ, lần sau /mode sẽ báo ngay không cần thử lại.{R}\n")
+                    _mode_out(f"{YELLOW}⚠ Model/provider này không hỗ trợ thinking "
+                          f"(không trả reasoning_content/thinking block).{R}\n"
+                          f"{DIM}  Đã ghi nhớ, lần sau /mode sẽ báo ngay không cần thử lại.{R}\n")
                     continue
                 _thinking_mode = arg
-                print(f"{GREEN}✓ Thinking mode: {arg}{R}")
+                _mode_lines = [f"{GREEN}✓ Thinking mode: {arg}{R}"]
                 if arg == "on" and (_prov().get("format_anthropic") or _active_provider == "aws_bedrock"):
-                    print(f"{DIM}  Lưu ý: nội dung thinking sẽ hiện ra màn hình (màu xám/dim, "
+                    _mode_lines.append(f"{DIM}  Lưu ý: nội dung thinking sẽ hiện ra màn hình (màu xám/dim, "
                           f"tag [thinking]). Signature được lưu/replay tự động để giữ thinking "
                           f"hoạt động cả ở các turn sau có tool_calls (tối ưu cache); nếu history "
                           f"cũ thiếu signature hợp lệ, thinking sẽ tự tắt riêng cho turn đó thay "
@@ -964,14 +1021,18 @@ def main():
                     # provider custom chấp nhận nhưng bỏ qua (vd 1 số
                     # gateway Anthropic-format third-party). Best-effort,
                     # 1 request rất nhẹ, chỉ chạy 1 lần rồi đánh dấu đã probe.
+                    if _mode_lines:
+                        _mode_out("\n".join(_mode_lines))
+                        _mode_lines = []
                     works = _probe_thinking_disable(model, api_key)
                     _thinking_disable_mark_probed(model)  # đánh dấu đã probe, dù kết quả gì
                     if not works:
-                        print(f"{YELLOW}⚠ Provider này có vẻ KHÔNG tắt được thinking thật dù đã "
-                              f"gửi 'disabled' — model có thể tự bật thinking ngầm phía server.{R}")
-                        print(f"{DIM}  Đây là giới hạn của provider/gateway, không phải lỗi của "
+                        _mode_out(f"{YELLOW}⚠ Provider này có vẻ KHÔNG tắt được thinking thật dù đã "
+                              f"gửi 'disabled' — model có thể tự bật thinking ngầm phía server.{R}\n"
+                              f"{DIM}  Đây là giới hạn của provider/gateway, không phải lỗi của "
                               f"app. Nếu cần tắt hẳn, kiểm tra docs riêng của provider.{R}")
-                print()
+                if _mode_lines:
+                    _mode_out("\n".join(_mode_lines))
                 continue
 
         if user.lower() == "/clear":

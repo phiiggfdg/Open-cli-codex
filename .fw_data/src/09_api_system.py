@@ -568,6 +568,73 @@ def choose_model(api_key):
             print(f"\n{RED}Huỷ.{R}"); sys.exit(0)
 
 
+def _web_choose_model(state, api_key):
+    """
+    Nhánh /model RIÊNG cho Web UI (yêu cầu: tách 2 nhánh, CLI thật giữ
+    nguyên choose_model() không đổi gì). choose_model() dựa vào raw-mode
+    đọc phím + tự vẽ/xoá màn hình bằng ANSI cursor escape -- không thể
+    "render" lên web được (web không có TTY, không đọc phím thô qua
+    WebSocket theo kiểu đó). Thay vào đó: gửi TOÀN BỘ danh sách model qua
+    state.ask(kind="model_picker") 1 lần duy nhất -- JS tự vẽ list/search/
+    phân trang phía client (xem renderAsk nhánh "model_picker" trong
+    web_index.html), không cần round-trip qua lại nhiều lần như CLI.
+
+    Trả về model_id (str) đã chọn, hoặc None nếu người dùng huỷ/đóng picker
+    không chọn gì (timeout mặc định KHÔNG áp dụng ở đây -- người dùng có
+    thể cần thời gian tìm/lướt list, không nên tự huỷ theo thời gian).
+    """
+    p = _prov()
+    is_requesty = (_active_provider == "requesty")
+    free_set = list(p.get("free_models", [])) if is_requesty else []
+
+    models = fetch_models(api_key)
+
+    answer = state.ask(
+        prompt="Chọn model:",
+        kind="model_picker",
+        default=None,
+        extra={
+            "models": models,
+            "free_set": free_set,
+            "is_requesty": is_requesty,
+            "provider_name": p.get("name", ""),
+        },
+    )
+    if not answer:
+        return None
+    chosen_model = str(answer).strip()
+    if not chosen_model:
+        return None
+
+    # Xử lý region cho Requesty -- LOGIC Y HỆT choose_model() (đoạn cuối
+    # hàm đó), tách riêng ở đây thay vì gọi chung vì choose_model() có
+    # sys.exit(0) khi huỷ (không phù hợp gọi từ web -- huỷ ở web chỉ nên
+    # return None, không được thoát hẳn tiến trình CLI).
+    if is_requesty:
+        free_regions = p.get("free_model_regions", {})
+        cfg = load_config()
+        if chosen_model in free_set:
+            auto_region = free_regions.get(chosen_model)
+            if auto_region:
+                cfg["requesty_region"] = auto_region
+            else:
+                cfg.pop("requesty_region", None)
+            save_config(cfg)
+        else:
+            if "@" in chosen_model:
+                cfg.pop("requesty_region", None)
+                save_config(cfg)
+            # Model trả phí không phải dạng "@region" -- CLI gốc mở thêm 1
+            # bước chọn region tương tác (_requesty_choose_region, raw-mode
+            # input riêng). KHÔNG portable lên web trong lần này (yêu cầu
+            # hiện tại của Phi chỉ là "list + search + chọn model", chưa
+            # nói tới bước chọn region phụ) -- để nguyên region hiện có
+            # trong config, không tự đổi. Nếu cần chọn region qua web, đó
+            # là 1 tính năng riêng, làm sau khi được xác nhận.
+
+    return chosen_model
+
+
 # ── Retry config ──────────────────────────────────────────────────────────────
 _RETRY_MAX     = 5          # số lần retry tối đa
 _RETRY_CODES   = {429, 500, 502, 503, 504}   # HTTP codes đáng retry
