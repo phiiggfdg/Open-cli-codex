@@ -476,21 +476,6 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         finally:
             stop.set()
             _unsubscribe_from(state)
-            # BUG ĐÃ SỬA: đóng tab (thay vì bấm Esc/"quay lại CLI") không
-            # tự disarm() web_bridge, và mọi PendingAsk còn treo trong
-            # pending_registry (vd _ask_change_format đang chờ answer)
-            # không còn ai resolve() -- EventBus.ask() treo vĩnh viễn ở
-            # pending.wait(timeout=None) vì cli_ask_handler cũng bỏ qua
-            # (thấy is_armed()==True nên return ngay, không gọi input()).
-            # Sửa: resolve mọi pending còn treo bằng default của chính nó
-            # (an toàn -- đây là pending do CHÍNH kết nối này tạo, đăng ký
-            # riêng trong pending_registry local của hàm này, không đụng
-            # tab khác), rồi disarm() để trả quyền input về CLI thật.
-            for _pending in list(pending_registry.values()):
-                _pending.resolve(_pending.default)
-            pending_registry.clear()
-            if state.web_bridge is not None:
-                state.web_bridge.disarm()
 
 
 class _ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
