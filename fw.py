@@ -47,6 +47,7 @@ _MODULES = [
     "01d_events.py",
     "01b_aws.py",
     "01c_anthropic.py",
+    "01e_openai_responses.py",
     "02_provider.py",
     "03_mcp.py",
     "04_agent_cache.py",

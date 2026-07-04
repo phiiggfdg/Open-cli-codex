@@ -17,7 +17,7 @@
 [![Stdlib Only](https://img.shields.io/badge/dependencies-stdlib--only-brightgreen)](#requirements)
 [![License: Proprietary](https://img.shields.io/badge/license-proprietary-red)](#license)
 [![Providers](https://img.shields.io/badge/providers-12-orange)](#supported-providers)
-[![Tools](https://img.shields.io/badge/agent%20tools-20-9cf)](#agent-tools)
+[![Tools](https://img.shields.io/badge/agent%20tools-21-9cf)](#agent-tools)
 [![Made with ❤️ in Vietnam](https://img.shields.io/badge/made%20with-%E2%9D%A4%EF%B8%8F%20in%20Vietnam-da251d)](#contact)
 
 [English](#-english) · [Tiếng Việt](#-tiếng-việt)
@@ -55,7 +55,7 @@
 - 🏗️ **[Architecture](https://github.com/phiiggfdg/Open-cli-codex/wiki/Architecture)**
   Module map, shared `exec()` namespace, load order
 - 🛠️ **[Agent Tools](https://github.com/phiiggfdg/Open-cli-codex/wiki/Agent-Tools)**
-  All 20 built-in tools, grouped by category
+  All 21 built-in tools, grouped by category
 - 🔒 **[Permissions & Sandbox](https://github.com/phiiggfdg/Open-cli-codex/wiki/Permissions-&-Sandbox)**
   Agent modes, per-tool permissions, sandboxing
 
@@ -197,7 +197,7 @@ Most CLI agents lock you into one API shape. `fw.py` internally speaks only Open
 ### Agent Tools
 
 <details open>
-<summary><strong>20 built-in tools</strong> (click to expand schema names)</summary>
+<summary><strong>21 built-in tools</strong> (click to expand schema names)</summary>
 
 | Category | Tools |
 |---|---|
@@ -205,7 +205,7 @@ Most CLI agents lock you into one API shape. `fw.py` internally speaks only Open
 | **File I/O** | `read`, `write`, `edit`, `multiedit`, `extract`, `apply_patch` |
 | **Search** | `glob`, `grep`, `view_symbol`, `file_index` |
 | **Web** | `webfetch`, `websearch` |
-| **Planning** | `todowrite`, `todoread`, `question` |
+| **Planning** | `todowrite`, `todoread`, `question`, `verify` |
 | **Code intelligence** | `lsp` |
 | **Orchestration** | `task` (subagent dispatch), `set_tools`, `skill` |
 
@@ -222,6 +222,7 @@ Type `/web` in the running CLI to open a local browser bridge — **no separate 
 - **Live event mirroring** — every `Event` your session emits (text deltas, tool calls, tool results, thinking, todo updates) is pushed to the browser as JSON in real time, not just a terminal byte-stream replay.
 - **Slash commands are CLI-only by design** — typing `/something` or `exit`/`quit`/`q` from the web client is rejected with a warning; the Web UI is for chatting and watching the agent work, not for driving REPL commands. Switch back to the real terminal (`Esc`) to run commands.
 - **Single active session** — the web bridge always mirrors whichever `SessionState` is currently registered as the CLI's session (e.g. switching sessions via `/sessions` re-points the bridge automatically).
+- **Image support** — attach images directly from the browser; only `/web` can send them (the real keyboard has no such path). Each incoming image is validated server-side before it reaches the model: unsupported MIME types are dropped with a warning, oversized base64 payloads (unresized full-res photos) are rejected with the limit shown, and up to 6 images per turn are accepted. The frontend also learns per-model whether the currently selected model is known to support vision, so it doesn't blindly unlock the image button every time.
 
 ```
 /web
@@ -289,6 +290,8 @@ fw.py                        # Entry point / module loader
 ├── 01_ui.py                 # Terminal UI components
 ├── 01b_aws.py                # AWS Bedrock Converse adapter
 ├── 01c_anthropic.py          # Anthropic Messages API adapter
+├── 01d_events.py             # EventBus, ask()/PendingAsk, CLI+Web renderers, web input bridge
+├── 01e_openai_responses.py   # OpenAI Responses API (/v1/responses) adapter
 ├── 02_provider.py           # Provider registry & API config
 ├── 03_mcp.py                # MCP integration
 ├── 04_agent_cache.py        # Permissions, file cache, sandbox
@@ -516,7 +519,7 @@ Phần lớn CLI agent chỉ hỗ trợ 1 dạng API duy nhất. `fw.py` nội b
 ### Công cụ của agent
 
 <details open>
-<summary><strong>20 tool tích hợp sẵn</strong> (bấm để xem theo nhóm)</summary>
+<summary><strong>21 tool tích hợp sẵn</strong> (bấm để xem theo nhóm)</summary>
 
 | Nhóm | Tools |
 |---|---|
@@ -524,7 +527,7 @@ Phần lớn CLI agent chỉ hỗ trợ 1 dạng API duy nhất. `fw.py` nội b
 | **Đọc/ghi file** | `read`, `write`, `edit`, `multiedit`, `extract`, `apply_patch` |
 | **Tìm kiếm** | `glob`, `grep`, `view_symbol`, `file_index` |
 | **Web** | `webfetch`, `websearch` |
-| **Lập kế hoạch** | `todowrite`, `todoread`, `question` |
+| **Lập kế hoạch** | `todowrite`, `todoread`, `question`, `verify` |
 | **Code intelligence** | `lsp` |
 | **Điều phối** | `task` (gọi subagent), `set_tools`, `skill` |
 
@@ -541,6 +544,7 @@ Gõ `/web` trong CLI đang chạy để mở bridge trình duyệt local — **k
 - **Phản chiếu event trực tiếp** — mọi `Event` phiên phát ra (text streaming, tool call, kết quả tool, thinking, todo update) được đẩy qua trình duyệt dạng JSON theo thời gian thực, không phải replay byte-stream terminal thô.
 - **Lệnh slash chỉ dùng được trên CLI thật, có chủ đích** — gõ `/lệnh` hoặc `exit`/`quit`/`q` từ web client sẽ bị từ chối kèm cảnh báo; Web UI dùng để chat và xem agent làm việc, không phải để điều khiển REPL. Quay lại terminal thật (`Esc`) để chạy lệnh.
 - **Chỉ 1 session hoạt động tại 1 thời điểm** — web bridge luôn phản chiếu đúng `SessionState` đang được đăng ký là session của CLI (vd đổi session qua `/sessions` sẽ tự động trỏ lại bridge).
+- **Hỗ trợ gửi ảnh** — đính kèm ảnh trực tiếp từ trình duyệt; chỉ `/web` mới gửi được ảnh (bàn phím CLI thật không có đường nào làm việc này). Mỗi ảnh gửi lên được kiểm tra ở phía server trước khi đưa vào turn: định dạng MIME không hỗ trợ sẽ bị bỏ qua kèm cảnh báo, ảnh base64 quá lớn (ảnh full-res chưa resize) bị chặn kèm giới hạn cụ thể, tối đa 6 ảnh mỗi lượt. Frontend cũng tự nhớ theo từng model đã biết hỗ trợ ảnh hay chưa, thay vì luôn mở khoá nút gửi ảnh một cách mù quáng.
 
 ```
 /web
@@ -608,6 +612,8 @@ fw.py                        # Điểm khởi chạy / loader module
 ├── 01_ui.py                 # Giao diện terminal
 ├── 01b_aws.py                # Adapter AWS Bedrock Converse
 ├── 01c_anthropic.py          # Adapter Anthropic Messages API
+├── 01d_events.py             # EventBus, ask()/PendingAsk, renderer CLI+Web, web input bridge
+├── 01e_openai_responses.py   # Adapter OpenAI Responses API (/v1/responses)
 ├── 02_provider.py           # Registry & cấu hình nhà cung cấp
 ├── 03_mcp.py                # Tích hợp MCP
 ├── 04_agent_cache.py        # Permission, file cache, sandbox
