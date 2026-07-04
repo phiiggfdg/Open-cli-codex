@@ -414,6 +414,7 @@ HELP = f"""
   {CYAN}/commands{R}            list custom commands
   {CYAN}/mcp [list|add|remove|refresh]{R}  MCP servers  {DIM}(Command Code only){R}
   {CYAN}/web{R}                 mở web UI local  {DIM}(terminal bridge qua trình duyệt){R}
+  {CYAN}/format{R}              đổi format API cho model hiện tại  {DIM}(openai/anthropic/openai_responses){R}
   {CYAN}/help{R}                this screen
   {DIM}exit / quit / q{R}       quit
 
@@ -631,10 +632,16 @@ def main():
             print(f"  {bar}  {cost_s}")
         try:
             ag_col  = BLUE if agent == AGENT_PLAN else GREEN
+            user_images = None
             user = get_next_input(
                 state,
                 f"{GRAY}{short}{R} {ag_col}{agent}{R} {TEAL}{BOLD}❯{R} "
             )
+            # Ảnh (nếu có) đi kèm dòng input này -- CHỈ khác None khi input
+            # tới từ WS handler /web (xem gate trong get_next_input_images).
+            # Đọc NGAY sau get_next_input(), trước khi vòng lặp có thể gọi
+            # lại lần nữa (last_images bị next_line() ghi đè ở lần sau).
+            user_images = get_next_input_images(state)
         except EOFError:
             user = None
             _cancel_bg.set()
@@ -657,7 +664,15 @@ def main():
             _cancel_bg.set()
         if user is None:
             print(f"\n  {DIM}Goodbye.{R}\n"); break
-        if not user: continue
+        # BUG: trước đây "if not user: continue" bỏ qua MỌI input rỗng --
+        # đúng cho CLI (Enter suông = bỏ qua). Nhưng trên /web, người dùng
+        # có thể gửi CHỈ ẢNH không kèm chữ (value rỗng, chỉ có images) --
+        # user_images vẫn có dữ liệu dù user là "". Nếu vẫn continue ở đây,
+        # ảnh bị nuốt hoàn toàn: không emit turn_start, không lưu, không
+        # gọi AI -- đúng hiện tượng "gửi ảnh mà im lặng" đã gặp. Chỉ
+        # continue khi THỰC SỰ không có gì cả (không chữ VÀ không ảnh).
+        if not user and not user_images:
+            continue
 
         # BUG ĐÃ SỬA: bấm chọn lệnh từ gợi ý (autocomplete) trên Web UI
         # (applySlashChoice ở web_index.html) luôn chèn "cmd + dấu cách"
@@ -708,7 +723,12 @@ def main():
         # state.emit() khi có state (xem block "if _cmd_parts[0] ==
         # '/mode':"). Không có input()/UI raw-mode nào, logic nghiệp vụ
         # (_probe_thinking_support/_probe_thinking_disable) không đổi gì.
-        _WEB_ALLOWED_CMDS = ("/listkeys", "/rmkey", "/deletekey", "/addkey", "/setkey", "/model", "/mode")
+        # /format: mới thêm — cho phép chạy qua web vì handler
+        # (_ask_change_format) chỉ dùng state.emit()/state.ask(kind=
+        # "choice"/"text"), không có input()/print() trần hay raw-mode
+        # terminal nào (đã xác nhận qua đọc source, giống lý do 5 lệnh
+        # key + /model/mode được whitelist ở trên).
+        _WEB_ALLOWED_CMDS = ("/listkeys", "/rmkey", "/deletekey", "/addkey", "/setkey", "/model", "/mode", "/format")
         _cmd0 = user.split(None, 1)[0].lower() if user.split(None, 1) else ""
         if (state is not None and state.web_bridge is not None
                 and state.web_bridge.is_armed()
@@ -717,7 +737,7 @@ def main():
             state.emit(EV_WARN, text=(
                 "Lệnh / (và exit/quit) không dùng được qua Web UI — bấm Esc "
                 "trên CLI để chạy lệnh, Web UI chỉ để chat/thao tác code.\n"
-                "(Riêng /listkeys /rmkey /deletekey /addkey /setkey /model /mode dùng được.)\n"
+                "(Riêng /listkeys /rmkey /deletekey /addkey /setkey /model /mode /format dùng được.)\n"
             ))
             continue
 
@@ -925,9 +945,27 @@ def main():
             # từng được dùng tới) ngay sau khi đổi state.model -- JS có case
             # riêng cập nhật lại metaEl mà không đụng gì khác trong log
             # (không xoá lịch sử chat như session_init đầy đủ sẽ làm).
-            state.emit(EV_SESSION_META, model=state.model, agent=state.agent)
+            # BUG ĐÃ SỬA (cùng gốc với session_init ở 12_web.py): đổi model
+            # qua /model giữa chừng cũng phải cho frontend biết NGAY model
+            # mới này đã từng biết hỗ trợ ảnh hay chưa (thay vì luôn mở khoá
+            # mù quáng qua maybeResetVisionBlock rồi đợi thử lại mới biết).
+            state.emit(EV_SESSION_META, model=state.model, agent=state.agent,
+                       vision_support=_vision_support_get(state.model))
             out = f"{GREEN}✓ {short}{R}\n"
             state.emit(EV_INFO, text=out, raw=True)
+            continue
+
+        if user.lower() == "/format":
+            # Trigger TAY cho đúng logic vốn chỉ tự chạy khi gặp HTTP 404
+            # sai-format (xem _ask_change_format trong 09_api_system.py) —
+            # dùng LẠI nguyên hàm đó, không viết logic riêng. Không rẽ
+            # nhánh CLI/web như /model: _ask_change_format() chỉ gọi
+            # state.emit()/state.ask(kind="choice"/"text") — cả 2 kind này
+            # đã chạy đúng trên CLI (cli_ask_handler) VÀ web (web_ask_handler
+            # + renderAsk, xem web_index.html) từ trước (chính nhánh 404 đã
+            # chứng minh điều này), không cần UI raw-mode riêng như
+            # choose_model() nên không cần tách 2 hàm như /model.
+            _ask_change_format(state, model)
             continue
 
         if user.lower() == "/agent":
@@ -1008,13 +1046,27 @@ def main():
                     continue
                 _thinking_mode = arg
                 _mode_lines = [f"{GREEN}✓ Thinking mode: {arg}{R}"]
-                if arg == "on" and (_prov().get("format_anthropic") or _active_provider == "aws_bedrock"):
+                _fmt_kind_mode = _format_kind_for(model)
+                if arg == "on" and (_fmt_kind_mode == "anthropic" or _active_provider == "aws_bedrock"):
                     _mode_lines.append(f"{DIM}  Lưu ý: nội dung thinking sẽ hiện ra màn hình (màu xám/dim, "
                           f"tag [thinking]). Signature được lưu/replay tự động để giữ thinking "
                           f"hoạt động cả ở các turn sau có tool_calls (tối ưu cache); nếu history "
                           f"cũ thiếu signature hợp lệ, thinking sẽ tự tắt riêng cho turn đó thay "
                           f"vì báo lỗi.{R}")
-                if (arg == "off" and (_prov().get("format_anthropic") or _active_provider == "aws_bedrock")
+                elif arg == "on" and _fmt_kind_mode == "openai_responses":
+                    # KHÁC Anthropic: đây là bản tóm tắt (reasoning summary)
+                    # do model tự viết lại, KHÔNG phải chain-of-thought thật
+                    # (OpenAI không expose raw reasoning tokens qua API) —
+                    # và KHÔNG có cơ chế signature/encrypted_content replay
+                    # nào được làm ở bản này (ngoài scope "/mode on/off"),
+                    # nên không ghi nhầm là "lưu/replay tự động" như nhánh
+                    # Anthropic — tránh hứa hẹn sai tính năng chưa tồn tại.
+                    _mode_lines.append(f"{DIM}  Lưu ý: đây là bản TÓM TẮT reasoning (không phải "
+                          f"chain-of-thought thật — OpenAI không lộ token suy luận gốc), hiện ra "
+                          f"màn hình dạng [thinking]. Chưa hỗ trợ lưu/replay reasoning qua nhiều "
+                          f"lượt có tool_calls (khác Anthropic) — mỗi turn tự suy luận lại từ đầu.{R}")
+                if (arg == "off" and (_fmt_kind_mode in ("anthropic", "openai_responses")
+                                       or _active_provider == "aws_bedrock")
                         and not _thinking_disable_already_probed(model)):
                     # Lần đầu tắt thinking cho cặp (provider, model) này —
                     # probe xem field "disabled" có thực sự tắt được hay
@@ -1711,6 +1763,32 @@ Write the AGENTS.md content directly. Be concise but complete."""
                             state.emit(EV_INTERRUPTED, checkpoint_id=cid)
                         else:
                             print(f"\n{YELLOW}  checkpoint {cid} saved after interrupt{R}")
+                    finally:
+                        # BUG ĐÃ SỬA: run_model/run_agent chỉ là override RIÊNG
+                        # cho lượt custom-command này (frontmatter "model:"/
+                        # "agent:" trong file .md, field tùy chọn — phần lớn
+                        # command không set, khi đó run_model==model/
+                        # run_agent==agent nên fix này không đổi gì quan sát
+                        # được). Trước đây state.model/state.agent bị set = 
+                        # run_model/run_agent ở trên nhưng KHÔNG BAO GIỜ được
+                        # phục hồi lại model/agent gốc của session sau khi turn
+                        # kết thúc (dù thành công hay bị Ctrl+C) — biến local
+                        # model/agent (dùng cho agent_turn() ở nhánh chat bình
+                        # thường, dòng ~1786) không bị ảnh hưởng nên request
+                        # thật vẫn đúng, nhưng state.model/state.agent bị lệch
+                        # vĩnh viễn. Hệ quả quan sát được: 12_web.py
+                        # (_send_session_init, gọi khi mở tab web mới/reconnect)
+                        # đọc st.model/st.agent để hiển thị lên UI + tra
+                        # vision_support theo model — nếu mở web sau khi vừa
+                        # chạy 1 custom command có model/agent riêng, web hiện
+                        # SAI tên model/agent và tra vision_support sai model.
+                        # Dùng finally (không phải đặt cuối try) để đảm bảo
+                        # phục hồi đúng CẢ KHI KeyboardInterrupt xảy ra giữa
+                        # agent_turn (nhánh except phía trên không có gì đọc
+                        # lại state.model/agent nên phục hồi ở đây không phá
+                        # logic checkpoint/emit đã chạy trước đó).
+                        state.model = model
+                        state.agent = agent
                 # Cùng bug print() trần vô điều kiện đã sửa ở nhánh chat
                 # bình thường phía dưới -- nhánh custom-command này cũng
                 # chạy khi gõ qua web (dù phần lớn UI custom-command chưa
@@ -1731,8 +1809,24 @@ Write the AGENTS.md content directly. Be concise but complete."""
         # Time chỉ lưu DB, không gửi lên API
         # Đếm trước khi append — tránh off-by-one khi resume session cũ
         is_first_turn = len([m for m in messages if m.get("role") == "user"]) == 0
-        messages.append({"role":"user","content":expanded})
-        message_save(conn, sid, "user", expanded)
+        if user_images:
+            # Content dạng OpenAI multimodal — 3 adapter (OpenAI-compat gốc,
+            # Anthropic, AWS Bedrock) tự dịch tiếp ở tầng dưới (xem
+            # _convert_content_blocks_to_anthropic / _to_converse). Ảnh chỉ
+            # sống trong RAM (biến messages) — KHÔNG lưu DB (xem message_save
+            # ngay dưới, dùng "expanded" thuần text, không phải content_val
+            # có ảnh). Turn sau, _strip_old_images() (09_api_system.py) sẽ
+            # tự thay ảnh này bằng placeholder khi build lại payload gọi API.
+            content_val = [{"type": "text", "text": expanded or "(đã gửi ảnh, không kèm chữ)"}] + [
+                {"type": "image_url",
+                 "image_url": {"url": f"data:{im['mime']};base64,{im['data']}"}}
+                for im in user_images
+            ]
+            messages.append({"role": "user", "content": content_val})
+            message_save(conn, sid, "user", expanded or "(đã gửi ảnh, không kèm chữ)")
+        else:
+            messages.append({"role":"user","content":expanded})
+            message_save(conn, sid, "user", expanded)
         try:
             messages = agent_turn(messages, model, api_key, conn, sid, agent=agent, state=state)
             state.messages = messages

@@ -724,7 +724,8 @@ def _call_simple(messages, model, api_key, retry_max=None, silent=False,
                     # Response Converse (non-stream) có schema khác OpenAI —
                     # dịch lại qua aws.py thay vì parse trực tiếp ở đây.
                     return parse_converse_response(body)
-                if _prov().get("format_anthropic"):
+                _fk = _format_kind_for(model)
+                if _fk == "anthropic":
                     # Anthropic non-stream: {"content": [{"type":"text","text":"..."},
                     #                                    {"type":"tool_use",...}]}
                     # _call_simple chỉ dùng cho text-only tasks (compact, rename,
@@ -736,6 +737,14 @@ def _call_simple(messages, model, api_key, retry_max=None, silent=False,
                         if b.get("type") == "text"
                     )
                     return {"text": text, "tool_calls": []}
+                if _fk == "openai_responses":
+                    # Responses API non-stream: body["output"] là list Items —
+                    # dùng parse_responses_response() (01e_openai_responses.py),
+                    # cùng pattern parse_converse_response() ở nhánh aws_bedrock
+                    # phía trên. _call_simple chỉ cần text (text-only tasks),
+                    # bỏ tool_calls y hệt nhánh Anthropic ngay trên.
+                    parsed = parse_responses_response(body)
+                    return {"text": parsed["text"], "tool_calls": []}
                 msg = body["choices"][0]["message"]
                 return {"text": msg.get("content", ""), "tool_calls": []}
         except urllib.error.HTTPError as e:
@@ -1092,11 +1101,405 @@ def _thinking_disable_mark_probed(model: str):
     cfg["thinking_disable_warned"] = table
     save_config(cfg)
 
+# ── Vision support cache (chỉ dùng qua /web — xem 12_web.py) ────────────────
+# KHÔNG probe chủ động (khác _probe_thinking_support): chỉ ghi nhận kết quả
+# của request THẬT do user gửi kèm ảnh. True = đã có ít nhất 1 lần gửi ảnh
+# thành công cho cặp (provider, model) này. False = đã thử và provider/model
+# từ chối (lỗi liên quan ảnh — xem _is_vision_error bên dưới). None = chưa
+# từng thử, UI mặc định coi như "có thể dùng được" cho tới khi biết chắc False.
+def _vision_key(model: str) -> str:
+    return f"{_active_provider}::{model}"
+
+def _vision_support_get(model: str):
+    # FIX: dùng chung _pool_lock (định nghĩa ở 11_key_pool.py, cùng
+    # namespace exec — an toàn tra cứu lúc runtime dù load sau file này,
+    # xem fw.py:_load_modules) bọc quanh mọi read-modify-write config.json.
+    # Trước đây hàm này đọc/ghi config.json hoàn toàn không lock, trong khi
+    # 11_key_pool.py đã tự nhận có race "lost update" khi 2 thread cùng
+    # đọc-sửa-ghi file này gần như đồng thời (vd _auto_rename_session chạy
+    # nền + turn có ảnh chạy cùng lúc) — dùng chung 1 lock loại bỏ race đó
+    # thay vì chỉ bảo vệ pool mà bỏ sót vision_support.
+    with _pool_lock:
+        cfg = load_config()
+        table = cfg.get("vision_support", {})
+        return table.get(_vision_key(model))  # None nếu chưa biết
+
+def _vision_support_set(model: str, supported: bool):
+    with _pool_lock:
+        cfg = load_config()
+        table = cfg.get("vision_support", {})
+        table[_vision_key(model)] = supported
+        cfg["vision_support"] = table
+        save_config(cfg)
+
+def _is_vision_error(body_txt: str) -> bool:
+    """Đoán lỗi HTTP có liên quan tới việc model/provider không hiểu block
+    ảnh hay không — dùng để quyết định set vision_support=False thay vì cứ
+    coi mọi lỗi 400 là do ảnh (có thể do nguyên nhân khác, vd max_tokens).
+
+    BUG ĐÃ SỬA: 2 cụm "invalid content" và "unsupported content type" là
+    GENERIC — không tự thân nhắc gì tới ảnh, chỉ mô tả "nội dung/loại nội
+    dung không hợp lệ" nói chung. Trước đây 2 cụm này đứng CHUNG danh sách
+    OR phẳng với các từ khoá đặc hiệu ảnh ("image", "vision", "image_url"...)
+    — nghĩa là BẤT KỲ lỗi 400/415/422 nào (schema sai, tool_choice sai, field
+    thiếu...) chỉ cần tình cờ chứa "invalid content" trong message lỗi, ở 1
+    turn CÓ gửi ảnh, sẽ bị hiểu nhầm là lỗi vision → set vision_support=False
+    SAI, khoá nhầm nút upload ảnh vĩnh viễn cho model đó dù model hỗ trợ ảnh
+    bình thường, lỗi thật nằm ở chỗ khác.
+
+    Ý định sửa ban đầu là "chỉ tin 2 cụm generic này khi ĐI KÈM 1 từ khoá
+    ảnh đặc hiệu trong cùng body" — nhưng nhận ra ngay khi viết: nếu body đã
+    chứa 1 từ khoá đặc hiệu ảnh (vd "image") thì hàm NGAY LẬP TỨC trả True
+    từ điều kiện đặc hiệu rồi, không bao giờ đi tới việc xét cụm generic
+    nữa — nghĩa là điều kiện "generic kèm đặc hiệu" không bao giờ có cơ hội
+    đóng góp thêm bất kỳ True nào so với chỉ dùng riêng từ khoá đặc hiệu.
+    Do đó cách sửa ĐÚNG và đơn giản nhất là bỏ hẳn 2 cụm generic này khỏi
+    danh sách phát hiện — chỉ dựa vào từ khoá đặc hiệu ảnh. Không mất khả
+    năng phát hiện thật: các lỗi vision thật gặp trong log dự án (Bedrock
+    "unsupported content type: image_url", "does not support images"...)
+    đều CÒN chứa sẵn 1 từ khoá đặc hiệu khác trong cùng câu, nên vẫn bắt
+    được qua nhánh đặc hiệu — chỉ loại bỏ đúng phần gây false-positive."""
+    t = body_txt.lower()
+    return any(x in t for x in (
+        "image", "vision", "multimodal", "does not support images", "image_url",
+    ))
+
+# ── Model format override (per-model, khác field format_anthropic của cả
+# provider) ──────────────────────────────────────────────────────────────
+# BỐI CẢNH: field "format_anthropic" (02_provider.py, wizard _add_custom_provider)
+# là cấu hình CẤP PROVIDER — 1 base_url, 1 format cố định cho MỌI model. Thực
+# tế 1 số gateway aggregator (vd openmodel.ai) route nhiều model từ nhiều
+# nhà cung cấp gốc khác nhau qua CÙNG 1 base_url, và không phải model nào
+# cũng có channel backend cho cả 2 format /messages lẫn /chat/completions —
+# gọi 1 model qua đúng format cấu hình sẵn của provider vẫn có thể ăn lỗi
+# kiểu "no channel available for model X with messages api" (HTTP 404) nếu
+# model đó chỉ được gateway map sang OpenAI-compat, không phải do code gọi
+# sai gì cả. Bảng override dưới đây (cùng pattern với _vision_support_get/
+# set phía trên) cho phép ghi nhớ riêng CHO TỪNG MODEL: model này thật ra
+# cần format khác với mặc định của provider — không đổi field provider gốc
+# (sẽ ảnh hưởng mọi model khác của cùng provider đó).
+#
+# BUG ĐÃ SỬA (thực tế gặp với openmodel.ai): đổi format thôi CHƯA ĐỦ — gateway
+# có thể dùng BASE_URL KHÁC HẲN cho mỗi format, không chỉ khác đuôi path
+# (/messages vs /chat/completions). Ví dụ base_url lưu sẵn cho format
+# Anthropic (.../v1) build ra .../v1/chat/completions khi đổi format lại 404
+# "route not found" — route thật cho nhánh OpenAI nằm ở base khác. Value lưu
+# trong bảng giờ là dict {"format_anthropic": bool, "base_url": str|None}
+# thay vì bool đơn thuần — base_url=None nghĩa là "dùng chung base của
+# provider" (đúng hành vi cũ). Đọc field cũ (bool) vẫn hoạt động (coi như
+# base_url=None) để không phá override đã lưu từ bản trước.
+def _format_override_key(model: str) -> str:
+    return f"{_active_provider}::{model}"
+
+def _format_override_get_raw(model: str):
+    """Trả về value thô đã lưu (dict mới hoặc bool cũ), None nếu chưa từng
+    override. Dùng nội bộ bởi _format_anthropic_for/_format_base_url_for —
+    code khác nên gọi 2 hàm đó thay vì đọc raw trực tiếp."""
+    with _pool_lock:
+        cfg = load_config()
+        table = cfg.get("model_format_override", {})
+        return table.get(_format_override_key(model))
+
+def _format_override_set(model: str, format_kind: str, base_url: str | None = None):
+    """Lưu override cho model này. base_url=None → dùng chung base_url của
+    provider (không có base riêng cho format mới này).
+
+    format_kind: "openai" | "anthropic" | "openai_responses".
+
+    BUG TRÁNH (mở rộng từ bool → 3 format): trước đây tham số là
+    use_anthropic: bool và dict lưu chỉ có "format_anthropic". Giữ NGUYÊN
+    field "format_anthropic" song song (suy ra = format_kind=="anthropic")
+    để bất kỳ code nào (kể cả code ngoài đã quen đọc field cũ trực tiếp,
+    hoặc bản build trước khi có patch này) đọc raw.get("format_anthropic")
+    vẫn ra đúng giá trị — không cần biết field "format_kind" mới tồn tại.
+    Đây là lý do KHÔNG xoá field cũ, dù _format_anthropic_for() bên dưới
+    giờ đã đọc qua _format_kind_for() là chính."""
+    with _pool_lock:
+        cfg = load_config()
+        table = cfg.get("model_format_override", {})
+        table[_format_override_key(model)] = {
+            "format_kind": format_kind,
+            "format_anthropic": (format_kind == "anthropic"),
+            "base_url": base_url,
+        }
+        cfg["model_format_override"] = table
+        save_config(cfg)
+
+def _format_kind_for(model: str) -> str:
+    """Format API có hiệu lực cho MODEL NÀY — "openai" | "anthropic" |
+    "openai_responses". Nguồn chân lý DUY NHẤT cho rẽ nhánh format, thay
+    cho _prov().get("format_anthropic")/"format_kind" trực tiếp ở mọi nơi,
+    để override per-model (nếu có) luôn được tôn trọng.
+
+    Thứ tự fallback khi chưa có override riêng cho model:
+      1. raw["format_kind"] nếu override đã lưu bằng bản MỚI (có field này)
+      2. raw["format_anthropic"] nếu override lưu bằng bản CŨ (chỉ có bool)
+         — suy luận: True → "anthropic", False → "openai" (bản cũ chưa hề
+         biết tới "openai_responses" nên không thể là giá trị sai ở đây).
+      3. _prov()["format_kind"] nếu provider (custom, wizard mới) đã set
+      4. _prov()["format_anthropic"] nếu provider từ bản CŨ chỉ có bool
+      5. "openai" — mặc định cuối cùng, đúng yêu cầu "format mặc định là
+         OpenAI Chat Completions" khi không có gì khác được cấu hình.
+    """
+    raw = _format_override_get_raw(model or "")
+    if isinstance(raw, dict):
+        if raw.get("format_kind"):
+            return raw["format_kind"]
+        return "anthropic" if raw.get("format_anthropic") else "openai"
+    if raw is not None:
+        # tương thích ngược: bản rất cũ lưu thẳng bool (không phải dict)
+        return "anthropic" if bool(raw) else "openai"
+    prov = _prov()
+    if prov.get("format_kind"):
+        return prov["format_kind"]
+    if prov.get("format_anthropic"):
+        return "anthropic"
+    return "openai"
+
+def _format_anthropic_for(model: str) -> bool:
+    """Format Anthropic Messages API có hiệu lực cho MODEL NÀY hay không —
+    giữ lại làm alias mỏng qua _format_kind_for() để mọi điểm gọi CŨ (đã
+    tồn tại trước khi có OpenAI Responses adapter) không cần sửa gì thêm —
+    chúng chỉ cần biết "có phải Anthropic hay không", còn việc phân biệt
+    openai vs openai_responses nằm ở _format_kind_for() cho code MỚI."""
+    return _format_kind_for(model) == "anthropic"
+
+def _format_base_url_for(model: str) -> str | None:
+    """Base URL riêng đã lưu cho format hiện tại (theo override) của model
+    này, None nếu chưa từng lưu riêng — khi đó caller tự fallback về
+    base_url mặc định của provider (_base_url() / _prov()["base_url"])."""
+    raw = _format_override_get_raw(model or "")
+    if isinstance(raw, dict):
+        return raw.get("base_url") or None
+    return None  # raw là bool cũ hoặc None → chưa từng có base_url riêng
+
+def _format_override_clear(model: str) -> bool:
+    """Xoá override (format + base_url) đã lưu cho model này, trả về provider
+    mặc định. Dùng khi override đã lưu từ trước nhưng VẪN 404 kiểu sai-format
+    ở lần gọi sau (session mới, hoặc base_url người dùng nhập vẫn sai) — tự
+    phục hồi về mặc định thay vì kẹt vĩnh viễn ở 1 format lỗi, và không hỏi
+    lại (hỏi cũng vô ích vì override vừa lưu đã chứng minh sai). Trả về
+    True nếu có override thật sự bị xoá, False nếu model này chưa từng có
+    override (gọi nhầm/không cần thiết)."""
+    with _pool_lock:
+        cfg = load_config()
+        table = cfg.get("model_format_override", {})
+        key = _format_override_key(model)
+        if key not in table:
+            return False
+        del table[key]
+        cfg["model_format_override"] = table
+        save_config(cfg)
+        return True
+
+
+def _ask_change_format(state, model: str) -> bool:
+    """Hỏi người dùng đổi format API (+ base_url riêng nếu cần) cho MODEL
+    NÀY — LÕI LOGIC được tách nguyên văn từ nhánh CASE 1 (404 sai-format tự
+    động phát hiện) trong call_api_stream(), để lệnh /format (chủ động, do
+    người dùng gõ, không cần chờ 404 thật xảy ra) dùng LẠI ĐÚNG cùng 1 logic
+    — không viết lại, không đổi hành vi. Khác biệt duy nhất so với bản gốc
+    trong call_api_stream: không có spinner (lệnh gõ tay không có spinner
+    đang chạy), không tự continue/retry gì (gọi xong là xong, không nằm
+    trong vòng lặp retry của call_api_stream).
+
+    Giữ đúng quy tắc "chỉ 2 lựa chọn CÒN LẠI, không cho chọn lại format
+    hiện tại" — y hệt nhánh 404, không mở rộng thành 3 lựa chọn dù gọi chủ
+    động, vì yêu cầu là "y chang bắt 404".
+
+    Trả về True nếu đã lưu override mới, False nếu người dùng chọn "0"
+    hoặc câu trả lời không khớp lựa chọn nào (không đổi gì)."""
+    _FMT_LABELS = {
+        "openai":           "OpenAI Chat Completions",
+        "anthropic":        "Anthropic Messages API",
+        "openai_responses": "OpenAI Responses API",
+    }
+    _cur_kind = _format_kind_for(model)
+    _other_kinds = [k for k in ("openai", "anthropic", "openai_responses")
+                    if k != _cur_kind]
+    _cur_label = _FMT_LABELS[_cur_kind]
+    _other_labels = [_FMT_LABELS[k] for k in _other_kinds]
+    _menu_txt = (f"\n{YELLOW}  Model '{model}' đang dùng format {_cur_label}.{R}\n"
+                 f"  {DIM}Đổi sang format khác cho riêng model này?{R}\n"
+                 f"  {YELLOW}1{R}  {_other_labels[0]}\n"
+                 f"  {YELLOW}2{R}  {_other_labels[1]}\n"
+                 f"  {YELLOW}0{R}  {DIM}Không đổi (giữ nguyên){R}")
+    if state: state.emit(EV_WARN, text=_menu_txt, raw=True)
+    else: print(_menu_txt, flush=True)
+    _prompt = "Chọn số (1/2/0), hoặc Enter để bỏ qua: "
+    if state is not None:
+        _ans = state.ask(_prompt, kind="choice", default="0",
+                          extra={"options": _other_labels})
+    else:
+        try:
+            _ans = input(f"  {CYAN}{_prompt}{R}").strip()
+        except (EOFError, KeyboardInterrupt):
+            _ans = "0"
+    _ans_norm = str(_ans or "0").strip().lower()
+    _new_kind = None
+    if _ans_norm == "1":
+        _new_kind = _other_kinds[0]
+    elif _ans_norm == "2":
+        _new_kind = _other_kinds[1]
+    else:
+        for _k in _other_kinds:
+            if _ans_norm == _FMT_LABELS[_k].lower():
+                _new_kind = _k
+                break
+    if _new_kind is None:
+        return False
+
+    _new_label = _FMT_LABELS[_new_kind]
+    _default_base = _prov().get("base_url", "")
+    _base_prompt = (f"Base URL cho format {_new_label} có khác "
+                     f"'{_default_base}' không? Enter để giữ nguyên, "
+                     f"hoặc dán URL mới: ")
+    if state is not None:
+        _new_base = state.ask(_base_prompt, kind="text", default=_default_base)
+    else:
+        try:
+            _new_base = input(f"\n  {YELLOW}{_base_prompt}{R}").strip()
+        except (EOFError, KeyboardInterrupt):
+            _new_base = ""
+    _new_base = (_new_base or "").strip().rstrip("/") or None
+    if _new_base == (_default_base or "").rstrip("/"):
+        _new_base = None
+    _base_invalid = False
+    if _new_base is not None:
+        _parsed = urllib.parse.urlparse(_new_base)
+        if _parsed.scheme not in ("http", "https") or not _parsed.netloc:
+            _base_invalid = True
+            _bad_base = _new_base
+            _new_base = None
+    if _base_invalid:
+        _warn_txt = (f"\n{YELLOW}  ⚠ Base URL '{_bad_base}' không hợp lệ "
+                     f"(thiếu http(s):// hoặc host) → bỏ qua, dùng base "
+                     f"URL mặc định của provider cho format {_new_label}.{R}")
+        if state: state.emit(EV_WARN, text=_warn_txt, raw=True)
+        else: print(_warn_txt, flush=True)
+    _format_override_set(model, _new_kind, base_url=_new_base)
+    _txt = (f"\n{GREEN}✓ Đã lưu: model '{model}' giờ dùng format "
+             f"{_new_label}" +
+             (f", base URL {_new_base}" if _new_base else "") +
+             f".{R}")
+    if state: state.emit(EV_INFO, text=_txt, raw=True)
+    else: print(_txt)
+    return True
+
+
+def _looks_like_wrong_api_format(body_txt: str) -> bool:
+    """Đoán lỗi 404 có phải do gọi SAI FORMAT API cho model này hay không
+    (vd gateway aggregator như openmodel.ai chỉ có channel OpenAI-compat cho
+    model X nhưng provider đang cấu hình gọi qua Anthropic Messages API, hoặc
+    ngược lại) — dựa trên message lỗi thật đã gặp: "no channel available for
+    model X with messages api". Bắt tổng quát theo cụm từ, không hardcode
+    nguyên câu, vì các gateway khác có thể diễn đạt hơi khác nhau."""
+    t = body_txt.lower()
+    return "channel" in t and (
+        "messages api" in t or "chat completions" in t or "endpoint" in t
+    )
+
+def _looks_like_vision_denial(text: str) -> bool:
+    """Đoán model có tự nhận KHÔNG thấy/đọc được ảnh trong chính câu trả lời
+    hay không — dùng làm bằng chứng NGƯỢC khi request vẫn 200 OK (không lỗi
+    HTTP) nhưng gateway đã âm thầm bỏ ảnh trước khi tới model. Chỉ cần bắt
+    được phần lớn các câu phổ biến, không cần tuyệt đối chính xác — false
+    negative (bỏ sót câu denial lạ) chỉ khiến cache tạm sai (không nguy
+    hiểm, vẫn tự sửa ở lần gọi có lỗi HTTP thật); false positive (coi nhầm
+    câu trả lời BÌNH THƯỜNG là denial) nguy hiểm hơn nên dùng regex có ngữ
+    cảnh phủ định + từ khoá ảnh, không dùng từ đơn lẻ dễ trùng."""
+    if not text:
+        return False
+    t = text.lower()
+    # Cụm cố định phổ biến (khớp nhanh, không cần regex)
+    if any(x in t for x in (
+        "không thể xem được hình ảnh", "không thể xem hình ảnh",
+        "không đọc được ảnh", "không đọc được hình ảnh",
+        "không thấy ảnh", "không thấy hình ảnh",
+        "không nhận được ảnh", "không nhận được hình ảnh",
+        "không hỗ trợ xem ảnh", "không hỗ trợ hình ảnh",
+        "tool của tôi không có khả năng", "tôi không có khả năng xem",
+        "cannot see the image", "can't see the image", "cannot view the image",
+        "unable to see the image", "unable to view the image",
+        "don't have the ability to see", "do not have the ability to see",
+        "no image was", "no image provided", "i don't see an image",
+        "i do not see an image", "i don't see any image",
+    )):
+        return True
+    # Câu đảo cấu trúc: "<cụm liên quan ảnh> ... không đọc/xem/thấy/nhận được"
+    # (vd "nội dung bên trong ảnh thì tôi không đọc được")
+    if re.search(r"(ảnh|hình ảnh)[^.!?]{0,40}không\s+(đọc|xem|thấy|nhận)\s*được", t):
+        return True
+    if re.search(r"không\s+(đọc|xem|thấy|nhận)\s*được[^.!?]{0,40}(ảnh|hình ảnh)", t):
+        return True
+    return False
+
+# ── Strip ảnh khỏi các message user CŨ trước khi gọi API ────────────────────
+# Chỉ message user CUỐI CÙNG trong list (turn vừa gửi) được giữ nguyên ảnh
+# thật. Mọi message user có ảnh ở các turn TRƯỚC đó bị thay bằng placeholder
+# text — tránh gửi lại base64 ảnh mỗi turn (tốn token theo cấp số nhân).
+# Đây là bước build-time (RAM only) — KHÔNG đụng gì tới message đã lưu DB,
+# vì message_save() đã lưu bản text-only ngay từ đầu (xem 12_web.py).
+_IMG_PLACEHOLDER = "[đã gửi 1 ảnh]"
+
+_AUTO_CONTINUE_TEXT = "continue"  # phải khớp đúng string literal ở dòng
+# messages.append({"role": "user", "content": "continue"}) trong
+# _agent_turn_inner (auto-continue khi response bị cắt do max_tokens).
+
+def _strip_old_images(messages: list) -> list:
+    """Trả về bản copy của messages với ảnh ở các user-message CŨ (không
+    thuộc turn hiện tại) đã bị thay bằng placeholder text. Không sửa list gốc.
+
+    BUG ĐÃ SỬA: "message cuối" trước đây được xác định là user-message có
+    index LỚN NHẤT trong toàn bộ messages (last_user_idx). Nhưng khi model
+    trả lời quá dài bị cắt (finish_reason=length), _agent_turn_inner tự
+    append 1 message {"role":"user","content":"continue"} để yêu cầu model
+    tiếp tục NGAY TRONG CÙNG 1 TURN LOGIC -- message "continue" này khi đó
+    trở thành user-message có index lớn nhất, khiến message user THẬT chứa
+    ảnh (gửi bởi người dùng, đứng trước đó) bị coi là "cũ" và bị strip
+    thành placeholder "[đã gửi 1 ảnh]" NGAY TRONG TURN ĐẦU TIÊN xử lý ảnh
+    đó -- trước khi model kịp thấy ảnh thật ở lần gọi "continue". Đây là
+    nguyên nhân model tự trả lời "tôi không đọc được ảnh" dù ảnh đã tới
+    server nguyên vẹn: lần gọi API đầu tiên (chưa bị cắt) CÓ thể đã thấy
+    ảnh đúng, nhưng nếu response đó bị cắt giữa chừng, lần gọi "continue"
+    kế tiếp sẽ mất ảnh, và phần trả lời sau cùng seen bởi user chỉ dựa
+    trên lần gọi đã mất ảnh đó.
+
+    Sửa: message user auto-generated "continue" KHÔNG được tính là mốc xác
+    định "turn mới" -- chỉ user-message THẬT (không phải "continue") mới
+    được coi là ranh giới. last_user_idx giờ là index của user-message THẬT
+    cuối cùng; mọi user-message có index >= đó (kể cả các "continue" phía
+    sau nó) đều được coi là CÙNG turn, ảnh được giữ nguyên."""
+    last_real_user_idx = None
+    for i, m in enumerate(messages):
+        if m.get("role") == "user" and m.get("content") != _AUTO_CONTINUE_TEXT:
+            last_real_user_idx = i
+    if last_real_user_idx is None:
+        return messages
+
+    out = []
+    for i, m in enumerate(messages):
+        if (m.get("role") == "user" and i < last_real_user_idx
+                and isinstance(m.get("content"), list)):
+            texts = [b.get("text", "") for b in m["content"]
+                      if isinstance(b, dict) and b.get("type") == "text"]
+            n_img = sum(1 for b in m["content"]
+                        if isinstance(b, dict) and b.get("type") == "image_url")
+            text = " ".join(t for t in texts if t).strip()
+            if n_img:
+                suffix = _IMG_PLACEHOLDER if n_img == 1 else f"[đã gửi {n_img} ảnh]"
+                text = f"{text} {suffix}".strip() if text else suffix
+            out.append({**m, "content": text})
+        else:
+            out.append(m)
+    return out
+
 def _apply_thinking_param(payload: dict, model: str):
     """
     Gắn tham số thinking vào payload OpenAI-shape (call_api_stream luôn
-    build payload theo format này; 2 adapter Anthropic/AWS tự dịch tiếp ở
-    tầng dưới — xem _provider_request / _to_anthropic_payload / _to_converse_payload).
+    build payload theo format này; 3 adapter Anthropic/AWS/Responses tự
+    dịch tiếp ở tầng dưới — xem _provider_request / _to_anthropic_payload /
+    _to_converse_payload / _to_responses_payload).
 
     QUAN TRỌNG — "/mode off" KHÔNG đơn giản là "không gửi gì":
     nhiều model (DeepSeek V4...) MẶC ĐỊNH TỰ BẬT thinking phía server dù
@@ -1108,15 +1511,31 @@ def _apply_thinking_param(payload: dict, model: str):
     Model chưa rõ / đã biết KHÔNG support thinking thì cả hai chiều on/off
     đều không gửi field "thinking" — tránh gửi tham số lạ cho model không
     hiểu, có thể gây lỗi 400/422 không cần thiết.
+
+    BUG ĐÃ SỬA: trước đây chỉ rẽ 2 nhánh (Anthropic/Bedrock vs "else"), nên
+    openai_responses rơi vào nhánh else — payload["thinking"] vẫn được gán
+    NHƯNG _to_responses_payload() không đọc field "thinking" theo cách của
+    OpenAI-compat (budget=None, chỉ có type) mà cần đúng schema riêng để
+    dịch sang "reasoning" — về mặt DỮ LIỆU thì field trung gian giống hệt
+    nhánh Anthropic (chỉ "type": "enabled"/"disabled", không cần
+    budget_tokens vì Responses dùng effort rời rạc, không dùng token count)
+    nên gộp chung điều kiện với nhánh Anthropic/Bedrock ở dưới, KHÔNG viết
+    nhánh riêng — tránh trùng lặp code cho cùng 1 schema trung gian.
     """
     supported = _thinking_support_get(model)
     if supported is not True:
         return  # chưa biết hoặc biết chắc KHÔNG support → không gắn gì cả, dù on hay off
 
-    if _prov().get("format_anthropic") or _active_provider == "aws_bedrock":
-        # Anthropic Messages API / Bedrock Converse: extended thinking.
-        # _to_anthropic_payload và _to_converse_payload đọc field "thinking"
-        # gốc OpenAI-shape này (xem TODO dịch tiếp ở 2 adapter nếu cần).
+    _fmt_kind = _format_kind_for(model)
+    if _fmt_kind in ("anthropic", "openai_responses") or _active_provider == "aws_bedrock":
+        # Anthropic Messages API / Bedrock Converse / OpenAI Responses API:
+        # cả 3 đều có khái niệm "extended reasoning" cần bật/tắt tường
+        # minh (khác OpenAI-compat DeepSeek-style ở nhánh else, chỉ có
+        # "enabled"/"disabled" thô không kèm effort). budget_tokens chỉ có
+        # ý nghĩa với Anthropic/Bedrock — _to_responses_payload() bỏ qua
+        # field này khi dịch sang "reasoning.effort" (không đọc
+        # budget_tokens), nên gửi thừa vô hại, không cần if/else tách theo
+        # từng format ở đây.
         if _thinking_mode == "on":
             payload["thinking"] = {"type": "enabled", "budget_tokens": 8000}
         else:
@@ -1136,6 +1555,14 @@ def _probe_thinking_support(model: str, api_key: str) -> bool:
     tham số thinking để xem provider+model này có thực sự trả reasoning_content
     không. Dùng đúng 1 lần cho mỗi cặp (provider, model) — kết quả được cache
     lại (_thinking_support_set) nên các lần sau không tốn thêm request nào.
+
+    BUG ĐÃ SỬA: trước đây chỉ rẽ Anthropic/Bedrock vs "else" (OpenAI-compat
+    body["choices"]...), nên probe cho openai_responses luôn đọc nhầm
+    body["choices"] — KeyError bị nuốt bởi except Exception ở dưới, kết
+    quả LUÔN False (coi như không support), khiến /mode on không bao giờ
+    bật được cho model đang dùng format Responses API dù model đó có thật
+    sự hỗ trợ reasoning summary. Giờ dùng parse_responses_response() để
+    đọc đúng item type "reasoning".
     """
     probe_payload = {
         "model": model,
@@ -1143,7 +1570,8 @@ def _probe_thinking_support(model: str, api_key: str) -> bool:
         "max_tokens": 64,
         "stream": False,
     }
-    if _prov().get("format_anthropic") or _active_provider == "aws_bedrock":
+    _fmt_kind = _format_kind_for(model)
+    if _fmt_kind in ("anthropic", "openai_responses") or _active_provider == "aws_bedrock":
         probe_payload["thinking"] = {"type": "enabled", "budget_tokens": 1024}
     else:
         probe_payload["thinking"] = {"type": "enabled"}
@@ -1159,9 +1587,13 @@ def _probe_thinking_support(model: str, api_key: str) -> bool:
             # Bedrock Converse: reasoningContent nằm trong content blocks.
             blocks = (body.get("output", {}).get("message", {}) or {}).get("content", [])
             return any("reasoningContent" in b for b in blocks)
-        if _prov().get("format_anthropic"):
+        if _fmt_kind == "anthropic":
             blocks = body.get("content", [])
             return any(b.get("type") == "thinking" for b in blocks)
+        if _fmt_kind == "openai_responses":
+            # body["output"] là list Items — parse_responses_response() đã
+            # tự nhận diện item type "reasoning" có "summary" hay không.
+            return bool(parse_responses_response(body).get("has_reasoning_summary"))
         msg = body.get("choices", [{}])[0].get("message", {})
         return bool(msg.get("reasoning_content"))
     except Exception:
@@ -1173,12 +1605,13 @@ def _probe_thinking_support(model: str, api_key: str) -> bool:
 def _probe_thinking_disable(model: str, api_key: str) -> bool:
     """
     Chỉ gọi khi model ĐÃ XÁC NHẬN support thinking (qua _probe_thinking_support)
-    VÀ format_anthropic/aws_bedrock. Câu hỏi khác với probe trên: gửi
-    {"type": "disabled"} có thực sự tắt được thinking không, hay provider
-    chấp nhận field này (không lỗi 400) nhưng vẫn tự bật ngầm — case đã
-    xác nhận xảy ra thật với 1 số provider Anthropic-format custom (vd
-    MiniMax dòng M2.x: "thinking cannot be disabled; thinking: disabled
-    is accepted but thinking remains on").
+    VÀ format thuộc anthropic/aws_bedrock/openai_responses (xem guard ở
+    10_main.py). Câu hỏi khác với probe trên: gửi {"type": "disabled"} có
+    thực sự tắt được thinking không, hay provider chấp nhận field này
+    (không lỗi 400) nhưng vẫn tự bật ngầm — case đã xác nhận xảy ra thật
+    với 1 số provider Anthropic-format custom (vd MiniMax dòng M2.x:
+    "thinking cannot be disabled; thinking: disabled is accepted but
+    thinking remains on").
 
     Không áp dụng cho nhánh OpenAI-compat (DeepSeek...): _apply_thinking_param()
     đã xử lý đúng bằng cách LUÔN gửi field "disabled" tường minh khi biết
@@ -1186,10 +1619,10 @@ def _probe_thinking_disable(model: str, api_key: str) -> bool:
     giới hạn riêng, không có thêm field chuẩn nào khác để dò/thử.
 
     Trả về True nếu "disabled" hoạt động đúng (không thấy thinking/
-    redacted_thinking block nào trong response), False nếu vẫn thấy
-    thinking dù đã gửi disabled. Kết quả chỉ dùng để CẢNH BÁO người dùng
-    1 lần (xem _thinking_disable_mark_probed) — không có cách chuẩn hoá hơn
-    để ép tắt vì hành vi này tuỳ provider custom.
+    redacted_thinking block/reasoning summary nào trong response), False
+    nếu vẫn thấy thinking dù đã gửi disabled. Kết quả chỉ dùng để CẢNH BÁO
+    người dùng 1 lần (xem _thinking_disable_mark_probed) — không có cách
+    chuẩn hoá hơn để ép tắt vì hành vi này tuỳ provider custom.
     """
     probe_payload = {
         "model": model,
@@ -1198,6 +1631,7 @@ def _probe_thinking_disable(model: str, api_key: str) -> bool:
         "stream": False,
         "thinking": {"type": "disabled"},
     }
+    _fmt_kind = _format_kind_for(model)
     try:
         req = _provider_request("/chat/completions", api_key, probe_payload)
         if _active_provider == "aws_bedrock":
@@ -1209,13 +1643,20 @@ def _probe_thinking_disable(model: str, api_key: str) -> bool:
         if _active_provider == "aws_bedrock":
             blocks = (body.get("output", {}).get("message", {}) or {}).get("content", [])
             return not any("reasoningContent" in b for b in blocks)
-        if _prov().get("format_anthropic"):
+        if _fmt_kind == "anthropic":
             blocks = body.get("content", [])
             return not any(b.get("type") in ("thinking", "redacted_thinking") for b in blocks)
-        # Nhánh OpenAI-compat: hàm này chỉ được gọi khi format_anthropic
-        # hoặc aws_bedrock (xem guard ở 10_main.py), nhưng tự bảo vệ ở đây
-        # thay vì ngầm định body.get("content") luôn rỗng/an toàn — tránh
-        # silent-return True sai nếu guard ở caller đổi trong tương lai.
+        if _fmt_kind == "openai_responses":
+            # _to_responses_payload() dịch {"type":"disabled"} → {"reasoning":
+            # {"effort":"none"}} — không có "summary" nên bình thường sẽ
+            # không có item "reasoning" nào trong output. Nếu vẫn có (server
+            # bỏ qua effort=none) → provider này không tắt được thật.
+            return not bool(parse_responses_response(body).get("has_reasoning_summary"))
+        # Nhánh OpenAI-compat: hàm này chỉ được gọi khi format thuộc
+        # anthropic/aws_bedrock/openai_responses (xem guard ở 10_main.py),
+        # nhưng tự bảo vệ ở đây thay vì ngầm định body.get("content") luôn
+        # rỗng/an toàn — tránh silent-return True sai nếu guard ở caller
+        # đổi trong tương lai.
         return True
     except Exception:
         # Lỗi khi probe disable (vd provider từ chối thẳng field "disabled"
@@ -1235,8 +1676,22 @@ def call_api_stream(messages, model, api_key, tool_choice="auto", session_id=Non
     # và không biết pool đã tự xoay trong lần gọi trước.
     api_key = pool_get_current() or api_key
     api_tools = tools if tools is not None else TOOLS
+    # Ảnh chỉ được giữ ở message user CUỐI CÙNG (turn hiện tại) — mọi ảnh ở
+    # các turn trước đã bị thay placeholder text ở đây, tránh gửi lại base64
+    # mỗi turn. messages gốc (trong RAM, dùng cho DB/UI) KHÔNG bị đổi — chỉ
+    # bản gửi API (_strip_old_images trả về copy mới) bị strip.
+    api_messages = _strip_old_images(messages)
+    # Có ảnh THẬT trong turn này? (chỉ message user cuối, sau strip, có thể
+    # còn image_url — dùng để cập nhật cache _vision_support_* đúng lúc,
+    # không đoán nhầm lỗi khác thành lỗi vision).
+    _last_user = next((m for m in reversed(api_messages) if m.get("role") == "user"), None)
+    _has_current_image = bool(
+        _last_user and isinstance(_last_user.get("content"), list)
+        and any(isinstance(b, dict) and b.get("type") == "image_url"
+                for b in _last_user["content"])
+    )
     payload = {
-        "model": model, "messages": messages,
+        "model": model, "messages": api_messages,
         "tools": api_tools, "tool_choice": tool_choice,
         "max_tokens": _known_max_tokens.get(model, 32768),
         "stream": True,
@@ -1272,6 +1727,14 @@ def call_api_stream(messages, model, api_key, tool_choice="auto", session_id=Non
     spinner       = Spinner("Thinking")
     spinner.start()
     spinner_ref   = [spinner]   # list để _stream_response có thể stop
+    # Cờ chặn vòng lặp vô hạn cho cơ chế tự-phục hồi override sai-format
+    # (xem nhánh 404 bên dưới): chỉ cho phép tự xoá override + retry với
+    # mặc định provider ĐÚNG 1 LẦN trong cả vòng lặp retry này. Nếu không có
+    # cờ này, khi override đã xoá mà format mặc định của provider CŨNG 404
+    # kiểu tương tự (rất hiếm nhưng có thể), code sẽ không có gì để xoá nữa
+    # ở lần sau (_format_override_get_raw trả None) nên tự nhiên dừng — cờ
+    # này chỉ để tránh trường hợp logic tương lai vô tình cho phép xoá lặp.
+    _format_recovery_done = False
 
     for attempt in range(_RETRY_MAX):
         text_parts    = []
@@ -1281,18 +1744,36 @@ def call_api_stream(messages, model, api_key, tool_choice="auto", session_id=Non
         thinking_sig: list = []
         redacted_parts: list = []
         _rate_limit_wait()
-        req = _provider_request("/chat/completions", api_key, payload,
-                                extra_headers=extra_hdrs)
         try:
+            # BUG ĐÃ SỬA (lớp phòng thủ thứ 2, bổ sung cho validate ở nhánh
+            # 404 hỏi base_url phía dưới): req = _provider_request(...) TRƯỚC
+            # ĐÂY nằm NGOÀI khối try này — nếu base_url override (đã lưu từ
+            # trước, có thể từ 1 bản build cũ chưa có validate, hoặc do bất
+            # kỳ đường nào khác chỉnh sửa config.json trực tiếp) không phải
+            # URL hợp lệ, urllib.request.Request() (gọi sâu trong
+            # build_anthropic_request/build_openai_responses_request) tự
+            # raise ValueError NGAY LÚC TẠO OBJECT — exception này bay thẳng
+            # ra khỏi call_api_stream(), agent_turn() chỉ có try/finally
+            # (không except), 10_main.py chỉ bắt KeyboardInterrupt → CRASH
+            # TOÀN BỘ TIẾN TRÌNH (verify bằng test thật, xem lịch sử sửa).
+            # Đưa vào trong try: ValueError rơi đúng vào "except Exception as
+            # e" bên dưới (không phải HTTPError/URLError) — return lỗi đẹp
+            # ngay lần đầu (không retry vô ích vì đây là lỗi cấu hình, không
+            # phải lỗi tạm thời), không crash app.
+            req = _provider_request("/chat/completions", api_key, payload,
+                                    extra_headers=extra_hdrs)
             if _active_provider == "aws_bedrock":
                 resp_cm = urlopen_smart(req, api_key, payload, timeout=180)
             else:
                 resp_cm = urllib.request.urlopen(req, timeout=180)
             with resp_cm as resp:
+                _fmt_kind_stream = _format_kind_for(model)
                 stream_src = (wrap_stream_response(resp)
                               if _active_provider == "aws_bedrock"
                               else wrap_anthropic_stream(resp)
-                              if _prov().get("format_anthropic")
+                              if _fmt_kind_stream == "anthropic"
+                              else wrap_openai_responses_stream(resp)
+                              if _fmt_kind_stream == "openai_responses"
                               else resp)
                 finish_reason = _stream_response(
                     stream_src, text_parts, tc_raw, usage, spinner_ref,
@@ -1303,6 +1784,26 @@ def call_api_stream(messages, model, api_key, tool_choice="auto", session_id=Non
                     state=state)
             _rate_limit_mark()
             pool_mark_success(api_key)  # key này ổn → giảm fail_count (decay)
+            if _has_current_image:
+                _full_text_so_far = "".join(text_parts)
+                if _looks_like_vision_denial(_full_text_so_far):
+                    # BUG ĐÃ SỬA: trước đây set vision_support=True chỉ vì
+                    # request KHÔNG lỗi HTTP (200 OK) -- nhưng "không lỗi"
+                    # không có nghĩa là model THỰC SỰ nhận được ảnh. Nhiều
+                    # gateway/provider (đã xác nhận với deepseek-v4-flash
+                    # qua openmodel.ai) âm thầm BỎ QUA block image_url thay
+                    # vì trả lỗi 400/415/422 khi model không hỗ trợ -- model
+                    # chỉ thấy phần text, tự nhiên trả lời kiểu "tôi không
+                    # thấy/đọc được ảnh nào" -- response đó vẫn 200 OK bình
+                    # thường, rơi vào đúng nhánh này, khiến cache bị set
+                    # SAI thành True (false positive) ngay từ lần gửi ảnh
+                    # đầu tiên. Giờ: nếu nội dung trả lời có dấu hiệu model
+                    # tự nhận không thấy ảnh, coi đây là bằng chứng NGƯỢC
+                    # lại -- set False thay vì True, và không coi đây là
+                    # "thành công" để early-break như bình thường.
+                    _vision_support_set(model, False)
+                else:
+                    _vision_support_set(model, True)
             break   # thành công — thoát retry loop
 
         except urllib.error.HTTPError as e:
@@ -1314,6 +1815,23 @@ def call_api_stream(messages, model, api_key, tool_choice="auto", session_id=Non
             # (khoảng trắng, không gạch dưới) — parse N thật từ message để
             # chính xác theo từng model, thay vì đoán cố định 8192.
             body_lower = body_txt.lower()
+
+            # Ảnh bị provider/model từ chối — ghi nhận False vào cache NGAY
+            # (không retry, không đoán mò): UI /web đọc cache này để xám nút
+            # upload + hiện popup "model này không hỗ trợ ảnh" cho lần sau.
+            # Chỉ set khi turn NÀY thực sự có gửi ảnh — tránh lẫn với lỗi
+            # 400 khác (max_tokens, tool schema...) không liên quan gì tới
+            # vision khiến cache sai.
+            if _has_current_image and e.code in (400, 415, 422) and _is_vision_error(body_txt):
+                _vision_support_set(model, False)
+                spinner_ref[0].stop()
+                _txt = f"\n{RED}✗ Model/provider này không hỗ trợ ảnh (vision).{R}"
+                if state: state.emit(EV_ERROR, text=_txt, raw=True, vision_unsupported=True)
+                else: print(_txt)
+                return {"text": "", "tool_calls": [], "usage": {}, "truncated": False,
+                        "reasoning": "", "thinking": "", "thinking_signature": "",
+                        "redacted_thinking_data": "", "vision_unsupported": True}
+
             if e.code == 400 and ("max_tokens" in body_lower or "max tokens" in body_lower):
                 if attempt == 0:
                     m = re.search(r"less than or equal to (\d+)", body_lower)
@@ -1383,6 +1901,98 @@ def call_api_stream(messages, model, api_key, tool_choice="auto", session_id=Non
                 spinner.start()
                 spinner_ref[0] = spinner
                 continue
+
+            # Lỗi 404 do gọi SAI FORMAT API cho model này (gateway aggregator
+            # kiểu openmodel.ai: cùng 1 provider/base_url nhưng từng model có
+            # thể chỉ có channel cho 1 trong 2 format /messages hoặc
+            # /chat/completions — field format_anthropic hiện tại là CẤP
+            # PROVIDER, không phân biệt được việc này). Chỉ hỏi ở LẦN THỬ ĐẦU
+            # (attempt == 0) để không hỏi lặp lại nếu người dùng đã từ chối/
+            # hoặc đổi rồi vẫn lỗi vì lý do khác. Hỏi qua state.ask() — hoạt
+            # động cả CLI (cli_ask_handler gọi input() ngay) lẫn Web
+            # (web_ask_handler gửi "ask" kind=confirm, đã có UI nút Allow/Deny
+            # sẵn trong web_index.html, xem renderAsk). state có thể None nếu
+            # gọi từ nhánh CLI cũ chưa migrate qua event bus (xem
+            # _agent_turn_inner: "if state is not None") — fallback input()
+            # trực tiếp để nhánh đó vẫn hỏi được, không chỉ im lặng bỏ qua.
+            # CASE 2 (tự phục hồi): model NÀY đang có override format lưu sẵn
+            # (có thể từ lần chat trước, HOẶC vừa được CASE 1 lưu ở chính
+            # attempt trước đó trong CÙNG lượt gọi này — vd attempt=0 đổi
+            # format qua CASE 1, retry sang attempt=1 vẫn 404 kiểu sai-format)
+            # nhưng vẫn dính lỗi sai-format — nghĩa là override hiện tại
+            # (format và/hoặc base_url) SAI, hỏi lại cũng vô ích vì hoặc
+            # người dùng vừa xác nhận nó (CASE 1 lượt này), hoặc đã xác nhận
+            # ở lần chat trước rồi. Tự xoá override, báo rõ, và retry 1 lần
+            # với format+base mặc định của provider — không hỏi, chặn lặp
+            # lại bằng _format_recovery_done (KHÔNG dùng attempt == 0 để
+            # giới hạn — bug cũ: giới hạn theo attempt khiến nhánh này không
+            # bao giờ chạy được ngay sau khi CASE 1 vừa đổi format trong
+            # cùng lượt, vì lúc đó attempt đã >= 1; phải đợi sang LƯỢT CHAT
+            # KẾ TIẾP mới tự xoá được override sai) để không xoá-retry vô
+            # hạn nếu provider mặc định cũng lỗi tương tự.
+            if (e.code == 404 and not _format_recovery_done
+                    and _looks_like_wrong_api_format(body_txt)
+                    and _format_override_get_raw(model or "") is not None):
+                _format_recovery_done = True
+                _cleared = _format_override_clear(model)
+                spinner_ref[0].stop()
+                if _cleared:
+                    _txt = (f"\n{YELLOW}  ⚠ Override format đã lưu cho model "
+                             f"'{model}' vẫn bị lỗi 404 (sai format hoặc sai "
+                             f"base URL) → đã tự xoá, quay về mặc định "
+                             f"provider. Thử lại...{R}")
+                    if state: state.emit(EV_WARN, text=_txt, raw=True)
+                    else: print(_txt, flush=True)
+                    spinner = Spinner(f"Retry {attempt+1}")
+                    spinner.start()
+                    spinner_ref[0] = spinner
+                    continue
+                # _cleared == False: lý thuyết không xảy ra (điều kiện phía
+                # trên đã check get_raw is not None), nhưng nếu xảy ra thì
+                # rơi tiếp xuống nhánh CASE 1 / lỗi generic bên dưới, không
+                # return sai lệch ở đây.
+
+            # CASE 1 (lần đầu): model này CHƯA từng override — lỗi 404 do gọi
+            # SAI FORMAT. Giờ có 3 format khả dĩ (openai/anthropic/
+            # openai_responses) thay vì 2 — không thể chỉ đảo bool nữa, phải
+            # hỏi CHỌN 1 trong 2 format CÒN LẠI (khác format hiện tại).
+            # Dùng kind="choice" (không phải "confirm") vì có >2 lựa chọn:
+            #   - Web: renderAsk() đã xử lý kind="choice" với extra.options
+            #     sẵn từ trước (ra nút bấm cho từng option, xem web_index.html)
+            #     — không cần sửa gì phía web.
+            #   - CLI: cli_ask_handler (01d_events.py) KHÔNG có nhánh riêng
+            #     cho kind="choice" — nó rơi vào nhánh else (input() trần,
+            #     không tự in số thứ tự). Phải TỰ in menu số ra trước khi
+            #     gọi state.ask(), giống cách tool_question() (07_tools_more.py)
+            #     tự in "1. 2. 3." trước input() ở nhánh state is None. Dùng
+            #     state.emit(EV_INFO,...) để in ra được cả CLI (qua
+            #     render_cli) — không in trùng lặp gì ở web vì web tự vẽ
+            #     nút từ extra.options, không cần đọc dòng in này.
+            if e.code == 404 and attempt == 0 and _looks_like_wrong_api_format(body_txt) \
+                    and _format_override_get_raw(model or "") is None:
+                # LƯU Ý: logic hỏi-chọn-format + base_url đã được TÁCH ra
+                # thành _ask_change_format(state, model) (định nghĩa phía
+                # trên, cạnh các hàm _format_override_*) để lệnh /format
+                # (10_main.py) dùng lại ĐÚNG CÙNG code này khi người dùng
+                # chủ động gõ lệnh, không cần chờ 404 thật. Nhánh 404 ở đây
+                # chỉ khác phần đã tách ra ở 2 điểm: (1) phải dừng spinner
+                # trước khi hỏi vì đang có spinner chạy giữa 1 request,
+                # (2) nếu đổi thành công thì continue retry ngay trong vòng
+                # lặp này — 2 việc _ask_change_format() không tự làm (nó
+                # không biết gì về spinner/vòng lặp retry của hàm này).
+                spinner_ref[0].stop()
+                _changed = _ask_change_format(state, model)
+                if _changed:
+                    _txt = f"\n{DIM}  Thử lại...{R}"
+                    if state: state.emit(EV_INFO, text=_txt, raw=True)
+                    else: print(_txt)
+                    spinner = Spinner(f"Retry {attempt+1}")
+                    spinner.start()
+                    spinner_ref[0] = spinner
+                    continue
+                # Không đổi (chọn "0" hoặc không khớp gì) → rơi tiếp xuống
+                # nhánh lỗi generic bên dưới, không hỏi lại nữa cho các
+                # attempt sau (đã chặn bằng attempt == 0).
 
             # Lỗi khác không retry
             spinner_ref[0].stop()
@@ -1891,6 +2501,24 @@ def _agent_turn_inner(messages, model, api_key, conn, sid, max_steps, agent, sta
                     if isinstance(orig, str):
                         messages_with_cache[i] = dict(messages_with_cache[i])
                         messages_with_cache[i]["content"] = orig + mode_hint
+                    elif isinstance(orig, list):
+                        # FIX: turn có ảnh (content dạng multimodal list) —
+                        # trước đây rơi vào nhánh này bị bỏ qua hoàn toàn
+                        # (break ngay không làm gì), khiến mode_hint (agent
+                        # build/plan) mất hẳn cho MỌI turn có ảnh. Append
+                        # hint vào block "text" đầu tiên; nếu chưa có block
+                        # text nào, thêm 1 block text mới ở đầu danh sách
+                        # (giữ nguyên các block image_url phía sau).
+                        new_content = [dict(b) if isinstance(b, dict) else b
+                                       for b in orig]
+                        text_idx = next((j for j, b in enumerate(new_content)
+                                          if isinstance(b, dict) and b.get("type") == "text"), None)
+                        if text_idx is not None:
+                            new_content[text_idx]["text"] = new_content[text_idx].get("text", "") + mode_hint
+                        else:
+                            new_content.insert(0, {"type": "text", "text": mode_hint})
+                        messages_with_cache[i] = dict(messages_with_cache[i])
+                        messages_with_cache[i]["content"] = new_content
                     break
 
         messages_with_cache = _sanitize_tool_turns(messages_with_cache)
@@ -1991,7 +2619,7 @@ def _agent_turn_inner(messages, model, api_key, conn, sid, max_steps, agent, sta
                 # → 2 provider này dùng nhánh else bên dưới: lưu/replay
                 # signature THẬT qua thinking_block (đã triển khai đầy đủ,
                 # xem _to_anthropic_payload/_to_converse_payload).
-                if not (_prov().get("format_anthropic") or _active_provider == "aws_bedrock"):
+                if not (_format_anthropic_for(model) or _active_provider == "aws_bedrock"):
                     _reasoning = result.get("reasoning") or ""
                     if _reasoning:
                         a_msg["reasoning_content"] = _reasoning

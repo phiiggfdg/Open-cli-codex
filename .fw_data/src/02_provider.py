@@ -527,8 +527,21 @@ def _provider_request(path: str, api_key: str, payload: dict | None = None,
         return build_request(bedrock_path, api_key, bedrock_payload,
                               extra_headers=extra_headers)
 
-    # Anthropic Messages API format (custom provider với format_anthropic=True)
-    if _prov().get("format_anthropic"):
+    # Anthropic Messages API format cho MODEL NÀY — ưu tiên override riêng
+    # (xem _format_anthropic_for/_format_override_set, 09_api_system.py) nếu
+    # đã lưu, fallback về format_anthropic cấp provider. BUG ĐÃ SỬA: đây là
+    # nơi build request THẬT gửi đi — trước đó chỉ đọc thẳng
+    # _prov().get("format_anthropic"), bỏ sót khỏi đợt sửa 11 điểm gọi khác
+    # (nằm ở file 02_provider.py, không phải 09/08/10 đã grep) — hệ quả:
+    # dù override đã lưu đúng và mọi nhánh parse/logic khác đọc đúng, request
+    # thực tế build ra VẪN đi theo format cũ, khiến "đổi format rồi vẫn 404
+    # y hệt" (bug quan sát được qua log CLI thật). model lấy từ payload vì
+    # _provider_request() không có tham số model riêng — mọi call site đều
+    # có payload["model"] (chat turn, probe, models_url list không cần
+    # model nên .get() trả None, khi đó fallback về provider mặc định).
+    _model_for_fmt = (payload or {}).get("model")
+    _fmt_kind = _format_kind_for(_model_for_fmt)
+    if _fmt_kind == "anthropic":
         # path vào đây là:
         #   - URL đầy đủ (key_check_url, models_url): "https://...../models"
         #   - path tương đối từ call_api_stream: "/chat/completions"
@@ -537,16 +550,42 @@ def _provider_request(path: str, api_key: str, payload: dict | None = None,
         #   - path tương đối → ghép base_url + path
         # Chỉ cần dịch "/chat/completions" → "/messages" cho chat.
         anth_path = "/messages" if path == "/chat/completions" else path
+        # BUG ĐÃ SỬA: base_url override riêng cho format Anthropic của model
+        # này (nếu đã hỏi+lưu qua _format_override_set, xem call_api_stream
+        # nhánh 404 wrong-format) — gateway aggregator có thể dùng base_url
+        # KHÁC HẲN cho mỗi format, không chỉ khác đuôi path. Fallback về
+        # base_url chung của provider nếu model chưa từng cần override riêng.
+        _anth_base = _format_base_url_for(_model_for_fmt) or _prov().get("base_url", "https://api.anthropic.com/v1")
         return build_anthropic_request(
             anth_path, api_key,
             payload=payload,
             extra_headers=extra_headers,
-            base_url=_prov().get("base_url", "https://api.anthropic.com/v1"),
+            base_url=_anth_base,
             anthropic_version=_prov().get("anthropic_version", ANTHROPIC_DEFAULT_VERSION),
             auth_mode=_prov().get("anthropic_auth_mode", "x-api-key"),
         )
 
-    base = _base_url()
+    if _fmt_kind == "openai_responses":
+        # Cùng pattern nhánh Anthropic ở trên: dịch "/chat/completions" →
+        # "/responses" cho chat, giữ nguyên URL đầy đủ (models_url/
+        # key_check_url) vì build_openai_responses_request cũng tự handle
+        # startswith("http"). base_url override riêng cho format này nếu
+        # đã hỏi+lưu qua _format_override_set (404 wrong-format, xem
+        # 09_api_system.py) — cùng lý do gateway có thể dùng base khác cho
+        # mỗi format, không chỉ khác đuôi path.
+        resp_path = "/responses" if path == "/chat/completions" else path
+        _resp_base = _format_base_url_for(_model_for_fmt) or _prov().get("base_url", "https://api.openai.com/v1")
+        return build_openai_responses_request(
+            resp_path, api_key,
+            payload=payload,
+            extra_headers=extra_headers,
+            base_url=_resp_base,
+        )
+
+    # BUG ĐÃ SỬA: cùng lý do như nhánh Anthropic ở trên — base_url override
+    # riêng cho format OpenAI-compat của model này (nếu có), fallback về
+    # _base_url() (base chung của provider) nếu chưa từng override.
+    base = _format_base_url_for(_model_for_fmt) or _base_url()
     url  = path if path.startswith("http") else f"{base}{path}"
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -620,11 +659,16 @@ def _add_custom_provider():
     # và gợi ý format phù hợp làm default cho bước kế tiếp.
     #
     # Ví dụ:
-    #   https://api.openmodel.ai/v1/messages      → base: .../v1  | suggest: anthropic
+    #   https://api.openmodel.ai/v1/messages        → base: .../v1 | suggest: anthropic
     #   https://api.openmodel.ai/v1/chat/completions → base: .../v1 | suggest: openai
-    #   https://api.openmodel.ai/v1               → base: .../v1  | suggest: không đổi
+    #   https://api.openmodel.ai/v1/responses       → base: .../v1 | suggest: openai_responses
+    #   https://api.openmodel.ai/v1                 → base: .../v1 | suggest: không đổi
     _ANTHROPIC_SUFFIXES = ("/messages", "/v1/messages")
     _OPENAI_SUFFIXES    = ("/chat/completions", "/v1/chat/completions")
+    # "/responses" phải check TRƯỚC "/messages" không liên quan gì (không
+    # trùng suffix), nhưng thứ tự vẫn quan trọng nếu sau này ai thêm suffix
+    # ngắn dễ overlap — giữ 3 khối tách riêng, không gộp, cho rõ ràng.
+    _RESPONSES_SUFFIXES = ("/responses", "/v1/responses")
     _fmt_suggest = None   # None = chưa đủ thông tin để gợi ý
 
     base_url = ""
@@ -643,6 +687,13 @@ def _add_custom_provider():
             _stripped = True
             break
     if not _stripped:
+        for _sfx in _RESPONSES_SUFFIXES:
+            if base_url.endswith(_sfx):
+                base_url = base_url[:-len(_sfx)].rstrip("/")
+                _fmt_suggest = "openai_responses"
+                _stripped = True
+                break
+    if not _stripped:
         for _sfx in _OPENAI_SUFFIXES:
             if base_url.endswith(_sfx):
                 base_url = base_url[:-len(_sfx)].rstrip("/")
@@ -651,22 +702,37 @@ def _add_custom_provider():
                 break
 
     if _stripped:
-        _suggest_label = "Anthropic" if _fmt_suggest == "anthropic" else "OpenAI"
+        _suggest_label = {
+            "anthropic":        "Anthropic",
+            "openai_responses": "OpenAI Responses",
+            "openai":           "OpenAI",
+        }[_fmt_suggest]
         print(f"  {GREEN}✓ Base URL:{R} {WHITE}{base_url}{R}"
               f"  {DIM}(đã strip endpoint path, gợi ý format: {_suggest_label}){R}")
 
     # ── 3. Format API ─────────────────────────────────────────────────────────
-    # Default gợi ý từ URL nếu detect được, không thì mặc định openai (1)
-    _fmt_default = "2" if _fmt_suggest == "anthropic" else "1"
+    # Default gợi ý từ URL nếu detect được, không thì mặc định openai (1) —
+    # đúng yêu cầu "format mặc định là OpenAI Chat Completions".
+    _fmt_default_map = {"anthropic": "2", "openai_responses": "3"}
+    _fmt_default = _fmt_default_map.get(_fmt_suggest, "1")
     print(f"\n  {DIM}Format API:{R}")
-    print(f"  {YELLOW}1{R}  OpenAI-compatible  {DIM}(/v1/chat/completions){R}")
-    print(f"  {YELLOW}2{R}  Anthropic Messages API  {DIM}(/v1/messages, SSE Anthropic-style){R}\n")
+    print(f"  {YELLOW}1{R}  OpenAI Chat Completions  {DIM}(/v1/chat/completions){R}")
+    print(f"  {YELLOW}2{R}  Anthropic Messages API  {DIM}(/v1/messages, SSE Anthropic-style){R}")
+    print(f"  {YELLOW}3{R}  OpenAI Responses API  {DIM}(/v1/responses, SSE response.*.delta){R}\n")
     fmt_raw = _ask("Chọn format", _fmt_default).strip()
-    use_anthropic_format = (fmt_raw == "2")
-    if use_anthropic_format:
-        print(f"  {GREEN}✓ Dùng Anthropic Messages API format.{R}\n")
+    if fmt_raw == "2":
+        format_kind = "anthropic"
+    elif fmt_raw == "3":
+        format_kind = "openai_responses"
     else:
-        print(f"  {GREEN}✓ Dùng OpenAI-compatible format.{R}\n")
+        format_kind = "openai"
+    use_anthropic_format = (format_kind == "anthropic")  # tương thích ngược
+    _fmt_label_map = {
+        "anthropic":        "Anthropic Messages API",
+        "openai_responses": "OpenAI Responses API",
+        "openai":           "OpenAI Chat Completions",
+    }
+    print(f"  {GREEN}✓ Dùng {_fmt_label_map[format_kind]}.{R}\n")
 
     # ── 4. Link lấy API key ───────────────────────────────────────────────────
     print(f"\n  {DIM}Link trang lấy API key (hiện khi hỏi key lần đầu).{R}")
@@ -715,9 +781,14 @@ def _add_custom_provider():
         prov_key = f"{base_key}_{suffix}"; suffix += 1
 
     # ── 8. Xây provider dict ──────────────────────────────────────────────────
-    # parse_models mặc định theo format
-    if use_anthropic_format:
+    # parse_models mặc định theo format. openai_responses dùng CHUNG dạng
+    # {data:[{id}]} như openai-compat (cùng /models endpoint chuẩn OpenAI) —
+    # xem parse_openai_responses_models() ở 01e_openai_responses.py, tách
+    # hàm riêng để nhất quán cấu trúc với 2 adapter kia dù logic parse y hệt.
+    if format_kind == "anthropic":
         _default_parse = lambda data: parse_anthropic_models(data)  # noqa: E731
+    elif format_kind == "openai_responses":
+        _default_parse = lambda data: parse_openai_responses_models(data)  # noqa: E731
     else:
         _default_parse = lambda data: [          # chuẩn OpenAI {data:[{id}]}  # noqa: E731
             m["id"] for m in data.get("data", [])
@@ -739,7 +810,15 @@ def _add_custom_provider():
         "rate_limit_delay": 0.0,
         "key_url":          key_url,  # link lấy key — hiện trong get_api_key wizard
         "_custom":          True,     # đánh dấu để phân biệt
-        "format_anthropic": use_anthropic_format,  # True → dùng Anthropic Messages API
+        # format_anthropic: field CŨ, giữ lại để tương thích ngược (code cũ
+        # hoặc override đã lưu từ bản trước đọc field này trực tiếp vẫn
+        # đúng — True chỉ khi format_kind=="anthropic", openai_responses
+        # KHÔNG bật cờ này vì nó không đi qua nhánh build_anthropic_request).
+        "format_anthropic": use_anthropic_format,
+        # format_kind: field MỚI, nguồn chân lý cho 3 giá trị — dùng bởi
+        # _provider_request() (bên dưới) và mọi nơi cần phân biệt cả 3
+        # format thay vì chỉ bool anthropic/không-anthropic.
+        "format_kind":      format_kind,
     }
 
     # ── 9. Lưu và inject ─────────────────────────────────────────────────────
@@ -755,10 +834,22 @@ def _add_custom_provider():
     return prov_key
 
 def _rebuild_custom_parse(prov_dict: dict) -> dict:
-    """Thêm lại parse_models lambda cho custom provider load từ JSON."""
+    """Thêm lại parse_models lambda cho custom provider load từ JSON.
+
+    BUG TRÁNH: provider lưu từ bản TRƯỚC khi có "format_kind" chỉ có
+    "format_anthropic" (bool) trong JSON — dùng .get("format_kind") trực
+    tiếp sẽ ra None cho các provider cũ đó, rơi vào nhánh else sai nếu
+    không fallback qua format_anthropic trước. Suy ra format_kind từ
+    format_anthropic khi field mới chưa tồn tại, để không phá provider
+    Anthropic đã lưu từ trước khi có bản vá này."""
     if "_custom" in prov_dict and "parse_models" not in prov_dict:
-        if prov_dict.get("format_anthropic"):
+        _fmt = prov_dict.get("format_kind")
+        if _fmt is None:
+            _fmt = "anthropic" if prov_dict.get("format_anthropic") else "openai"
+        if _fmt == "anthropic":
             prov_dict["parse_models"] = lambda data: parse_anthropic_models(data)
+        elif _fmt == "openai_responses":
+            prov_dict["parse_models"] = lambda data: parse_openai_responses_models(data)
         else:
             prov_dict["parse_models"] = lambda data: [
                 m["id"] for m in data.get("data", [])

@@ -241,6 +241,51 @@ def build_request(path: str, raw_credentials: str, payload: dict | None,
 
 
 # ── Request payload: OpenAI-style → Converse-style ─────────────────────────
+# ── Convert content blocks: OpenAI-style (text/image_url) → Bedrock Converse
+# Nguồn ảnh DUY NHẤT là /web (12_web.py) — xem _strip_old_images() ở
+# 09_api_system.py. Converse API cần block ảnh dạng:
+#   {"image": {"format": "png"|"jpeg"|"gif"|"webp",
+#              "source": {"bytes": <base64 string>}}}
+# Khác Anthropic: Converse muốn "format" là 1 trong 4 giá trị cố định trên
+# (không phải full MIME type như "image/png"), và "bytes" ở đây theo cách
+# boto3/Converse JSON chấp nhận là base64 string thuần (không prefix
+# data:...;base64,).
+_CONVERSE_IMG_FORMATS = {
+    "image/png":  "png",
+    "image/jpeg": "jpeg",
+    "image/jpg":  "jpeg",
+    "image/gif":  "gif",
+    "image/webp": "webp",
+}
+
+def _convert_content_blocks_to_converse(blocks: list) -> list:
+    out = []
+    for b in blocks:
+        if not isinstance(b, dict):
+            continue
+        btype = b.get("type")
+        if btype == "text":
+            out.append({"text": b.get("text", "")})
+        elif btype == "image_url":
+            url = (b.get("image_url") or {}).get("url", "")
+            if url.startswith("data:") and ";base64," in url:
+                header, data = url.split(";base64,", 1)
+                mime = header[len("data:"):] or "image/png"
+                fmt = _CONVERSE_IMG_FORMATS.get(mime.lower())
+                if fmt is None:
+                    # Format ảnh Converse không hỗ trợ (vd bmp, svg) — bỏ
+                    # qua block thay vì gửi request chắc chắn lỗi 400.
+                    continue
+                out.append({
+                    "image": {
+                        "format": fmt,
+                        "source": {"bytes": data},
+                    }
+                })
+            # else: không phải data-URI base64 hợp lệ — bỏ qua an toàn.
+    return out or [{"text": ""}]
+
+
 def _to_converse_payload(payload: dict) -> dict:
     """
     Dịch payload OpenAI-compat (messages, tools, tool_choice, max_tokens...)
@@ -286,8 +331,15 @@ def _to_converse_payload(payload: dict) -> dict:
         # Gặp message không phải tool → flush buffer trước
         _flush_tool_results()
         content = []
-        if m.get("content"):
-            content.append({"text": m["content"]})
+        raw_content = m.get("content")
+        if isinstance(raw_content, list):
+            # Content dạng OpenAI multimodal (text/image_url) — nguồn ảnh
+            # DUY NHẤT là /web (xem _strip_old_images ở 09_api_system.py).
+            # Bedrock Converse cần block "image" riêng, KHÔNG có key "text"
+            # chung như string thường — dịch từng block.
+            content.extend(_convert_content_blocks_to_converse(raw_content))
+        elif raw_content:
+            content.append({"text": raw_content})
         for tc in m.get("tool_calls") or []:
             try:
                 args = json.loads(tc["function"].get("arguments") or "{}")

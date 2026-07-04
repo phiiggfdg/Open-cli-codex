@@ -56,6 +56,45 @@ def build_anthropic_request(path: str, api_key: str, payload: dict | None,
     return urllib.request.Request(url, data=body, headers=headers, method=method)
 
 
+# ── Convert content blocks: OpenAI-style (text/image_url) → Anthropic ───────
+# Nguồn ảnh DUY NHẤT trong hệ thống là /web (12_web.py) — xem ghi chú ở
+# _strip_old_images() trong 09_api_system.py. Content list ở đây luôn ở dạng
+# OpenAI: [{"type":"text","text":...}, {"type":"image_url",
+# "image_url":{"url":"data:<mime>;base64,<data>"}}]. Anthropic Messages API
+# cần format khác hẳn: {"type":"image","source":{"type":"base64",
+# "media_type":<mime>,"data":<data>}} — không nhận "image_url" hay data-URI
+# nguyên văn. Dịch từng block, giữ nguyên thứ tự.
+def _convert_content_blocks_to_anthropic(blocks: list) -> list:
+    out = []
+    for b in blocks:
+        if not isinstance(b, dict):
+            continue
+        btype = b.get("type")
+        if btype == "text":
+            out.append({"type": "text", "text": b.get("text", "")})
+        elif btype == "image_url":
+            url = (b.get("image_url") or {}).get("url", "")
+            # Chỉ hỗ trợ data-URI base64 (đúng những gì web client gửi lên —
+            # xem 12_web.py, ảnh luôn được encode base64 client-side trước
+            # khi gửi qua WS, không có URL http(s) thật nào được chấp nhận).
+            if url.startswith("data:") and ";base64," in url:
+                header, data = url.split(";base64,", 1)
+                media_type = header[len("data:"):] or "image/png"
+                out.append({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": media_type,
+                        "data": data,
+                    },
+                })
+            # else: url không phải data-URI base64 hợp lệ — bỏ qua block
+            # này thay vì gửi rác lên Anthropic (sẽ chỉ gây lỗi 400 khó hiểu
+            # hơn là thiếu mất 1 ảnh).
+        # Các type khác (nếu có trong tương lai) — bỏ qua an toàn.
+    return out or [{"type": "text", "text": ""}]
+
+
 # ── Payload convert: OpenAI-style → Anthropic Messages ──────────────────────
 def _to_anthropic_payload(payload: dict) -> dict:
     """
@@ -153,9 +192,13 @@ def _to_anthropic_payload(payload: dict) -> dict:
 
         else:  # user
             content_val = m.get("content", "")
+            if isinstance(content_val, list):
+                anth_content = _convert_content_blocks_to_anthropic(content_val)
+            else:
+                anth_content = [{"type": "text", "text": content_val}]
             anth_messages.append({
                 "role": "user",
-                "content": content_val if isinstance(content_val, list) else [{"type": "text", "text": content_val}],
+                "content": anth_content,
             })
 
     _flush_tools()  # flush cuối nếu message cuối là tool result

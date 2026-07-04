@@ -58,6 +58,32 @@ def undo_state_load(conn, sid):
 # ════════════════════════════════════════════════════════════════════════════
 
 def estimate_tokens(messages):
+    """Ước lượng số token của messages.
+
+    BUG ĐÃ SỬA: trước đây hàm này json.dumps() thẳng messages GỐC trong RAM
+    -- nhưng ảnh base64 của các turn CŨ chỉ bị thay bằng placeholder text
+    lúc BUILD PAYLOAD GỌI API (xem _strip_old_images ở 09_api_system.py),
+    không phải bị xoá khỏi messages trong RAM. Ảnh base64 gốc (thường
+    100-300KB/ảnh) vẫn nằm nguyên trong messages mãi mãi, khiến mỗi lần
+    estimate_tokens() chạy đều CỘNG DỒN ước lượng token của MỌI ảnh đã
+    từng gửi trong session -- kể cả khi model không còn thấy chúng nữa.
+    Kết quả: thanh context bar và cảnh báo compact báo % giả tạo, phình to
+    rất nhanh chỉ sau vài lần gửi ảnh (từng thấy 222% dù model thực tế còn
+    xa mới đầy) -- dẫn tới hỏi compact/xoá lịch sử không cần thiết.
+
+    Sửa: áp dụng cùng phép strip-ảnh-cũ (_strip_old_images) trước khi ước
+    lượng, để con số phản ánh đúng những gì thực sự được gửi lên model ở
+    lần gọi API kế tiếp -- khớp với _compact_threshold vốn cũng dựa trên
+    context window thật của model.
+    """
+    try:
+        messages = _strip_old_images(messages)
+    except NameError:
+        # _strip_old_images được định nghĩa ở module load sau (09_api_system.py)
+        # nhưng cùng namespace runtime -- nếu vì lý do nào đó chưa sẵn sàng
+        # (không nên xảy ra trong luồng chạy bình thường của fw.py), fallback
+        # về ước lượng thô cũ thay vì crash.
+        pass
     total = 0
     for m in messages:
         total += len(json.dumps(m, ensure_ascii=False)) // CHARS_PER_TOKEN
@@ -155,18 +181,48 @@ def maybe_compact(messages, model, api_key, conn, sid):
         mode = "soft"
         color = YELLOW
     pct = int(current / hard_thresh * 100)
-    print(f"\n{color}{'─'*56}{R}")
-    print(f"  {BOLD}[compact]{R} Context đang ở {pct}% ({current:,} tok).")
-    print(f"  {DIM}Cần tóm tắt lịch sử cũ để giải phóng không gian.{R}")
-    print(f"  {CYAN}Tóm tắt và xoá các tin nhắn cũ? [Y/n]: {R}", end="")
-    try:
-        ans = input().strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        ans = "y"
+    # BUG ĐÃ SỬA: input()/print() trần ở đây vi phạm nguyên tắc event-bus
+    # của toàn bộ app (xem comment 10_main.py:704-707 — "KHÔNG còn print()/
+    # input() nào chạy khi có state"). maybe_compact() được gọi từ ngay
+    # trong agent_turn(), nên khi turn chạy qua /web (bàn phím CLI đã bị
+    # khoá bởi WebInputBridge), input() ở đây chặn cứng đọc stdin mà không
+    # ai gõ được — turn treo vô thời hạn, không có đường thoát (không đi
+    # qua state.ask()/PendingAsk như mọi xác nhận khác trong app).
+    # Sửa: dùng current_state()/state.ask(kind="confirm") đúng pattern đã
+    # có sẵn (giống /setkey ở 10_main.py, permission-ask ở 08_undo_dispatch.py).
+    # Không đổi chữ ký hàm maybe_compact (tránh vỡ mọi lời gọi hiện có) —
+    # current_state() là thread-local, đã được set_current_state(state) ở
+    # đầu agent_turn() trước khi vòng lặp gọi tới đây, nên luôn có giá trị
+    # đúng lúc chạy. Khi không có ask_handler nào (không nên xảy ra trong
+    # luồng thực tế vì cli_ask_handler luôn subscribe ở main()), EventBus.ask()
+    # tự trả về default="y" ngay, an toàn — khớp hành vi cũ khi input() gặp
+    # EOFError/KeyboardInterrupt.
+    st = current_state()
+    prompt = (f"\n{color}{'─'*56}{R}\n"
+              f"  {BOLD}[compact]{R} Context đang ở {pct}% ({current:,} tok).\n"
+              f"  {DIM}Cần tóm tắt lịch sử cũ để giải phóng không gian.{R}\n"
+              f"  {CYAN}Tóm tắt và xoá các tin nhắn cũ? [Y/n]: {R}")
+    if st is not None:
+        ans = (st.ask(prompt, kind="confirm", default="y") or "y").strip().lower()
+    else:
+        # Fallback: không có state nào đang chạy (không nên xảy ra qua
+        # agent_turn bình thường) — giữ hành vi input() cũ để không phá
+        # vỡ code path nào khác có thể còn gọi maybe_compact() độc lập.
+        print(prompt, end="")
+        try:
+            ans = input().strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            ans = "y"
     if ans in ("n", "no", "không", "k"):
-        print(f"  {YELLOW}Bỏ qua compact — context có thể bị tràn.{R}")
+        if st is not None:
+            st.emit(EV_WARN, text="Bỏ qua compact — context có thể bị tràn.")
+        else:
+            print(f"  {YELLOW}Bỏ qua compact — context có thể bị tràn.{R}")
         return messages
-    print(f"{color}[compact/{mode}] Context {current:,} tok ({pct}% of limit)...{R}")
+    if st is not None:
+        st.emit(EV_INFO, text=f"[compact/{mode}] Context {current:,} tok ({pct}% of limit)...")
+    else:
+        print(f"{color}[compact/{mode}] Context {current:,} tok ({pct}% of limit)...{R}")
     c = compact_messages(messages, model, api_key, mode=mode)
     # Chỉ ghi DB nếu compact thực sự xảy ra (tức là c là danh sách summary+recent,
     # không phải `recent` thuần — trường hợp fallback do API lỗi).

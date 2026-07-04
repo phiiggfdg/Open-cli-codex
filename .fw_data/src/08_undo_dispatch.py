@@ -225,14 +225,14 @@ Be concise. Current directory: {os.getcwd()}"""
 
     def _sub_urlopen(payload, timeout=60):
         # Gọi API non-stream và trả về (text, tool_calls) chuẩn hoá.
-        # 3 nhánh parse response, khớp đúng với 3 nhánh request trong _provider_request:
+        # 4 nhánh parse response, khớp đúng với 4 nhánh request trong _provider_request:
         #
         #   Nhánh 1 — aws_bedrock:
         #     _provider_request → build Converse API request (urlopen_smart)
         #     response format  → Converse JSON (khác OpenAI hoàn toàn)
         #     parse            → parse_converse_response() → (text, tool_calls)
         #     tool_calls       → parse đầy đủ từ block "toolUse" (giống nhánh
-        #                        2/3) — subagent Bedrock DÙNG ĐƯỢC tool bình
+        #                        2/3/4) — subagent Bedrock DÙNG ĐƯỢC tool bình
         #                        thường, không có giới hạn nào ở đây
         #
         #   Nhánh 2 — format_anthropic (custom provider dùng Anthropic Messages API):
@@ -243,7 +243,26 @@ Be concise. Current directory: {os.getcwd()}"""
         #     tool_calls       → list OpenAI-style để loop tool_task xử lý bình thường
         #     sub_messages     → append OpenAI-style; lần gọi sau _to_anthropic_payload convert lại
         #
-        #   Nhánh 3 — OpenAI-compat (tất cả provider còn lại):
+        #   Nhánh 3 — OpenAI Responses API (format_kind == "openai_responses"):
+        #     _provider_request → build_openai_responses_request, dịch payload qua
+        #                         _to_responses_payload; "/chat/completions" → "/responses"
+        #     response format  → {"output": [{"type":"message","content":[...]},
+        #                                     {"type":"function_call","call_id":...,
+        #                                      "name":...,"arguments":...}]}
+        #                        — KHÔNG có key "choices", khác hẳn nhánh 4. Trước bản vá
+        #                        này, thiếu nhánh riêng khiến rơi thẳng xuống nhánh 4 và
+        #                        crash KeyError: 'choices' ngay khi tool "task" chạy với
+        #                        model đang set format_kind="openai_responses" (bug thật,
+        #                        đã tự tái hiện bằng cách giả lập đúng body Responses API).
+        #     parse            → parse_responses_response() (01e_openai_responses.py) —
+        #                        đã tự convert function_call item → OpenAI tool_calls format,
+        #                        không cần convert tay ở đây (khác nhánh 2 phải tự convert
+        #                        tool_use vì parse_anthropic_* không có hàm tương ứng cho
+        #                        non-stream). sub_messages vẫn lưu OpenAI-style; lần gọi
+        #                        sau _to_responses_payload tự tách lại thành function_call/
+        #                        function_call_output item — không cần đổi gì thêm ở đây.
+        #
+        #   Nhánh 4 — OpenAI-compat (tất cả provider còn lại):
         #     _provider_request → standard Bearer request
         #     response format  → {"choices": [{"message": {"content":..., "tool_calls":[...]}}]}
         #     parse            → choices[0]["message"] trực tiếp
@@ -251,6 +270,7 @@ Be concise. Current directory: {os.getcwd()}"""
         # C30 FIX: retry 429/5xx
         # C32 FIX: handle aws_bedrock Converse format (nhánh 1)
         # C3X FIX: handle format_anthropic tool_calls (nhánh 2) — trước chỉ parse text, bỏ tool_use
+        # C3Y FIX: handle openai_responses (nhánh 3) — bug thật, xem chi tiết trong comment trên
         _RETRY_CODES_SUB = {429, 500, 502, 503, 504}
         _RETRY_DELAYS_SUB = [2, 5, 10]
         for attempt in range(3):
@@ -272,7 +292,7 @@ Be concise. Current directory: {os.getcwd()}"""
                     # Nhánh 2: Anthropic Messages API (custom provider format_anthropic=True)
                     # response: {"content": [{"type":"text","text":"..."},
                     #                        {"type":"tool_use","id":"...","name":"...","input":{}}]}
-                    if _prov().get("format_anthropic"):
+                    if _format_anthropic_for(model or ""):
                         content_blocks = body.get("content", [])
                         text = "".join(
                             b.get("text", "") for b in content_blocks
@@ -295,7 +315,21 @@ Be concise. Current directory: {os.getcwd()}"""
                                 })
                         return text, tool_calls_sub
 
-                    # Nhánh 3: OpenAI-compat (tất cả provider còn lại)
+                    # Nhánh 3: OpenAI Responses API (format_kind == "openai_responses")
+                    # response: {"output": [{"type":"message","content":[{"type":
+                    #           "output_text","text":...}]}, {"type":"function_call",
+                    #           "call_id":...,"name":...,"arguments":...}]}
+                    # — KHÔNG có key "choices" (bug đã tự tái hiện KeyError trước
+                    # khi thêm nhánh này). Dùng thẳng parse_responses_response()
+                    # (01e_openai_responses.py) — hàm đó đã tự convert function_call
+                    # item → OpenAI tool_calls format sẵn, không cần convert tay như
+                    # nhánh 2 (Anthropic không có hàm parse non-stream tương ứng nên
+                    # phải tự convert tool_use ở đây).
+                    if _format_kind_for(model or "") == "openai_responses":
+                        parsed = parse_responses_response(body)
+                        return parsed.get("text", "") or "", parsed.get("tool_calls") or []
+
+                    # Nhánh 4: OpenAI-compat (tất cả provider còn lại)
                     msg = body["choices"][0]["message"]
                     return msg.get("content", "") or "", msg.get("tool_calls") or []
             except urllib.error.HTTPError as e:
@@ -339,7 +373,7 @@ Be concise. Current directory: {os.getcwd()}"""
         # biết là có support thinking (None hoặc False), không gửi gì —
         # giữ nguyên hành vi an toàn cũ, không gây 400/422 cho model lạ.
         if _thinking_mode == "on" and _thinking_support_get(model) is True:
-            if _prov().get("format_anthropic") or _active_provider == "aws_bedrock":
+            if _format_anthropic_for(model or "") or _active_provider == "aws_bedrock":
                 payload["thinking"] = {"type": "enabled", "budget_tokens": 8000}
             else:
                 payload["thinking"] = {"type": "enabled"}

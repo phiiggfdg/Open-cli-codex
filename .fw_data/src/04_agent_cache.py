@@ -754,11 +754,39 @@ def checkpoints_load(conn, sid, limit: int = 10) -> list[dict]:
     ).fetchall()
     return [dict(r) for r in rows]
 
+# Ảnh (content dạng list [{"type":"text",...},{"type":"image_url",...}])
+# không bao giờ được lưu xuống DB — chỉ sống trong RAM (state.messages),
+# theo đúng thiết kế ở 10_main.py (message_save luôn nhận text thuần).
+# FIX: messages_replace_all() là điểm ghi DB DUY NHẤT nhận messages nguyên
+# dạng (không qua message_save) — được gọi từ maybe_compact() (compact tự
+# động, "recent" giữ lại có thể chứa turn ảnh vừa gửi) và /compact thủ công
+# (10_main.py). Cả 2 đường trước đây ghi thẳng content list (kèm base64)
+# xuống DB nếu ảnh nằm trong phần message được giữ lại — vi phạm thiết kế
+# trên. Strip mọi block ảnh thành placeholder text TRƯỚC khi ghi, không đụng
+# gì tới bản messages trong RAM (hàm chỉ đọc, không sửa list truyền vào).
+def _strip_images_for_storage(content):
+    """content có thể là str (giữ nguyên) hoặc list block kiểu OpenAI
+    multimodal. Trả về str an toàn để lưu DB — text gốc + placeholder cho
+    mỗi ảnh, không bao giờ chứa base64."""
+    if not isinstance(content, list):
+        return content
+    texts = [b.get("text", "") for b in content
+             if isinstance(b, dict) and b.get("type") == "text"]
+    n_img = sum(1 for b in content
+                if isinstance(b, dict) and b.get("type") == "image_url")
+    text = " ".join(t for t in texts if t).strip()
+    if n_img:
+        suffix = "[đã gửi 1 ảnh]" if n_img == 1 else f"[đã gửi {n_img} ảnh]"
+        text = f"{text} {suffix}".strip() if text else suffix
+    return text
+
 def messages_replace_all(conn, sid, messages):
     conn.execute("DELETE FROM message WHERE session_id=?", (sid,))
     ts = int(time.time())
     for i, m in enumerate(messages):
         stored = m if isinstance(m, dict) else {"role": "user", "content": str(m)}
+        if stored.get("role") == "user" and isinstance(stored.get("content"), list):
+            stored = {**stored, "content": _strip_images_for_storage(stored["content"])}
         conn.execute("INSERT INTO message VALUES (?,?,?,?,?)",
                      (str(uuid.uuid4()), sid, stored["role"],
                       json.dumps(stored, ensure_ascii=False), ts + i))

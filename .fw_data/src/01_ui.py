@@ -123,7 +123,7 @@ SLASH_COMMANDS = [
     "/undo", "/redo", "/diff", "/sandbox", "/export", "/cache", "/checkpoint",
     "/perm", "/perms", "/skills", "/setkey", "/deletekey", "/init", "/rules",
     "/commands", "/sequential", "/batch", "/commit", "/review", "/help", "/mcp",
-    "/addkey", "/listkeys", "/rmkey", "/keystrategy", "/web",
+    "/addkey", "/listkeys", "/rmkey", "/keystrategy", "/web", "/format",
 ]
 
 SLASH_DESC = {
@@ -166,6 +166,7 @@ SLASH_DESC = {
     "/help":       "xem tất cả lệnh",
     "/mcp":        "quản lý MCP server (Command Code) — list/add/remove/status",
     "/web":        "mở web UI local (terminal bridge qua trình duyệt)",
+    "/format":     "đổi format API (openai/anthropic/openai_responses) cho model hiện tại",
 }
 
 def _slash_hint(prefix: str) -> list[str]:

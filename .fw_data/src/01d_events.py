@@ -117,11 +117,32 @@ class EventBus:
     def ask(self, prompt: str, kind: str = "text", default=None, timeout=None, extra: dict | None = None):
         """Blocking: gửi PendingAsk tới mọi handler đã đăng ký, đợi 1 trong
         số đó .resolve(). Nếu không có handler nào, trả về default ngay
-        (an toàn — không treo agent_turn nếu chưa có UI nào gắn)."""
+        (an toàn — không treo agent_turn nếu chưa có UI nào gắn).
+
+        BUG ĐÃ SỬA: trước đây vòng lặp gọi TẤT CẢ handler bất kể handler
+        trước đó đã resolve() hay chưa. Kịch bản gặp thật: user bật /web,
+        bấm Esc quay lại CLI (disarm() chỉ tắt cờ armed, KHÔNG unsubscribe
+        WS khỏi bus -- WS chỉ unsubscribe khi tab đóng hẳn, xem
+        _unsubscribe_from ở 12_web.py) nhưng không đóng tab trình duyệt.
+        Lần ask() kế tiếp trên CLI (compact, permission-ask, /setkey...):
+        cli_ask_handler thấy is_armed()==False nên chạy input() và
+        resolve() ngay trên chính thread gọi ask() -- nhưng vòng lặp vẫn
+        tiếp tục gọi web_ask_handler (đăng ký sau) dù pending đã có câu
+        trả lời, khiến tab web bị "mồ côi" đó bỗng hiện ra 1 card ask vô
+        cớ (rõ nhất và đáng ngại nhất là permission-ask cho tool bash) --
+        gây hoang mang dù không ảnh hưởng logic thật (giá trị dùng vẫn là
+        của CLI, vì pending.wait() chỉ đọc 1 lần ngay sau vòng for này).
+        Sửa: dừng gọi handler tiếp theo ngay khi phát hiện đã resolve.
+        Không ảnh hưởng multi-tab hợp lệ (nhiều tab đang mở ĐỒNG THỜI,
+        chưa ai trả lời) vì lúc đó handler nào cũng được gọi trước khi có
+        resolve() nào xảy ra -- chỉ chặn đúng trường hợp resolve xảy ra
+        NGAY TRONG handler trước đó (như input() đồng bộ của CLI)."""
         pending = PendingAsk(prompt, kind, default, extra)
         if not self._ask_handlers:
             return default
         for fn in list(self._ask_handlers):
+            if pending._event.is_set():
+                break
             fn(pending)
         return pending.wait(timeout)
 
@@ -329,6 +350,10 @@ class WebInputBridge:
         # được _stream_response() (09_api_system.py) poll sau mỗi chunk SSE
         # nhận về -- đúng chỗ duy nhất có thể ngắt kịp thời trong lúc stream.
         self._stream_interrupt = threading.Event()
+        # Ảnh đi kèm dòng input gần nhất lấy ra từ next_line() — chỉ khác
+        # None khi dòng đó tới từ push_line_with_images() (nguồn DUY NHẤT:
+        # WS handler /web). Đọc bởi get_next_input() ngay sau next_line().
+        self.last_images = None
 
     def _q(self):
         if self._queue is None:
@@ -353,6 +378,14 @@ class WebInputBridge:
 
     def push_line(self, line: str):
         self._q().put(("line", line))
+
+    def push_line_with_images(self, line: str, images: list):
+        """Như push_line() nhưng kèm ảnh (chỉ nguồn duy nhất: WS handler
+        của /web — xem 12_web.py). Ảnh được đính kèm qua tuple thay vì field
+        riêng trên bridge, để tránh race condition nếu có nhiều dòng input
+        xếp hàng nhanh liên tiếp (mỗi dòng tự mang đúng ảnh của chính nó,
+        không phụ thuộc biến trạng thái chia sẻ có thể bị ghi đè)."""
+        self._q().put(("line_img", (line, images)))
 
     def push_interrupt(self):
         # Set cả 2: cờ stream (đọc bởi _stream_response trong lúc AI đang
@@ -385,7 +418,15 @@ class WebInputBridge:
 
     def next_line(self):
         """Block tới khi có dòng mới hoặc interrupt, hoặc trả None nếu
-        session bị disarm trong lúc chờ (poll mỗi 0.25s)."""
+        session bị disarm trong lúc chờ (poll mỗi 0.25s). Trả về string
+        (giữ nguyên contract cũ — nhiều nơi gọi get_next_input() kỳ vọng
+        string thẳng, không phải tuple). Ảnh đi kèm (nếu có, chỉ từ
+        push_line_with_images() — nguồn DUY NHẤT là WS handler /web, xem
+        12_web.py) được cất tạm vào self.last_images, đọc ra ngay bởi
+        get_next_input() SAU LỆNH GỌI next_line() này, trước khi bất kỳ
+        dòng nào khác có thể ghi đè (next_line() tiếp theo chỉ chạy sau khi
+        caller đã lấy input hiện tại đi xử lý — không có race ở đây vì
+        get_next_input() luôn đọc last_images ngay sau khi return)."""
         while True:
             if not self._armed.is_set():
                 return None
@@ -395,6 +436,11 @@ class WebInputBridge:
                 continue
             if kind == "interrupt":
                 raise KeyboardInterrupt()
+            if kind == "line_img":
+                text, images = payload
+                self.last_images = images
+                return text
+            self.last_images = None
             return payload
 
 
@@ -419,6 +465,25 @@ def get_next_input(state, prompt: str):
                 continue
             return line
         return _multiline_input_with_hint(prompt)
+
+
+def get_next_input_images(state):
+    """Trả về list ảnh (hoặc None) đi kèm dòng input VỪA LẤY bởi
+    get_next_input() ngay trước đó. Gọi hàm này ngay sau get_next_input()
+    trong cùng vòng lặp, trước khi gọi lại get_next_input() lần nữa (last_images
+    bị next_line() ghi đè ở lần gọi kế tiếp).
+
+    QUAN TRỌNG (gate): chỉ có giá trị khi input đó đến từ WS handler của
+    /web (bridge.is_armed() == True tại thời điểm nhận) — bàn phím CLI thật
+    không có đường nào gọi push_line_with_images(), nên nhánh else luôn trả
+    None. Đây là điểm gác duy nhất đảm bảo CLI không bao giờ vô tình mang
+    theo ảnh (xem thiết kế đã chốt: ảnh chỉ tồn tại trong luồng /web)."""
+    bridge = getattr(state, "web_bridge", None) if state is not None else None
+    if bridge is not None and bridge.is_armed():
+        images = getattr(bridge, "last_images", None)
+        bridge.last_images = None  # tiêu thụ 1 lần, tránh dính sang turn sau
+        return images
+    return None
 
 
 # ── Web renderer: nhận Event, gửi JSON qua WebSocket ─────────────────────────

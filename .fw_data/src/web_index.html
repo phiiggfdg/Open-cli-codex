@@ -500,14 +500,14 @@
   /* ── Nút tròn liquid-glass: nổi khối rõ (highlight trên + shadow đổ dưới
      kiểu "viên kẹo kính" của iOS), kèm dải sáng quét chéo khi chạm/hover —
      mô phỏng ánh sáng trượt qua bề mặt kính lồi khi ngón tay lướt qua. */
-  #sendBtn, #ctrlBtn {
+  #sendBtn, #ctrlBtn, #imgBtn {
     position: relative; isolation: isolate; overflow: hidden;
     flex:0 0 auto; width:46px; height:46px; border:none; border-radius:50%;
     display:flex; align-items:center; justify-content:center;
     font-size:15px; font-weight:700; cursor:pointer; padding:0;
     transition:transform .18s cubic-bezier(.3,1.4,.5,1), box-shadow .25s cubic-bezier(.22,.7,.3,1), filter .12s;
   }
-  #sendBtn::before, #ctrlBtn::before {
+  #sendBtn::before, #ctrlBtn::before, #imgBtn::before {
     content: ""; position: absolute; inset: -70% -10%; z-index: 2;
     background: linear-gradient(115deg,
       transparent 26%,
@@ -519,9 +519,9 @@
     transition: transform .55s cubic-bezier(.22,.7,.3,1);
     pointer-events: none;
   }
-  #sendBtn:hover::before, #ctrlBtn:hover::before { transform: translateX(30%) rotate(8deg); }
-  #sendBtn:active, #ctrlBtn:active { transform:scale(0.9); filter:brightness(0.98); }
-  #sendBtn:active::before, #ctrlBtn:active::before { transform: translateX(60%) rotate(8deg); }
+  #sendBtn:hover::before, #ctrlBtn:hover::before, #imgBtn:hover::before { transform: translateX(30%) rotate(8deg); }
+  #sendBtn:active, #ctrlBtn:active, #imgBtn:active { transform:scale(0.9); filter:brightness(0.98); }
+  #sendBtn:active::before, #ctrlBtn:active::before, #imgBtn:active::before { transform: translateX(60%) rotate(8deg); }
   #sendBtn { background:linear-gradient(160deg, #8ba07a, var(--accent-2) 55%, #5c7050); color:#fff;
     box-shadow:
       0 1px 1px rgba(255,255,255,0.4) inset,
@@ -534,6 +534,56 @@
       0 2px 6px rgba(124,143,108,0.35); }
   #sendBtn:disabled { background:var(--border-soft); color:var(--text-dim); cursor:not-allowed;
     box-shadow:none; }
+  /* ── Nút chọn ảnh: khung tròn 46x46 + hiệu ứng ánh sáng quét chéo dùng
+     CHUNG với #sendBtn/#ctrlBtn (khai báo gộp ở rule phía trên). Ở đây chỉ
+     còn phần MÀU/VIỀN riêng: tông trắng-xanh nhạt trung tính để không lẫn
+     với sendBtn (xanh lá) hay ctrlBtn (đỏ). Trước khi sửa, #imgBtn đứng
+     riêng lẻ, không có border-radius:50%/width/height/hiệu ứng hover -- nút
+     bị méo/vuông, không đồng bộ hình khối với 2 nút còn lại trong inputBar.
+     CHỈ hiện khi đang chạy qua /web (luôn đúng vì web_index.html chỉ được
+     serve bởi 12_web.py) -- không có khái niệm "CLI mode" trong file này. */
+  #imgBtn { background:rgba(255,254,251,0.8); color:var(--accent-2); border:1.5px solid var(--border-soft);
+    backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+    box-shadow:
+      0 1px 1px rgba(255,255,255,0.8) inset,
+      0 3px 8px rgba(61,56,46,0.08); }
+  #imgBtn:hover { background:rgba(139,160,122,0.1); }
+  #imgBtn:disabled { opacity:0.35; cursor:not-allowed; filter:grayscale(1); box-shadow:none; }
+  #imgBtn.has-images { color:#fff; background:linear-gradient(160deg, #8ba07a, var(--accent-2) 55%, #5c7050); }
+  #imgInput { display:none; }
+
+  /* ── Thanh preview ảnh đã chọn, nằm trên #inputBar, chỉ hiện khi có ảnh */
+  #imgPreviewBar {
+    display:none; flex:0 0 auto; gap:8px; padding:8px 10px 0;
+    background:rgba(238,233,221,0.78); backdrop-filter:blur(16px) saturate(1.2);
+    -webkit-backdrop-filter:blur(16px) saturate(1.2);
+  }
+  #imgPreviewBar.show { display:flex; flex-wrap:wrap; }
+  .img-thumb { position:relative; width:52px; height:52px; border-radius:10px; overflow:hidden;
+    border:1px solid var(--border-soft); flex:0 0 auto; }
+  .img-thumb img { width:100%; height:100%; object-fit:cover; display:block; }
+  .img-thumb .rm { position:absolute; top:1px; right:1px; width:16px; height:16px; border-radius:50%;
+    background:rgba(40,36,30,0.72); color:#fff; border:none; font-size:11px; line-height:16px;
+    cursor:pointer; padding:0; }
+
+  /* ── Popup "model không hỗ trợ ảnh" ─────────────────────────────────── */
+  #visionModal {
+    display:none; position:fixed; inset:0; z-index:50; align-items:center; justify-content:center;
+    background:rgba(40,36,30,0.4); backdrop-filter:blur(3px);
+  }
+  #visionModal.show { display:flex; }
+  #visionModalCard {
+    background:var(--bg-panel); border-radius:var(--radius-md); padding:20px 22px; max-width:320px;
+    box-shadow:0 12px 40px rgba(61,56,46,0.28); text-align:center;
+  }
+  #visionModalCard h3 { margin:0 0 8px; font-size:15px; color:var(--text); }
+  #visionModalCard p { margin:0 0 16px; font-size:13px; color:var(--text-dim); line-height:1.5; }
+  #visionModalCard button { background:var(--accent-2); color:#fff; border:none; border-radius:var(--radius-sm);
+    padding:9px 20px; font-weight:600; font-size:13px; cursor:pointer; }
+
+  .bubble-img-row { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:6px; }
+  .bubble-img-thumb { width:96px; height:96px; object-fit:cover; border-radius:10px;
+    border:1px solid var(--border-soft); display:block; }
   #ctrlBtn { background:rgba(255,254,251,0.8); color:var(--err); border:1.5px solid rgba(173,88,71,0.3);
     backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
     box-shadow:
@@ -667,15 +717,31 @@
     <div id="meta"></div>
   </div>
   <div id="logScroll"><div id="log"></div></div>
+  <div id="imgPreviewBar"></div>
   <div id="inputBar">
     <div id="slashHint"></div>
     <button id="ctrlBtn" title="Ngắt (Ctrl-C)">^C</button>
+    <input id="imgInput" type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple />
+    <button id="imgBtn" title="Đính kèm ảnh" aria-label="Đính kèm ảnh">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
+           stroke-linecap="round" stroke-linejoin="round">
+        <rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/>
+      </svg>
+    </button>
     <input id="inputField" autocomplete="off" autocapitalize="off" autocorrect="off"
            spellcheck="false" placeholder="Gõ lệnh hoặc tin nhắn rồi Enter…" />
     <button id="sendBtn" title="Gửi" aria-label="Gửi">
       <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6"
            stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
     </button>
+  </div>
+</div>
+
+<div id="visionModal">
+  <div id="visionModalCard">
+    <h3>Model này không hỗ trợ ảnh</h3>
+    <p>Model/provider hiện tại đã từ chối ảnh vừa gửi. Nút đính kèm ảnh đã tạm khoá cho phiên này — bạn vẫn có thể tiếp tục chat bằng văn bản.</p>
+    <button id="visionModalOk">Đã hiểu</button>
   </div>
 </div>
 
@@ -700,6 +766,24 @@ const metaEl = document.getElementById("meta");
 const inputField = document.getElementById("inputField");
 const sendBtn = document.getElementById("sendBtn");
 const ctrlBtn = document.getElementById("ctrlBtn");
+const imgBtn = document.getElementById("imgBtn");
+const imgInput = document.getElementById("imgInput");
+const imgPreviewBar = document.getElementById("imgPreviewBar");
+const visionModal = document.getElementById("visionModal");
+const visionModalOk = document.getElementById("visionModalOk");
+
+// ── Ảnh đính kèm (chỉ /web — xem 12_web.py, đây là cổng vào DUY NHẤT của
+// ảnh trong toàn hệ thống). Mảng {mime, data(base64 không prefix), name}.
+// KHÔNG persist gì (không localStorage) -- đúng thiết kế "ảnh chỉ sống
+// trong turn hiện tại", refresh trang là mất, đúng ý muốn.
+let pendingImages = [];
+// true khi model/provider hiện tại đã bị xác nhận (bởi 1 lỗi thật từ
+// server) là không hỗ trợ ảnh -- xám nút, chặn chọn thêm. Reset về false
+// mỗi khi session_init/session_meta báo model đổi (xem handleEvent bên dưới).
+let visionBlocked = false;
+let currentModelKey = ""; // dùng để phát hiện đổi model -> reset visionBlocked
+
+const MAX_IMAGES_PER_TURN = 6; // khớp giới hạn phía server (12_web.py)
 
 function escapeHtml(s) {
   return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -730,6 +814,15 @@ function xterm256ToHex(n) {
     return basic[n];
   }
   if (n <= 231) {
+    // FIX: mã 220 (vàng đậm, rgb(255,215,0)) và 229 (vàng rất nhạt,
+    // rgb(255,255,175)) đọc được trên nền tối của terminal thật, nhưng
+    // .ask-box có nền vàng nhạt (#f9f1e0) -- 2 mã này đè lên gần cùng
+    // tông, chữ gần như biến mất (card /format: dòng cảnh báo + danh
+    // sách lựa chọn). Chỉ đổi riêng 2 mã N này sang tông vàng/nâu đậm
+    // hơn để đủ tương phản trên nền sáng; mọi mã 256-color khác (74/114/
+    // 177/196/214/231/240...) vẫn tính theo công thức gốc như cũ.
+    if (n === 220) return "#8a5a00";
+    if (n === 229) return "#7a6a1a";
     const i = n - 16;
     const levels = [0, 95, 135, 175, 215, 255];
     const r = levels[Math.floor(i / 36) % 6];
@@ -1293,6 +1386,7 @@ function setBusy(busy) {
   isBusy = busy;
   sendBtn.disabled = busy;
   inputField.disabled = busy;
+  imgBtn.disabled = busy || visionBlocked;
   inputField.placeholder = busy ? "Đang xử lý… chờ AI trả lời xong" : "Gõ lệnh hoặc tin nhắn rồi Enter…";
   if (busy) {
     startSpinner();
@@ -1301,19 +1395,22 @@ function setBusy(busy) {
   }
 }
 
-// ── Khoá ô chat riêng khi /model picker đang chờ chọn ───────────────────────
+// ── Khoá ô chat riêng khi có card bắt buộc phải chọn trước ─────────────────
 // Khác setBusy(): không bật spinner, không đụng placeholder "đang xử lý"
-// (không phải AI đang chạy, chỉ là card /model đang mở chờ người dùng bấm
-// chọn) -- placeholder riêng nói rõ lý do vì sao ô chat bị khoá, tránh nhầm
-// với trạng thái busy thật. CHỈ áp dụng cho model_picker, không áp dụng cho
-// các loại "ask" khác (confirm/choice/text) — những loại đó vẫn cho gõ tin
-// nhắn khác trong lúc chờ như trước giờ.
+// (không phải AI đang chạy, chỉ là 1 card đang mở chờ người dùng bấm chọn)
+// -- placeholder riêng nói rõ lý do vì sao ô chat bị khoá, tránh nhầm với
+// trạng thái busy thật. Dùng cho model_picker (/model) VÀ choice (vd
+// /format) -- cả 2 đều là menu bắt buộc chọn 1 trong các lựa chọn, không
+// nên cho gõ tin nhắn/lệnh khác chen ngang trong lúc server đang đợi
+// answer. confirm/text vẫn KHÔNG khoá, giữ nguyên như trước giờ (những
+// loại đó cho phép gõ tin nhắn khác trong lúc chờ).
 function setModelPickerLock(locked) {
   modelPickerLocked = locked;
   sendBtn.disabled = locked || isBusy;
   inputField.disabled = locked || isBusy;
+  imgBtn.disabled = locked || isBusy || visionBlocked;
   if (locked) {
-    inputField.placeholder = "Hãy chọn model ở trên trước";
+    inputField.placeholder = "Hãy chọn 1 mục ở trên trước";
   } else if (!isBusy) {
     inputField.placeholder = "Gõ lệnh hoặc tin nhắn rồi Enter…";
   }
@@ -1344,6 +1441,10 @@ function handleEvent(msg) {
       closeTurnLogs();
       renderHistory(d.messages || []);
       setBusy(false);
+      // Session mới (hoặc /sessions đổi phiên) -> model có thể đã khác,
+      // "không hỗ trợ ảnh" của model CŨ không còn ý nghĩa gì cho model MỚI
+      // -- reset lại để nút ảnh sáng lên, thử lại từ đầu.
+      maybeResetVisionBlock(d.model, d.vision_support);
       break;
     }
     case "turn_start":
@@ -1419,6 +1520,9 @@ function handleEvent(msg) {
     case "error":
       if (currentGroup) appendGroupChild(ansiToHtml(d.text), "child-err");
       else appendStandaloneCard(ansiToHtml(d.text), "err");
+      if (d.vision_unsupported) {
+        blockVisionForCurrentModel();
+      }
       break;
     case "interrupted":
       currentGroup = null;
@@ -1478,6 +1582,9 @@ function handleEvent(msg) {
         const sidPart = cur.match(/\[[0-9a-fA-F]{1,8}\]/);
         const sidLabel = sidPart ? sidPart[0] : "";
         metaEl.textContent = `${d.model || ""}  ·  ${d.agent || ""}  ·  ${sidLabel}`;
+        // /model đổi model giữa chừng -- model MỚI chưa từng được thử gửi
+        // ảnh, không được thừa hưởng trạng thái "không hỗ trợ" của model CŨ.
+        maybeResetVisionBlock(d.model, d.vision_support);
       }
       break;
     case "ask":
@@ -1649,9 +1756,13 @@ function renderAsk(msg) {
     sendJson({ type: "answer", id: msg.id, value });
     // Chọn xong -> mở lại ô chat ngay (không đợi turn_end/setBusy, vì việc
     // trả lời "ask" và việc AI xử lý turn tiếp theo là 2 pha khác nhau).
-    // CHỈ mở nếu đây đúng là model_picker -- các "ask" khác (confirm/
-    // choice/text) chưa từng khoá ô chat nên không cần đụng vào đây.
-    if (msg.kind === "model_picker") setModelPickerLock(false);
+    // model_picker VÀ choice đều khoá ô chat lúc card mở (xem 2 chỗ gọi
+    // setModelPickerLock(true) bên dưới) nên cả 2 đều cần mở lại ở đây.
+    // BUG ĐÃ SỬA: trước đây chỉ mở lại cho model_picker -- card "choice"
+    // (vd /format) chưa từng bị khoá nên bàn phím vẫn gõ được tự do
+    // trong lúc card đang chờ chọn, dễ gửi lệnh chen ngang lúc server
+    // đang chờ answer. confirm/text vẫn KHÔNG khoá (giữ nguyên như cũ).
+    if (msg.kind === "model_picker" || msg.kind === "choice") setModelPickerLock(false);
     const tag = document.createElement("div");
     tag.className = "ask-answer-tag";
     tag.textContent = label;
@@ -1710,6 +1821,14 @@ function renderAsk(msg) {
     // vẫn cho gõ tự do nếu không muốn chọn từ danh sách. Trước đây kind
     // "choice" không được xử lý riêng, rơi vào nhánh ô nhập text ở dưới
     // -> mất hẳn danh sách lựa chọn trên web, đây là chỗ đã fix.
+    //
+    // BUG ĐÃ SỬA: card choice (vd /format) trước đây KHÔNG khoá ô chat
+    // chính trong lúc chờ chọn -- gõ/gửi tin nhắn khác chen ngang được
+    // trong khi server đang đợi answer cho câu hỏi này, giống hệt vấn đề
+    // mà model_picker đã từng gặp và được khoá từ trước. Dùng lại đúng
+    // cơ chế setModelPickerLock (mở lại trong answerAndLock ở trên, đã
+    // sửa điều kiện để bao gồm cả "choice").
+    setModelPickerLock(true);
     actions.className = "ask-actions";
     options.forEach((opt, i) => {
       const btn = document.createElement("button");
@@ -1755,16 +1874,16 @@ function renderAsk(msg) {
 
 // ── Gợi ý lệnh slash ─────────────────────────────────────────────────────
 // Danh sách + mô tả copy NGUYÊN VĂN từ SLASH_COMMANDS/SLASH_DESC trong
-// Web UI hiện chỉ cho phép 6 lệnh chạy được (xem whitelist
+// Web UI hiện chỉ cho phép 7 lệnh chạy được (xem whitelist
 // _WEB_ALLOWED_CMDS ở 10_main.py) -- mọi lệnh "/" khác bị chặn cứng và
-// bắt quay lại CLI thật. Vì vậy autocomplete ở đây CHỈ liệt kê 6 lệnh này,
+// bắt quay lại CLI thật. Vì vậy autocomplete ở đây CHỈ liệt kê 7 lệnh này,
 // không hiện các lệnh khác nữa: gợi ý 1 lệnh rồi gõ vào bị chặn ("không
 // dùng được qua Web UI") gây khó chịu hơn là không gợi ý gì cả. Khi
 // 10_main.py mở thêm lệnh vào whitelist, nhớ đồng bộ tay ở đây (không có
 // cách lấy whitelist tự động từ backend qua giao thức hiện tại).
 const SLASH_COMMANDS = [
   "/listkeys", "/rmkey", "/deletekey", "/addkey", "/setkey", "/model",
-  "/mode on", "/mode off",
+  "/mode on", "/mode off", "/format",
 ];
 const SLASH_DESC = {
   "/setkey":     "đổi API key",
@@ -1775,6 +1894,7 @@ const SLASH_DESC = {
   "/model":      "đổi model (list + tìm kiếm + phân trang)",
   "/mode on":    "bật thinking mode",
   "/mode off":   "tắt thinking mode",
+  "/format":     "đổi format API cho model hiện tại",
 };
 
 const slashHintEl = document.getElementById("slashHint");
@@ -1894,27 +2014,219 @@ function connect() {
     dot.classList.remove("ok");
     statusText.textContent = "Disconnected — đang thử lại…";
     setBusy(false);  // tránh kẹt khoá input nếu mất kết nối giữa lúc busy
-    setModelPickerLock(false);  // tránh kẹt khoá input nếu mất kết nối giữa lúc /model đang mở
+    setModelPickerLock(false);  // tránh kẹt khoá input nếu mất kết nối giữa lúc model_picker/choice đang mở
     setTimeout(connect, 1500);
   };
 
   ws.onerror = () => { try { ws.close(); } catch(e){} };
 }
 
+// ── Vision support: reset/block theo model hiện tại ──────────────────────
+// visionSupport: giá trị cache biết trước từ backend (_vision_support_get) --
+// true/false/null. BUG ĐÃ SỬA: trước đây hàm này luôn set visionBlocked=false
+// vô điều kiện mỗi khi đổi model, kể cả khi backend ĐÃ BIẾT CHẮC model đó
+// không hỗ trợ ảnh (từ lần thử trước, có thể ở session/tab khác) -- khiến
+// user phải tốn 1 lần gửi ảnh thật, đợi lỗi HTTP xảy ra lại mới bị khoá,
+// dù thông tin đã có sẵn. Giờ nhận thêm visionSupport: nếu === false, khoá
+// nút NGAY, không cần đợi thử lại. Không tự động hiện popup ở đây (khác
+// blockVisionForCurrentModel gọi từ lỗi turn thật) -- popup chỉ nên xuất
+// hiện đúng lúc user vừa cố gửi ảnh, không phải ngay lúc mới connect/đổi
+// model mà họ còn chưa làm gì.
+// BUG ĐÃ SỬA: title="Đính kèm ảnh" trên #imgBtn là CỐ ĐỊNH trong HTML, không
+// đổi theo trạng thái -- khi nút bị xám vì model không hỗ trợ vision (biết
+// trước qua session_init/session_meta, CHƯA từng bấm thử), hover vào vẫn chỉ
+// hiện "Đính kèm ảnh", không giải thích lý do bị khoá. Hàm dưới đây cập nhật
+// title đúng theo visionBlocked, gọi tại mọi nơi biến này bị đổi.
+function updateImgBtnTitle() {
+  const t = visionBlocked ? "Model này không hỗ trợ ảnh" : "Đính kèm ảnh";
+  imgBtn.title = t;
+  imgBtn.setAttribute("aria-label", t);
+}
+
+function maybeResetVisionBlock(model, visionSupport) {
+  const key = model || "";
+  if (key !== currentModelKey) {
+    currentModelKey = key;
+    visionBlocked = (visionSupport === false);
+    imgBtn.classList.remove("has-images");
+    imgBtn.disabled = isBusy || modelPickerLocked || visionBlocked;
+    updateImgBtnTitle();
+    // Model đổi -> ảnh đang chờ gửi (nếu có) không còn ý nghĩa cho model
+    // mới (chưa biết có hỗ trợ hay không) -- xoá sạch để tránh gửi nhầm
+    // ảnh cho 1 model chưa từng xác nhận.
+    clearPendingImages();
+  }
+}
+
+function blockVisionForCurrentModel() {
+  visionBlocked = true;
+  imgBtn.disabled = true;
+  updateImgBtnTitle();
+  clearPendingImages();
+  visionModal.classList.add("show");
+}
+
+visionModalOk.addEventListener("click", () => visionModal.classList.remove("show"));
+visionModal.addEventListener("click", (e) => { if (e.target === visionModal) visionModal.classList.remove("show"); });
+
+// ── Đọc file ảnh -> base64, render thumbnail preview ──────────────────────
+function renderImgPreview() {
+  imgPreviewBar.innerHTML = "";
+  if (pendingImages.length === 0) {
+    imgPreviewBar.classList.remove("show");
+    imgBtn.classList.remove("has-images");
+    return;
+  }
+  imgPreviewBar.classList.add("show");
+  imgBtn.classList.add("has-images");
+  pendingImages.forEach((img, idx) => {
+    const wrap = document.createElement("div");
+    wrap.className = "img-thumb";
+    const im = document.createElement("img");
+    im.src = `data:${img.mime};base64,${img.data}`;
+    im.alt = img.name || "image";
+    const rm = document.createElement("button");
+    rm.className = "rm"; rm.textContent = "×"; rm.title = "Bỏ ảnh này";
+    rm.addEventListener("click", () => {
+      pendingImages.splice(idx, 1);
+      renderImgPreview();
+    });
+    wrap.appendChild(im); wrap.appendChild(rm);
+    imgPreviewBar.appendChild(wrap);
+  });
+}
+
+function clearPendingImages() {
+  pendingImages = [];
+  renderImgPreview();
+}
+
+const MAX_IMAGE_DIM = 1568; // cạnh dài tối đa (px) -- mức phổ biến các vision
+// model khuyến nghị, đủ chi tiết để đọc text/UI trong screenshot mà không
+// cần gửi nguyên độ phân giải điện thoại (thường 1080x2400+, ~600KB/ảnh).
+
+function resizeImageIfNeeded(file) {
+  // BUG/GIỚI HẠN ĐÃ SỬA: trước đây ảnh được gửi NGUYÊN kích thước gốc --
+  // ảnh chụp màn hình điện thoại full-res (~600KB, 1080x2400) base64 hoá
+  // thành ~800KB text, ước lượng ra ~200,000 token CHỈ CHO 1 ẢNH. Với
+  // session mới gần như rỗng, 1 ảnh như vậy đã đủ vượt ngưỡng compact
+  // (thấy 192-222% context ngay từ turn đầu). Model không cần độ phân
+  // giải điện thoại đầy đủ để đọc nội dung ảnh -- resize xuống cạnh dài
+  // tối đa MAX_IMAGE_DIM trước khi encode giảm token đáng kể mà không mất
+  // khả năng đọc text/chi tiết trong ảnh.
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    const url = URL.createObjectURL(file);
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      const { width, height } = img;
+      const longSide = Math.max(width, height);
+      if (longSide <= MAX_IMAGE_DIM) {
+        // Đã đủ nhỏ -- không cần resize, trả về file gốc nguyên vẹn.
+        resolve(file);
+        return;
+      }
+      const scale = MAX_IMAGE_DIM / longSide;
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.round(width * scale);
+      canvas.height = Math.round(height * scale);
+      const ctx = canvas.getContext("2d");
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      // PNG giữ nguyên định dạng nếu ảnh gốc là PNG (tránh nén mất chi tiết
+      // cho ảnh có nền trong suốt/đồ hoạ); còn lại dùng JPEG chất lượng cao
+      // để giảm dung lượng thêm (ảnh chụp màn hình thường không cần lossless).
+      const outType = file.type === "image/png" ? "image/png" : "image/jpeg";
+      const quality = outType === "image/jpeg" ? 0.85 : undefined;
+      canvas.toBlob((blob) => {
+        if (!blob) { resolve(file); return; } // fallback: gửi gốc nếu canvas lỗi
+        resolve(new File([blob], file.name || "image", { type: outType }));
+      }, outType, quality);
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); resolve(file); }; // fallback: gửi gốc nếu decode lỗi
+    img.src = url;
+  });
+}
+
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      // reader.result = "data:image/png;base64,AAAA..." -- tách phần base64 thuần
+      const s = String(reader.result || "");
+      const idx = s.indexOf(";base64,");
+      resolve(idx >= 0 ? s.slice(idx + 8) : "");
+    };
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(file);
+  });
+}
+
+imgBtn.addEventListener("click", () => {
+  if (imgBtn.disabled) return;
+  imgInput.click();
+});
+
+imgInput.addEventListener("change", async () => {
+  const files = Array.from(imgInput.files || []);
+  imgInput.value = ""; // cho phép chọn lại đúng file đó lần sau
+  if (files.length === 0) return;
+  const room = MAX_IMAGES_PER_TURN - pendingImages.length;
+  for (const f of files.slice(0, Math.max(0, room))) {
+    if (!f.type.startsWith("image/")) continue;
+    try {
+      const resized = await resizeImageIfNeeded(f);
+      const data = await fileToBase64(resized);
+      if (data) pendingImages.push({ mime: resized.type, data, name: f.name });
+    } catch (e) { /* file lỗi -- bỏ qua, không chặn các ảnh khác */ }
+  }
+  renderImgPreview();
+});
+
 function sendJson(obj) {
   if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(obj));
+    try {
+      ws.send(JSON.stringify(obj));
+    } catch (e) {
+      // TRƯỚC ĐÂY: lỗi ở đây (vd payload ảnh quá lớn khiến JSON.stringify/
+      // ws.send ném exception -- có thể do giới hạn bộ nhớ trên thiết bị
+      // yếu, hoặc kích thước frame) bị NUỐT HOÀN TOÀN không dấu vết --
+      // bubble user đã hiện (appendBubble chạy trước sendJson trong
+      // sendLine()) nhưng message không bao giờ tới server, không có phản
+      // hồi, không có lỗi hiển thị -- đúng hiện tượng "im lặng tuyệt đối"
+      // đang gặp. Hiện lỗi ra UI thay vì nuốt.
+      console.error("[sendJson] ws.send failed:", e);
+      if (typeof handleEvent === "function") {
+        try {
+          handleEvent({ type: "error", data: { text: "Gửi tin nhắn thất bại (có thể do ảnh quá lớn): " + (e && e.message ? e.message : e) } });
+        } catch (e2) { /* ignore */ }
+      }
+    }
+  } else {
+    console.error("[sendJson] WS not open, readyState=", ws ? ws.readyState : "null");
   }
 }
 
 function sendLine() {
   if (isBusy || modelPickerLocked) return;  // an toàn kép: dù input bị disable, chặn luôn ở đây
   const val = inputField.value;
-  if (!val) return;
+  const images = pendingImages;
+  if (!val && images.length === 0) return;
   inputField.value = "";
   closeSlashHint();
-  appendBubble(escapeHtml(val), "user");
-  sendJson({ type: "input", value: val });
+  let bubbleHtml = escapeHtml(val);
+  if (images.length > 0) {
+    const thumbs = images.map(img =>
+      `<img src="data:${img.mime};base64,${img.data}" class="bubble-img-thumb" alt="image"/>`
+    ).join("");
+    bubbleHtml = `<div class="bubble-img-row">${thumbs}</div>${bubbleHtml}`;
+  }
+  appendBubble(bubbleHtml, "user");
+  const payload = { type: "input", value: val };
+  if (images.length > 0) {
+    payload.images = images.map(img => ({ mime: img.mime, data: img.data }));
+  }
+  sendJson(payload);
+  clearPendingImages();
 }
 
 sendBtn.addEventListener("click", sendLine);
