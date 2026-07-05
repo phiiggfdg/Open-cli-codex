@@ -59,6 +59,7 @@ _MODULES = [
     "11_key_pool.py",
     "12_web.py",
     "10_main.py",
+    "13_codeweb.py",
 ]
 
 

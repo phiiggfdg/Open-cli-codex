@@ -97,6 +97,7 @@
 - [Supported Providers](#supported-providers)
 - [Agent Tools](#agent-tools)
 - [Local Web UI (`/web`)](#local-web-ui-web)
+- [Codeweb Mode (`/codeweb`)](#codeweb-mode-codeweb)
 - [Skill System](#skill-system)
 - [API Key Pool & Rotation](#api-key-pool--rotation)
 - [Project Structure](#project-structure)
@@ -235,6 +236,27 @@ Type `/web` in the running CLI to open a local browser bridge — **no separate 
 
 ---
 
+### Codeweb Mode (`/codeweb`)
+
+A focused sub-mode of `/web`, purpose-built for frontend work: a two-column layout where the left side keeps the normal chat/tool log and the right side is a **live preview pane** that updates automatically every time the agent writes or edits an `.html` file — no extra tool call, no round-trip, it just happens.
+
+- **`/codeweb on` / `/codeweb off`** — one of the few slash commands whitelisted to run from the web client itself (see Local Web UI above); switches the session to a dedicated `codeweb` agent with its own system prompt, independent from the `build`/`plan` prompt.
+- **Sandboxed dry-run before swap** — every auto-preview first loads in a hidden sandbox `iframe`; only if it loads without a runtime error (or unhandled promise rejection, or unexpected navigation) does the visible pane switch to it. A broken save never overwrites a working preview.
+- **Live DOM patching, not a hard reload** — editing the file currently being previewed patches the running DOM in place instead of reloading, so scroll position and JS state survive small edits; changed nodes get a brief highlight flash so you can see what moved.
+- **Multi-file tabs** — every `.html` file that has passed a preview check gets its own tab; switching tabs is instant (no re-run needed).
+- **Internal dev servers open inline** — if the agent starts a real server (via the special `serve:` bash prefix, since a normal `bash` call can't run a long-lived process) and reports a `localhost`/private-IP URL, clicking that link in the chat opens it as a live tab in the same preview pane instead of leaving the app.
+- **Resizable, ratio-constrained viewport** — drag the divider to resize the two columns, or lock the preview frame to a fixed aspect ratio (16:9, 9:16, 4:3, 1:1, 20:9) to simulate a specific device/viewport.
+- **Read-only for the model** — the agent never sees the rendered page or a screenshot of it; it only knows whether its own save passed or failed the sandbox check. Actual visual confirmation always comes from you.
+
+```
+/codeweb on
+# → dedicated system prompt + two-column layout (progress | live preview) enabled
+```
+
+> Implemented in `13_codeweb.py` (agent/system prompt/auto-preview hook) and the `codeweb*` functions in `web_index.html` (sandbox check, DOM morph, tabs, resizable split). Only meaningful while `/web` is armed — typing it from the real terminal has no effect.
+
+---
+
 ### Skill System
 
 On-demand domain guidance the model can pull in mid-task via the `skill` tool, instead of bloating the system prompt with instructions it may never need.
@@ -302,6 +324,8 @@ fw.py                        # Entry point / module loader
 ├── 09_api_system.py         # API streaming, system prompt, agentic loop
 ├── 11_key_pool.py           # Multi-key pool, 429 rotation, cooldown
 ├── 12_web.py                # Local Web UI — stdlib WebSocket bridge to the running session
+├── 13_codeweb.py            # /codeweb agent, system prompt, sandboxed auto-preview hook
+├── web_index.html           # /web frontend — chat UI, live preview pane, WebSocket client
 └── 10_main.py               # Main CLI entrypoint, REPL, slash commands
 ```
 
@@ -557,6 +581,27 @@ Gõ `/web` trong CLI đang chạy để mở bridge trình duyệt local — **k
 
 ---
 
+### Mode Codeweb (`/codeweb`)
+
+Mode phụ của `/web`, thiết kế riêng cho công việc frontend: layout 2 cột, bên trái vẫn là log chat/tool như bình thường, bên phải là **panel xem trước trực tiếp** (live preview), tự động cập nhật mỗi khi agent ghi hoặc sửa 1 file `.html` — không cần gọi thêm tool, không round-trip, tự động xảy ra.
+
+- **`/codeweb on` / `/codeweb off`** — một trong số ít lệnh slash được whitelist chạy được ngay từ web client (xem mục Web UI local ở trên); chuyển session sang agent `codeweb` riêng, dùng system prompt độc lập, tách biệt hoàn toàn khỏi prompt `build`/`plan`.
+- **Chạy thử trong sandbox trước khi thay thế** — mỗi lần auto-preview, nội dung được nạp thử vào 1 `iframe` sandbox ẩn trước; chỉ khi nạp xong không có lỗi runtime (hoặc unhandled promise rejection, hoặc điều hướng bất thường) thì panel hiển thị mới chuyển sang nội dung đó. File lưu bị lỗi sẽ không bao giờ đè lên bản preview đang chạy tốt.
+- **Vá trực tiếp vào DOM đang sống, không reload cứng** — sửa đúng file đang được xem sẽ patch thẳng vào DOM đang chạy thay vì tải lại từ đầu, nên vị trí cuộn và state JS vẫn giữ nguyên qua các lần sửa nhỏ; các node vừa đổi được highlight chớp nhẹ để dễ nhận ra chỗ vừa thay đổi.
+- **Nhiều tab file** — mỗi file `.html` đã pass kiểm tra preview có 1 tab riêng; chuyển tab tức thì, không cần chạy lại.
+- **Server nội bộ mở ngay trong app** — nếu agent khởi động 1 server thật (qua tiền tố `serve:` đặc biệt của `bash`, vì `bash` thường không chạy được tiến trình sống lâu) và báo địa chỉ `localhost`/IP nội bộ, bấm vào link đó trong chat sẽ mở ngay thành 1 tab preview sống trong cùng panel, thay vì rời khỏi app.
+- **Khung xem đổi được kích thước, khoá theo tỉ lệ** — kéo thanh chia để đổi kích thước 2 cột, hoặc khoá khung preview theo tỉ lệ cố định (16:9, 9:16, 4:3, 1:1, 20:9) để mô phỏng 1 thiết bị/viewport cụ thể.
+- **Model không tự xem được kết quả** — agent không bao giờ thấy trang đã render hay ảnh chụp của nó; chỉ biết lần lưu của chính mình có pass hay fail kiểm tra sandbox. Xác nhận trực quan thật sự luôn đến từ bạn.
+
+```
+/codeweb on
+# → system prompt riêng + layout 2 cột (tiến trình | live preview) đã bật
+```
+
+> Cài đặt tại `13_codeweb.py` (agent/system prompt/hook auto-preview) và các hàm `codeweb*` trong `web_index.html` (kiểm tra sandbox, morph DOM, quản lý tab, chia cột đổi kích thước được). Chỉ có ý nghĩa khi `/web` đang armed — gõ lệnh này từ terminal thật không có tác dụng gì.
+
+---
+
 ### Hệ thống Skill
 
 Kiến thức chuyên biệt theo domain, model tự gọi giữa lúc làm việc qua tool `skill`, thay vì nhồi hết vào system prompt những thứ chưa chắc dùng đến.
@@ -624,6 +669,8 @@ fw.py                        # Điểm khởi chạy / loader module
 ├── 09_api_system.py         # Streaming API, system prompt, vòng lặp agent
 ├── 11_key_pool.py           # Pool nhiều key, xoay key khi 429, cooldown
 ├── 12_web.py                # Web UI local — bridge WebSocket stdlib tới phiên đang chạy
+├── 13_codeweb.py            # Agent /codeweb, system prompt riêng, hook auto-preview sandbox
+├── web_index.html           # Frontend /web — giao diện chat, panel live preview, WebSocket client
 └── 10_main.py               # Entrypoint CLI chính, REPL, slash command
 ```
 
