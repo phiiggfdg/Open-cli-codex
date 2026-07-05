@@ -557,6 +557,9 @@ def _dispatch_tool(name, args, model, api_key, conn, sid, state=None):
             return f"[permission denied: {name}]"
         result = mcp_call_tool(name, args)
         return result
+    # /codeweb: KHÔNG còn tool riêng nào cho agent này — đã bỏ "preview_check"
+    # (xem 13_codeweb.py). Auto-preview ngầm (codeweb_maybe_auto_preview) vẫn
+    # hoạt động độc lập, hook ở run_tool() bên dưới, không qua dispatch này.
     if not _check_permission(name, args):
         return f"[permission denied: {name}]"
     dispatch = {
@@ -626,6 +629,31 @@ def run_tool(name, args, model, api_key, conn, sid, state=None):
         state.emit(EV_TOOL_END, name=name, brief=brief, truncated=truncated)
     else:
         print(f"  {DIM}╰─ {brief}{'…' if truncated else ''}{R}")
+    # ── /codeweb: auto-preview NGẦM, KHÔNG tốn lượt tool của model ──────────
+    # Khác hẳn tool "preview_check" (model chủ động gọi để tự "xem" ảnh).
+    # Đây là fire-and-forget: mỗi khi write/edit/multiedit/apply_patch/extract
+    # ghi xong vào 1 file .html trong lúc agent=codeweb, panel phải TỰ ĐỘNG
+    # check-ngầm rồi swap qua file đó nếu ok -- model không biết, không thấy,
+    # không hề liên quan tới tool_result. Xem codeweb_maybe_auto_preview()
+    # ở 13_codeweb.py cho toàn bộ logic + lý do dùng emit() thay vì ask().
+    #
+    # BUG ĐÃ SỬA: "extract" (tool_extract, 06_tools_fs.py) cũng ghi nội dung
+    # HTML thật vào `dst` — có thể tạo file .html mới hoàn toàn hoặc append
+    # vào file .html đang xem — nhưng trước đây KHÔNG nằm trong danh sách
+    # trigger này, nên panel phải không bao giờ tự cập nhật khi model dùng
+    # extract để tách/refactor 1 đoạn HTML sang file khác. Thêm "extract" +
+    # xử lý riêng vì field tên path của nó là "dst", không phải "path" như
+    # write/edit/multiedit/apply_patch — chuẩn hoá về args={"path": dst}
+    # trước khi gọi, để codeweb_maybe_auto_preview không cần biết gì về sự
+    # khác biệt tên field giữa các tool.
+    if name in ("write", "edit", "multiedit", "apply_patch", "extract"):
+        try:
+            _cw_args = args
+            if name == "extract" and isinstance(args, dict) and "dst" in args:
+                _cw_args = {"path": args["dst"]}
+            codeweb_maybe_auto_preview(name, _cw_args, state)
+        except Exception:
+            pass  # auto-preview là tiện ích ngầm — không bao giờ được làm vỡ tool call thật
     # Cap what the model sees — head+tail like openai/codex
     result_for_model   = _head_tail(str(result), TOOL_OUTPUT_MAX_CHARS,  label=name)
     # Cap what stays in context history (even smaller — lives forever)

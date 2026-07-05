@@ -12,7 +12,7 @@ Agents:  build (full), plan (read-only)
 Perms:   per-tool allow/ask/deny
 """
 
-import os, sys, json, re, sqlite3, uuid, time, subprocess, shlex
+import os, sys, json, re, sqlite3, uuid, time, subprocess, shlex, signal
 import difflib, urllib.request, urllib.parse, urllib.error, threading, shutil
 import html as _html
 from pathlib import Path
@@ -124,6 +124,7 @@ SLASH_COMMANDS = [
     "/perm", "/perms", "/skills", "/setkey", "/deletekey", "/init", "/rules",
     "/commands", "/sequential", "/batch", "/commit", "/review", "/help", "/mcp",
     "/addkey", "/listkeys", "/rmkey", "/keystrategy", "/web", "/format",
+    "/codeweb",
 ]
 
 SLASH_DESC = {
@@ -167,6 +168,7 @@ SLASH_DESC = {
     "/mcp":        "quản lý MCP server (Command Code) — list/add/remove/status",
     "/web":        "mở web UI local (terminal bridge qua trình duyệt)",
     "/format":     "đổi format API (openai/anthropic/openai_responses) cho model hiện tại",
+    "/codeweb":    "chỉ dùng trong /web — /codeweb on|off, mode code frontend với live preview 2 cột",
 }
 
 def _slash_hint(prefix: str) -> list[str]:

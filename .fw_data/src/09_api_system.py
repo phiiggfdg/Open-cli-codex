@@ -2298,6 +2298,22 @@ def build_system(agent=AGENT_BUILD):
     if cache_key in _system_full_cache:
         return _system_full_cache[cache_key]
 
+    # /codeweb: agent riêng, prompt HOÀN TOÀN độc lập (không kế thừa
+    # build_system_static() của build/plan) — xem CODEWEB_SYSTEM_PROMPT ở
+    # 13_codeweb.py. Vẫn đi qua cùng cache_key=(proj_key, agent) như mọi
+    # agent khác nên KHÔNG phá prefix-cache phía provider: 1 khi session đã
+    # vào codeweb, mọi turn sau đó nhận lại đúng 1 string y hệt (agent
+    # không đổi trong lúc codeweb đang bật).
+    if agent == AGENT_CODEWEB:
+        result = (
+            f"Workspace: {proj_key}\n"
+            f"Agent: {agent}\n"
+            f"Sandbox: all reads/writes/bash MUST stay inside `{proj_key}`.\n\n"
+            f"{CODEWEB_SYSTEM_PROMPT}"
+        )
+        _system_full_cache[cache_key] = result
+        return result
+
     static = build_system_static(agent)
 
     # Header: Workspace + Agent + Sandbox — o DAU, luon giong nhau suot session
@@ -2468,6 +2484,10 @@ def _agent_turn_inner(messages, model, api_key, conn, sid, max_steps, agent, sta
         _mcp_tools = mcp_tools_as_openai_format()
         if _mcp_tools:
             _turn_api_tools = TOOLS + _mcp_tools
+
+    # /codeweb: KHÔNG còn tool riêng nào cho agent này (đã bỏ "preview_check"
+    # — xem 13_codeweb.py). Tool list của agent codeweb = TOOLS gốc y hệt
+    # build/plan, không cần rẽ nhánh gì thêm ở đây nữa.
 
 
     while steps < max_steps:
@@ -2779,7 +2799,6 @@ def _agent_turn_inner(messages, model, api_key, conn, sid, max_steps, agent, sta
             tool_results_history.append({
                 "role": "tool", "tool_call_id": tc.get("id", ""), "content": out_history
             })
-
         messages.extend(tool_results)
         for tr in tool_results_history:
             message_save(conn, sid, "tool", tr)

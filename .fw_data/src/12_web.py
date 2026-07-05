@@ -348,6 +348,13 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                         # biết (None nếu chưa từng thử) để frontend tự quyết định
                         # khoá ngay từ đầu, không cần đợi thử lại.
                         "vision_support": _vision_support_get(st.model),
+                        # /codeweb: phục hồi panel preview khi reload trang/
+                        # reconnect WS -- xem codeweb_get_session_preview_state()
+                        # ở 13_codeweb.py + comment ở "codeweb_preview_ack" phía
+                        # trên (nơi state này được ghi lại mỗi khi client báo
+                        # 1 preview vừa pass). Rỗng nếu session chưa từng có
+                        # preview nào pass hoặc chưa phải codeweb.
+                        "codeweb_preview": codeweb_get_session_preview_state(st.sid),
                     },
                 })
             except Exception:
@@ -464,6 +471,18 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                         pending = pending_registry.pop(pid, None)
                         if pending is not None:
                             pending.resolve(msg.get("value"))
+                    elif mtype == "codeweb_preview_ack":
+                        # /codeweb: JS báo NGƯỢC lại server rằng 1 preview (auto
+                        # HOẶC thủ công) vừa PASS ở phía client -- server không
+                        # tự biết kết quả check (chạy trong iframe sandbox phía
+                        # trình duyệt), nên cần tin nhắn nhỏ này để LƯU LẠI state
+                        # (path + html) cho _send_session_init() gửi lại khi
+                        # reload trang/reconnect WS. Không round-trip qua
+                        # ask()/pending_registry -- không ai đang chờ trả lời,
+                        # đây chỉ là ghi cache, xem codeweb_remember_preview_ack()
+                        # ở 13_codeweb.py.
+                        codeweb_remember_preview_ack(
+                            state, msg.get("path", ""), msg.get("html", ""))
                     # các type khác (vd resize) -- không còn PTY thật, bỏ qua an toàn
                 except Exception:
                     # Lớp bắt tổng: trước đây bất kỳ lỗi nào ở đây (vd push_line_with_images

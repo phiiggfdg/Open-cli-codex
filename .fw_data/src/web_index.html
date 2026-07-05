@@ -159,8 +159,193 @@
   #dot.ok { background:var(--accent-2); animation: dotPulse 2.6s ease-in-out infinite; }
   #meta { color:var(--text-dim); letter-spacing:.2px; font-variant-numeric:tabular-nums; font-size:11.5px; }
 
-  #logScroll { flex:1 1 auto; overflow-y:auto; -webkit-overflow-scrolling:touch; scroll-behavior:smooth; }
-  #log { padding:16px 12px; display:flex; flex-direction:column; gap:10px;
+  /* ── /codeweb: layout 2 cột ────────────────────────────────────────────
+     #mainSplit là flex row: #logScroll (tiến trình) bên trái, #codewebPane
+     (live preview) bên phải. Mặc định #codewebPane ẩn (display:none) và
+     #logScroll chiếm full-width — layout HỆT như trước khi có tính năng
+     này. Chỉ khi session_meta.agent === "codeweb" (xem setCodewebMode() ở
+     JS) mới thêm class "codeweb-on" vào #mainSplit để bật 2 cột — không
+     đụng CSS/behaviour cũ cho mọi mode khác (build/plan). */
+  #mainSplit { flex:1 1 auto; display:flex; flex-direction:row; min-height:0; overflow:hidden; }
+  /* flex-grow cố định "0 1" ở CẢ 2 trạng thái (off dùng flex-basis:100%,
+     on dùng 48%/55%) -- không đổi flex-grow giữa 2 trạng thái, cùng lý do
+     đã sửa ở #codewebPane bên dưới (flex-grow đổi giá trị làm transition
+     bị "che" mất, chỉ 1 chiều mượt còn chiều kia giật). */
+  #logScroll { flex:0 1 100%; overflow-y:auto; -webkit-overflow-scrolling:touch; scroll-behavior:smooth;
+    transition:flex-basis .32s cubic-bezier(.22,.7,.3,1); }
+  /* Trước đây #codewebPane display:none <-> flex là tức thì (không thể
+     transition qua display:none). Giờ pane LUÔN nằm trong layout (display
+     flex cố định), khi tắt co về width:0 + overflow:hidden (ẩn nội dung,
+     không chiếm chỗ) -- cho phép "kéo ra nhả vô" mượt khi bật/tắt /codeweb.
+     Dùng ĐÚNG easing cubic-bezier(.22,.7,.3,1) mà mọi animation khác trong
+     file đang dùng (bubble, turn-toggle, card...) -- không tự chế curve.
+
+     BUG ĐÃ SỬA: bản trước đổi flex-grow 0<->1 giữa 2 trạng thái (flex:0 0 0
+     lúc tắt -> flex:1 1 52% lúc bật). flex-grow KHÔNG animate mượt qua CSS
+     transition theo cách browser tính lại layout -- nó nhảy giá trị ngay
+     lập tức rồi flexbox tính lại kích thước dựa trên khoảng trống còn lại
+     trong CÙNG 1 bước, "che" mất transition của flex-basis/max-width. Do
+     đó chiều off (1->0, không còn "cưỡng ép" chiếm chỗ) nhìn mượt còn chiều
+     on (0->1, đột ngột giành hết chỗ trống) thì giật/không animate. Sửa:
+     KHÔNG đổi flex-grow/shrink giữa 2 trạng thái nữa (giữ cố định "0 0"
+     luôn), chỉ đổi flex-basis (0% <-> 52%/45%) -- browser animate
+     flex-basis mượt thật sự khi flex-grow không đổi ở cả 2 đầu. */
+  #codewebPane { display:flex; flex:0 0 0%; overflow:hidden;
+    flex-direction:column; background:#1e1e1e; position:relative;
+    transition:flex-basis .32s cubic-bezier(.22,.7,.3,1); }
+  #codewebPane > * { opacity:0; transition:opacity 180ms ease; }
+  #mainSplit.codeweb-on #codewebPane > * { opacity:1; transition-delay:140ms; }
+  /* 42% quá chật cho text tiếng Việt dài (wrap dày đặc, khó đọc) -> nâng
+     lên 48%/52%. Màn rất hẹp (điện thoại dọc, <520px) ưu tiên cột log rộng
+     hơn preview vì đọc tiến trình quan trọng hơn xem preview nhỏ xíu. */
+  #mainSplit.codeweb-on #logScroll { flex:0 1 48%; border-right:1px solid var(--border-soft); }
+  #mainSplit.codeweb-on #codewebPane { flex:0 0 52%; }
+  @media (max-width:520px) {
+    #mainSplit.codeweb-on #logScroll { flex:0 1 55%; }
+    #mainSplit.codeweb-on #codewebPane { flex:0 0 45%; }
+  }
+
+  /* Thanh kéo giữa 2 cột -- ẩn hoàn toàn khi codeweb tắt (width:0, không
+     chiếm chỗ, không bắt sự kiện). Khi bật: 1 dải mỏng có "grip" 3 chấm ở
+     giữa để gợi ý kéo được. border-right của #logScroll bị tắt khi có
+     resizer (resizer tự vẽ viền của chính nó) tránh đường viền đôi. */
+  #codewebResizer { flex:0 0 0; width:0; overflow:hidden; position:relative;
+    cursor:col-resize; touch-action:none; transition:width .32s cubic-bezier(.22,.7,.3,1); }
+  #mainSplit.codeweb-on #codewebResizer { flex:0 0 10px; width:10px; }
+  #mainSplit.codeweb-on #logScroll { border-right:0; }
+  #codewebResizer::before { content:""; position:absolute; inset:0; left:4px; width:1px;
+    background:var(--border-soft); transition:background-color 120ms ease; }
+  #codewebResizer:hover::before, #codewebResizer.cw-dragging::before { background:var(--accent-2); }
+  #codewebResizerGrip { position:absolute; top:50%; left:50%; transform:translate(-50%,-50%);
+    width:4px; height:28px; border-radius:3px; background:var(--border-soft);
+    transition:background-color 120ms ease, height 120ms ease; }
+  #codewebResizer:hover #codewebResizerGrip, #codewebResizer.cw-dragging #codewebResizerGrip {
+    background:var(--accent-2); height:40px; }
+  /* Lúc đang kéo: tắt transition của 2 cột (phải theo sát con trỏ ngay lập
+     tức, easing 320ms sẽ làm trễ và giật) + tắt transition mượt của bubble/
+     iframe bên trong để không "đua" theo kích thước đổi liên tục mỗi pixel. */
+  #mainSplit.cw-resizing #logScroll, #mainSplit.cw-resizing #codewebPane { transition:none; }
+  #mainSplit.cw-resizing { cursor:col-resize; user-select:none; }
+  #mainSplit.cw-resizing #codewebFrame { pointer-events:none; }
+
+
+
+  /* ── /codeweb: log trái chuyển thành "activity feed" gọn ─────────────────
+     Cột 42% quá hẹp cho bubble full-size (padding lớn, blur 3D, bo góc to,
+     sheen animation, lệch trái/phải) vốn thiết kế cho khung chat full-width
+     -> nhồi vào đây nhìn rối, nặng nề như "bãi rác". Override CHỈ khi
+     #mainSplit.codeweb-on, không đụng gì tới style gốc của bubble/turn-logs
+     ở mode thường (build/plan) hay khi #codewebPane đang ẩn. Nguyên tắc:
+     bỏ hiệu ứng trang trí nặng, thu nhỏ khoảng cách, căn trái đồng nhất
+     (không lệch trái/phải), rõ tín hiệu chứ không rõ "đẹp". */
+  #mainSplit.codeweb-on #log { padding:10px 8px; gap:6px; }
+  #mainSplit.codeweb-on .bubble-wrap.from-user,
+  #mainSplit.codeweb-on .bubble-wrap.from-ai { justify-content:flex-start; }
+  #mainSplit.codeweb-on .bubble {
+    max-width:100%; width:100%; padding:8px 10px; border-radius:10px;
+    font-size:12.5px; line-height:1.4;
+    backdrop-filter:none; -webkit-backdrop-filter:none;
+    animation:none; box-shadow:none;
+  }
+  #mainSplit.codeweb-on .bubble::before { display:none; } /* tắt sheen quét sáng */
+  #mainSplit.codeweb-on .bubble.user {
+    background:rgba(107,130,100,0.12); border:1px solid rgba(107,130,100,0.28);
+    color:var(--text); border-radius:10px;
+  }
+  #mainSplit.codeweb-on .bubble.ai {
+    background:rgba(255,254,251,0.6); border:1px solid var(--border-soft);
+    border-radius:10px;
+  }
+  #mainSplit.codeweb-on .bubble:active { transform:none; }
+  /* Card tool/turn-toggle cũng thu gọn tương ứng, giữ nguyên hành vi mở/đóng */
+  #mainSplit.codeweb-on .turn-logs-inner {
+    padding:6px; border-radius:8px; backdrop-filter:none; -webkit-backdrop-filter:none;
+    background:rgba(255,254,251,0.6); gap:6px;
+  }
+  #mainSplit.codeweb-on .turn-toggle {
+    padding:3px 9px 3px 8px; font-size:11px; backdrop-filter:none; -webkit-backdrop-filter:none;
+    box-shadow:none; background:rgba(255,254,251,0.7);
+  }
+  #mainSplit.codeweb-on .turn-toggle.open { box-shadow:none; }
+  #mainSplit.codeweb-on .bubble-img-thumb { width:56px; height:56px; }
+  #mainSplit.codeweb-on .tool-group { padding-bottom:0; }
+  #mainSplit.codeweb-on .tool-children { display:none; }
+
+  #codewebToolbar { flex:0 0 auto; display:flex; align-items:center; justify-content:space-between;
+    gap:6px; padding:6px 8px; background:rgba(238,233,221,0.7); border-bottom:1px solid var(--border-soft); }
+  /* Tên file dài (vd "vietnam-intro-page-final-v2.html") không giới hạn
+     trước đây khiến 1 tab giãn hết cỡ, đẩy các tab khác ra ngoài mà không
+     có dấu hiệu gì báo còn tab bị che ngoài overflow-x:auto trần trụi.
+     Giờ: mỗi tab max-width + ellipsis, và gradient fade mờ dần ở 2 đầu
+     thanh tab (luôn hiện, không cần JS phát hiện scroll position — đơn
+     giản, đủ dùng vì đây chỉ là gợi ý thị giác "có thể còn thứ để cuộn"). */
+  #codewebTabs { flex:1 1 auto; display:flex; gap:4px; overflow-x:auto; min-width:0;
+    position:relative;
+    mask-image:linear-gradient(to right, transparent 0, #000 14px, #000 calc(100% - 14px), transparent 100%);
+    -webkit-mask-image:linear-gradient(to right, transparent 0, #000 14px, #000 calc(100% - 14px), transparent 100%); }
+  #codewebTabs .cw-tab { font-size:12px; padding:4px 10px; border-radius:999px; white-space:nowrap;
+    max-width:140px; overflow:hidden; text-overflow:ellipsis; flex:0 0 auto;
+    background:rgba(255,254,251,0.8); border:1px solid var(--border-soft); color:var(--text-dim); cursor:pointer;
+    transition:background-color 160ms ease, color 160ms ease, border-color 160ms ease; }
+  #codewebTabs .cw-tab.active { background:var(--accent-2); color:#fff; border-color:var(--accent-2); }
+  #codewebToolbarBtns { flex:0 0 auto; display:flex; gap:4px; }
+  #codewebToolbarBtns button { width:26px; height:26px; border-radius:6px; border:1px solid var(--border-soft);
+    background:rgba(255,254,251,0.8); color:var(--text-dim); cursor:pointer; font-size:14px; line-height:1;
+    display:flex; align-items:center; justify-content:center; }
+  #codewebToolbarBtns button:hover { background:var(--accent-2); color:#fff; border-color:var(--accent-2); }
+  /* Mobile không có :hover thật (chỉ tap) -> :active cho phản hồi ngay lúc
+     chạm, không phải chờ nhấc tay ra mới thấy đổi màu qua :hover giả lập. */
+  #codewebToolbarBtns button:active { background:var(--accent-2); color:#fff; border-color:var(--accent-2); transform:scale(.92); }
+  #codewebReloadBtn.cw-spinning { animation:cwSpin 700ms linear infinite; }
+  @keyframes cwSpin { from { transform:rotate(0deg); } to { transform:rotate(360deg); } }
+
+  /* Panel cài đặt (chọn tỉ lệ khung) -- popover nhỏ góc phải trên, ẩn mặc
+     định, chỉ hiện khi bấm nút ⚙ (JS toggle class "show"). CHỈ tồn tại
+     trong codeweb — không ảnh hưởng UI mode khác. */
+  #codewebSettingsPanel { display:none; position:absolute; top:40px; right:8px; z-index:20;
+    background:#fff; border:1px solid var(--border-soft); border-radius:10px; padding:10px 12px;
+    box-shadow:0 8px 24px rgba(0,0,0,0.18); min-width:180px; }
+  #codewebSettingsPanel.show { display:block; }
+  .cw-settings-title { font-size:11px; color:var(--text-dim); margin-bottom:8px; text-transform:uppercase; letter-spacing:.4px; }
+  #codewebRatioOptions { display:flex; flex-wrap:wrap; gap:6px; }
+  #codewebRatioOptions button { font-size:12px; padding:5px 9px; border-radius:6px;
+    border:1px solid var(--border-soft); background:rgba(0,0,0,0.03); color:var(--text-dim); cursor:pointer; }
+  #codewebRatioOptions button:hover { background:rgba(0,0,0,0.06); }
+  #codewebRatioOptions button:active { background:rgba(0,0,0,0.1); transform:scale(.95); }
+  #codewebRatioOptions button.active { background:var(--accent-2); color:#fff; border-color:var(--accent-2); }
+
+  /* Wrapper giữ khung tỉ lệ đã chọn -- khi ratio != "none", iframe co lại
+     đúng aspect-ratio, canh giữa, phần thừa xung quanh là nền tối (giống
+     khung xem responsive thật). ratio="none" -> full kích thước pane như cũ. */
+  #codewebFrameWrap { flex:1 1 auto; display:flex; align-items:center; justify-content:center;
+    overflow:auto; background:#1e1e1e; min-height:0; position:relative; }
+  /* KHÔNG dùng CSS aspect-ratio + max-width/max-height cùng lúc: 2 cơ chế
+     này không phối hợp đúng khi bị giới hạn theo chiều rộng (16:9, 20:9 bị
+     max-width chặn nhưng height không tự co theo -- đã kiểm chứng bằng
+     Playwright). Thay vào đó JS đo clientWidth/clientHeight của wrap rồi
+     TÍNH TRỰC TIẾP width/height px chính xác theo ratio, set inline style.
+     CSS ở đây chỉ còn việc trang trí (box-shadow), không tự quyết định size. */
+  #codewebFrameWrap.cw-has-ratio #codewebFrame { box-shadow:0 0 0 1px rgba(255,255,255,0.08); }
+  /* Trước đây chuyển ẩn<->hiện giữa #codewebEmpty và #codewebFrame bằng
+     display:none (tức thì, không mượt) trong khi mọi hiệu ứng khác trong
+     file đều có transition -> không đồng bộ phong cách. Giờ cả 2 luôn nằm
+     trong DOM, fade qua opacity+scale nhẹ; lớp không active thêm
+     pointer-events:none để không chặn click/tap của lớp đang hiện. */
+  #codewebFrame { flex:1 1 auto; width:100%; height:100%; border:0; background:#fff;
+    opacity:0; transform:scale(.98); transition:opacity 220ms ease, transform 220ms ease; pointer-events:none; }
+  #codewebFrameWrap.cw-has-ratio #codewebFrame { flex:none; }
+  /* Animation trượt ngang khi auto-preview/preview_check đổi sang 1 tab
+     khác — chạy lại mỗi lần class được thêm (JS force-reflow trước khi add). */
+  @keyframes cwSlideIn { from { transform:translateX(24px); opacity:0; } to { transform:translateX(0); opacity:1; } }
+  #codewebFrame.cw-slide-in { animation:cwSlideIn 220ms ease-out; }
+  #codewebPane.has-preview #codewebFrame { opacity:1; transform:scale(1); pointer-events:auto; }
+  #codewebPane.has-preview #codewebEmpty { opacity:0; pointer-events:none; }
+  #codewebEmpty { flex:1 1 auto; display:flex; align-items:center; justify-content:center;
+    color:#8a8a8a; font-size:13px; text-align:center; padding:24px;
+    position:absolute; inset:0; opacity:1; transition:opacity 220ms ease; }
+
+
+  #log { padding:16px 12px; display:flex; flex-direction:column; gap:10px; min-width:0;
     font-size: 14.5px; line-height:1.6; color:var(--text); min-height:100%; }
 
   /* Xuất hiện nhẹ nhàng: fade + trượt lên rất ít, không overshoot, để cảm
@@ -251,6 +436,15 @@
   .bubble:active::before {
     animation: bubbleSheenSweep .9s linear 0s 1 forwards;
   }
+  /* Link trong bubble chat (chèn bởi linkifyHtml()) -- bôi màu accent xanh
+     rêu (đồng bộ tông màu app, không lạc quẻ với bubble user/ai), gạch chân
+     nhẹ để phân biệt rõ với text thường, đổi độ đậm khi hover/tap để có
+     phản hồi (mobile không có :hover thật nên thêm :active cùng kiểu). */
+  a.cw-chat-link { color:var(--accent-2); text-decoration:underline; text-decoration-thickness:1px;
+    text-underline-offset:2px; word-break:break-all; }
+  a.cw-chat-link:hover, a.cw-chat-link:active { opacity:0.75; }
+  .bubble.user a.cw-chat-link { color:#fbfaf5; text-decoration-color:rgba(255,255,255,0.65); }
+
   .bubble.user {
     background: linear-gradient(165deg, rgba(107,130,100,0.62), rgba(79,95,76,0.68));
     backdrop-filter: blur(18px) saturate(1.6);
@@ -297,7 +491,7 @@
   /* ── Nhóm tool (cha-con) ─────────────────────────────────────────── */
   .tool-group {
     background:var(--bg-panel); border:1px solid var(--border-soft); border-radius:var(--radius-md);
-    padding:10px 12px 10px 0; margin:0 4px; position:relative; overflow:hidden;
+    padding:10px 12px 10px 0; margin:0 4px; position:relative; overflow:hidden; min-width:0;
     box-shadow:
       0 1px 0 rgba(255,255,255,0.7) inset,
       0 4px 12px rgba(61,56,46,0.06),
@@ -306,7 +500,7 @@
   }
   .tool-group-head {
     display:flex; align-items:baseline; gap:8px; padding:0 12px 8px 14px;
-    font-weight:600;
+    font-weight:600; min-width:0;
   }
   .tool-group-head .tool-icon { font-size:13px; opacity:.75; flex-shrink:0; }
   .tool-group-head .tool-name { color:var(--text); flex-shrink:0; white-space:nowrap; }
@@ -319,7 +513,7 @@
   .tool-group.denied { border-color:#ddbcb0; background:#fbf2ee;
     box-shadow:var(--shadow-1), -3px 0 0 0 var(--err) inset; }
 
-  .tool-children { position:relative; margin-left:14px; padding-left:16px; }
+  .tool-children { position:relative; margin-left:14px; padding-left:16px; min-width:0; }
   .tool-children::before {
     content:""; position:absolute; left:0; top:2px; bottom:8px; width:1.5px;
     background:var(--border); border-radius:2px;
@@ -622,7 +816,7 @@
   }
   .turn-logs > .turn-logs-inner {
     overflow:hidden; display:flex; flex-direction:column; gap:10px;
-    min-height:0; transform:translateY(-4px); transition:transform .3s cubic-bezier(.22,.7,.3,1);
+    min-height:0; min-width:0; transform:translateY(-4px); transition:transform .3s cubic-bezier(.22,.7,.3,1);
   }
   .turn-logs.open {
     grid-template-rows:1fr; opacity:1; margin-top:2px;
@@ -716,7 +910,39 @@
     <div id="status"><span id="dot"></span><span id="statusText">Connecting…</span></div>
     <div id="meta"></div>
   </div>
-  <div id="logScroll"><div id="log"></div></div>
+  <div id="mainSplit">
+    <div id="logScroll"><div id="log"></div></div>
+    <div id="codewebResizer" title="Kéo để đổi tỉ lệ 2 cột"><div id="codewebResizerGrip"></div></div>
+    <div id="codewebPane">
+      <div id="codewebToolbar">
+        <div id="codewebTabs"></div>
+        <div id="codewebToolbarBtns">
+          <button id="codewebReloadBtn" title="Tải lại preview hiện tại (nếu bị đơ/treo)">⟳</button>
+          <button id="codewebSettingsBtn" title="Cài đặt khung xem">⚙</button>
+        </div>
+      </div>
+      <div id="codewebSettingsPanel">
+        <div class="cw-settings-title">Khung xem (tỉ lệ)</div>
+        <div id="codewebRatioOptions">
+          <button data-ratio="none">Tự do</button>
+          <button data-ratio="16:9">16:9</button>
+          <button data-ratio="9:16">9:16</button>
+          <button data-ratio="4:3">4:3</button>
+          <button data-ratio="1:1">1:1</button>
+          <button data-ratio="20:9">20:9</button>
+        </div>
+      </div>
+      <div id="codewebFrameWrap">
+        <iframe id="codewebFrame" sandbox="allow-scripts allow-same-origin" title="live preview"></iframe>
+      </div>
+      <div id="codewebEmpty">Chưa có preview nào — đợi AI viết file HTML đầu tiên…</div>
+    </div>
+  </div>
+  <!-- iframe ẩn dùng để CHẠY THỬ trước khi swap sang #codewebFrame — xem
+       codewebSandboxCheck()/codewebRunAutoPreview(). Không hiển thị, không nằm trong luồng layout. -->
+  <iframe id="codewebSandboxFrame" sandbox="allow-scripts allow-same-origin"
+          style="position:fixed; left:-9999px; top:-9999px; width:1280px; height:800px; border:0;"
+          aria-hidden="true"></iframe>
   <div id="imgPreviewBar"></div>
   <div id="inputBar">
     <div id="slashHint"></div>
@@ -787,6 +1013,57 @@ const MAX_IMAGES_PER_TURN = 6; // khớp giới hạn phía server (12_web.py)
 
 function escapeHtml(s) {
   return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+// ── Linkify URL trong bubble text (chat) ─────────────────────────────────
+// Bôi xanh + gạch chân mọi URL http(s):// xuất hiện trong text AI/user, để
+// bấm được thẳng -- vd AI báo "Server đã chạy tại http://127.0.0.1:5173".
+// QUAN TRỌNG: phải gọi SAU escapeHtml() (nhận input đã escape), không phải
+// trước -- nếu chạy trên text thô rồi mới escape, escapeHtml() sẽ phá hỏng
+// các thẻ <a> vừa chèn (encode luôn dấu < > của chính thẻ mình tạo ra).
+// Regex chỉ khớp scheme http/https tuyệt đối (không bắt URL tương đối hay
+// scheme khác như javascript:/data: -- tránh mọi rủi ro XSS qua scheme lạ).
+//
+// BUG ĐÃ SỬA: dấu backtick (`) KHÔNG nằm trong tập ký tự loại trừ trước đây
+// -- AI rất hay bọc URL trong markdown code-span khi trả lời (vd "chạy tại
+// `http://127.0.0.1:8080`"), nên backtick ĐÓNG bị regex nuốt luôn vào cuối
+// URL match. Hệ quả: href thực sự chứa ký tự backtick (vd
+// "http://127.0.0.1:8080`") -- new URL() trên chuỗi này ném "Invalid URL",
+// khiến codewebIsLocalUrl() luôn trả false oan (dù đúng là link local) và
+// bấm vào không có gì xảy ra (không mở preview, cũng không mở tab được vì
+// href thật không hợp lệ). Backtick có thể xuất hiện ở CẢ ĐẦU lẫn CUỐI
+// (`http://x`), khác các dấu câu cuối câu khác chỉ dính ở cuối -- nên phải
+// loại trừ NGAY TRONG core match (giống \s<>"'), không thể xử lý bằng
+// CW_TRAILING_PUNCT_RE (chỉ trim được đuôi, không trim được đầu).
+//
+// BUG ĐÃ SỬA #2: dấu `*` (markdown bold/italic, "**url**") cùng lỗi y hệt
+// backtick -- AI rất hay in đậm URL khi trả lời (vd "vào **http://...**
+// là thấy trang"). Vì `*` không nằm trong tập loại trừ, 2 dấu `**` đóng bị
+// nuốt vào cuối href thật, biến link thành 1 path SAI (vd
+// ".../file.html**" -- file thật không có "**" trong tên) -- bấm vào 404/
+// route sai, và link hiển thị bị dính "**" xấu ngay trong bubble chat.
+// Cũng có thể xuất hiện ở đầu (case hiếm nhưng vẫn xử lý cho nhất quán).
+const CW_TRAILING_PUNCT_RE = /[.,;:!?)\]}'"]+$/;
+function linkifyHtml(escapedText) {
+  return String(escapedText ?? "").replace(/https?:\/\/[^\s<>"'`*]+/g, (url) => {
+    let trailing = "";
+    const m = url.match(CW_TRAILING_PUNCT_RE);
+    if (m) {
+      trailing = m[0];
+      url = url.slice(0, -trailing.length);
+    }
+    if (!url) return url + trailing; // toàn bộ chỉ là dấu câu (hiếm) -- bỏ qua, không tạo link rỗng
+    // href dùng chính url đã escape (an toàn vì escapeHtml chạy TRƯỚC, chỉ
+    // encode &/</> -- không encode dấu ", nên tự thêm quote an toàn ở đây).
+    const hrefSafe = url.replace(/"/g, "&quot;");
+    // target="_blank" + rel="noopener noreferrer" mặc định cho MỌI link --
+    // click handler (xem dưới) sẽ preventDefault() + route vào preview NẾU
+    // là localhost/127.0.0.1, nên target=_blank ở đây chỉ thực sự "ăn" cho
+    // link KHÁC (github.com, docs...). Đây là lưới an toàn: nếu vì lý do gì
+    // JS listener không kịp gắn/chạy (vd lỗi script khác chặn), link vẫn mở
+    // TAB MỚI thay vì điều hướng đè lên chính trang chat đang dùng.
+    return `<a href="${hrefSafe}" class="cw-chat-link" data-cw-link="1" target="_blank" rel="noopener noreferrer">${url}</a>${trailing}`;
+  });
 }
 
 // ── ANSI → HTML adapter ─────────────────────────────────────────────────────
@@ -901,18 +1178,58 @@ function ansiToHtml(raw) {
 // dồn dập (streaming text từng ký tự) để tránh animation chồng animation
 // gây giật/lag, và cũng bỏ qua nếu user đã tự cuộn lên xem log cũ (không
 // kéo họ xuống bất ngờ giữa chừng).
-let scrollRaf = null;
 function isNearBottom() {
   return scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight < 120;
 }
+
+// BUG ĐÃ SỬA: "lúc cuộn lúc không" khi log/tool-card xuất hiện dồn dập (rất
+// hay gặp trong /codeweb — AI ghi file + nhiều tool event liên tiếp nhanh
+// hơn animation smooth-scroll ~300-400ms có thể hoàn tất). isNearBottom()
+// trước đây so scrollTop TỨC THỜI — nhưng scrollTop đo giữa chừng lúc chính
+// animation cuộn (do lần gọi TRƯỚC đó gây ra) còn đang chạy dở luôn CÒN CÁCH
+// đáy > 120px (animation chưa kịp tới nơi), nên bị coi nhầm là "user đã tự
+// cuộn lên xem log cũ" -> bỏ qua. Animation ban đầu chạy tới target CŨ rồi
+// dừng hẳn, không lệnh cuộn nào sau đó được cấp phép nữa -> log kẹt giữa
+// chừng dù có nội dung mới bên dưới.
+// Sửa: theo dõi RIÊNG "đang trong 1 chuỗi tự-cuộn do chính ta khởi tạo" bằng
+// cờ _autoScrolling — quyết định "có nên tự cuộn" chỉ đánh giá isNearBottom()
+// tại thời điểm KHÔNG có animation nào của ta đang chạy (tức trạng thái do
+// chính user để lại, không phải do animation cũ của ta chưa xong). Nếu đang
+// giữa chuỗi tự-cuộn, luôn cho phép "nối tiếp" cuộn tới target mới (không
+// đánh giá lại) — vì đã xác định trước đó là user đang ở đáy, họ không có
+// cơ hội tự cuộn tay lên trong vài trăm ms animation đang chạy. Cờ chỉ được
+// gỡ khi: (a) animation tới đích thật (event "scrollend"/timeout dự phòng),
+// hoặc (b) user chủ động cuộn tay (wheel/touchmove) — xem listener bên dưới.
+let scrollRaf = null;
+let _autoScrolling = false;
+let _autoScrollSettleTimer = null;
+
 function scrollToBottom(opts) {
+  const force = opts && opts.force;
   const smooth = !opts || opts.smooth !== false;
-  if (!isNearBottom() && !(opts && opts.force)) return;
+  // Chỉ đánh giá "user có đang xem log cũ không" khi KHÔNG có chuỗi tự-cuộn
+  // nào của ta đang chạy dở — tránh tự đọc nhầm vị trí giữa chừng animation
+  // của chính mình làm "bằng chứng" user đã rời đáy.
+  if (!force && !_autoScrolling && !isNearBottom()) return;
+
+  _autoScrolling = true;
   if (scrollRaf) cancelAnimationFrame(scrollRaf);
+  if (_autoScrollSettleTimer) clearTimeout(_autoScrollSettleTimer);
   scrollRaf = requestAnimationFrame(() => {
     scrollEl.scrollTo({ top: scrollEl.scrollHeight, behavior: smooth ? "smooth" : "auto" });
   });
+  // Không có "scrollend" event nào đáng tin cậy cross-browser cho mọi bản
+  // đang hỗ trợ — dùng timeout dự phòng đủ dài hơn animation smooth dài nhất
+  // (CSS/behavior:smooth mặc định trình duyệt thường <500ms) để gỡ cờ, cho
+  // phép lần "gần đáy" tiếp theo được đánh giá lại từ đầu bình thường.
+  _autoScrollSettleTimer = setTimeout(() => { _autoScrolling = false; }, 500);
 }
+
+// User tự cuộn tay (chuột/trackpad/chạm) trong lúc chuỗi tự-cuộn đang chạy
+// -> họ đang chủ động muốn xem chỗ khác, gỡ cờ ngay để lần gọi tiếp theo
+// đánh giá lại đúng vị trí thật thay vì tiếp tục "nối" theo quán tính.
+scrollEl.addEventListener("wheel", () => { _autoScrolling = false; }, { passive: true });
+scrollEl.addEventListener("touchmove", () => { _autoScrolling = false; }, { passive: true });
 
 // ── Dọn will-change sau khi animation "vào" kết thúc ────────────────────
 // CSS đặt will-change:transform,opacity trên .row/.bubble/.live-slot để
@@ -1236,6 +1553,13 @@ function appendBubble(html, from) {
 // ── Streaming text (AI: ... / [thinking] ...) — gom nhiều delta vào 1 bubble ─
 let curTextRow = null;
 let curThinkRow = null;
+// Buffer text THÔ (chưa escape) của bubble đang stream -- cần giữ riêng vì
+// appendTextDelta phải re-render bằng innerHTML (linkify chèn thẻ <a>), nên
+// không thể chỉ .textContent += như trước (đơn giản nhưng không cho phép
+// chèn HTML). Dùng buffer string thay vì đọc lại DOM để tránh mất mát nếu
+// nội dung DOM đã bị linkify biến đổi (đọc textContent lại sẽ mất thẻ <a>
+// bao quanh URL, làm sai buffer nếu dùng ngược DOM làm nguồn thật).
+let curTextRaw = "";
 
 function resetStreamRows() {
   // Turn kết thúc -> tắt con trỏ nhấp nháy của bubble AI vừa stream xong.
@@ -1245,14 +1569,20 @@ function resetStreamRows() {
   }
   curTextRow = null;
   curThinkRow = null;
+  curTextRaw = "";
 }
 
 function appendTextDelta(text) {
   if (!curTextRow) {
     curTextRow = appendBubble('<span class="ai-body streaming"></span>', "ai");
+    curTextRaw = "";
   }
+  curTextRaw += text;
   const body = curTextRow.querySelector(".ai-body");
-  body.textContent += text;
+  // escapeHtml TRƯỚC (chống XSS từ nội dung AI/tool trả về) rồi mới linkify
+  // (chèn thẻ <a> an toàn lên trên text đã escape) -- đúng thứ tự bắt buộc,
+  // xem comment ở linkifyHtml().
+  body.innerHTML = linkifyHtml(escapeHtml(curTextRaw));
   scrollToBottom({ smooth: false });
 }
 
@@ -1441,6 +1771,8 @@ function handleEvent(msg) {
       closeTurnLogs();
       renderHistory(d.messages || []);
       setBusy(false);
+      setCodewebMode(d.agent);
+      codewebRestoreFromSessionInit(d.codeweb_preview);
       // Session mới (hoặc /sessions đổi phiên) -> model có thể đã khác,
       // "không hỗ trợ ảnh" của model CŨ không còn ý nghĩa gì cho model MỚI
       // -- reset lại để nút ảnh sáng lên, thử lại từ đầu.
@@ -1585,10 +1917,18 @@ function handleEvent(msg) {
         // /model đổi model giữa chừng -- model MỚI chưa từng được thử gửi
         // ảnh, không được thừa hưởng trạng thái "không hỗ trợ" của model CŨ.
         maybeResetVisionBlock(d.model, d.vision_support);
+        setCodewebMode(d.agent);
       }
       break;
     case "ask":
+      // Không còn "codeweb_preview" (round-trip cho tool preview_check đã bị
+      // bỏ, xem 13_codeweb.py) -- mọi "ask" giờ đều là hỏi người dùng thật.
       renderAsk(msg);
+      break;
+    case "codeweb_auto_preview":
+      // Fire-and-forget: KHÔNG phải "ask", không có id, không cần trả lời
+      // ngược server. Xem codeweb_maybe_auto_preview() ở 13_codeweb.py.
+      codewebRunAutoPreview(d.path, d.html);
       break;
     default:
       // Type không nhận diện được — hiện thô để không mất thông tin, thay
@@ -1607,9 +1947,9 @@ function renderHistory(messages) {
     if (typeof content !== "string") continue;
     if (role === "user") {
       if (content.startsWith("[")) continue; // system-injected, bỏ qua hiển thị
-      appendBubble(escapeHtml(content), "user");
+      appendBubble(linkifyHtml(escapeHtml(content)), "user");
     } else if (role === "assistant") {
-      appendBubble(escapeHtml(content), "ai");
+      appendBubble(linkifyHtml(escapeHtml(content)), "ai");
     }
   }
 }
@@ -1883,7 +2223,7 @@ function renderAsk(msg) {
 // cách lấy whitelist tự động từ backend qua giao thức hiện tại).
 const SLASH_COMMANDS = [
   "/listkeys", "/rmkey", "/deletekey", "/addkey", "/setkey", "/model",
-  "/mode on", "/mode off", "/format",
+  "/mode on", "/mode off", "/format", "/codeweb on", "/codeweb off",
 ];
 const SLASH_DESC = {
   "/setkey":     "đổi API key",
@@ -1895,6 +2235,8 @@ const SLASH_DESC = {
   "/mode on":    "bật thinking mode",
   "/mode off":   "tắt thinking mode",
   "/format":     "đổi format API cho model hiện tại",
+  "/codeweb on":  "bật mode code frontend, live preview 2 cột",
+  "/codeweb off": "tắt mode code frontend, quay lại prompt build",
 };
 
 const slashHintEl = document.getElementById("slashHint");
@@ -2100,6 +2442,1080 @@ function clearPendingImages() {
   pendingImages = [];
   renderImgPreview();
 }
+
+// ══════════════════════════════════════════════════════════════════════════
+// /codeweb — layout 2 cột + auto-preview NGẦM (sandbox iframe, tự động sau
+// mỗi write/edit file .html, không hỏi người dùng, không tốn tool call của
+// model). Toàn bộ code mới nằm gọn trong khối này để dễ tìm/xoá. Đã bỏ tool
+// "preview_check" (model chủ động gọi) — vô dụng trong thực tế, model hiếm
+// khi gọi đúng lúc và ảnh chụp gửi lên chỉ tốn token; auto-preview ngầm là
+// đủ cho nhu cầu thật (người dùng tự thấy kết quả trong panel phải).
+// ══════════════════════════════════════════════════════════════════════════
+const mainSplitEl    = document.getElementById("mainSplit");
+const codewebPaneEl  = document.getElementById("codewebPane");
+const codewebTabsEl  = document.getElementById("codewebTabs");
+const codewebResizerEl = document.getElementById("codewebResizer");
+// Origin giả dùng làm <base> cho mọi nội dung preview -- khai báo sớm vì
+// dùng ở nhiều nơi (codewebPrepareSrcdoc phía dưới, và listener load ngay sau).
+const CW_FAKE_BASE = "https://codeweb-preview.invalid/";
+
+const codewebFrameEl = document.getElementById("codewebFrame");
+// Lớp phòng thủ thứ 2 (base tag ở codewebPrepareSrcdoc là lớp 1): mỗi khi
+// iframe hiển thị load xong 1 document mới, nếu vì lý do gì đó location của
+// nó lại KHÔNG phải origin giả CW_FAKE_BASE (vd JS trong preview tự gọi
+// location.href="..." trỏ ra ngoài, hoặc trình duyệt xử lý srcdoc khác kỳ
+// vọng) -- coi như điều hướng ngoài ý muốn, dừng ngay bằng cách nạp lại đúng
+// nội dung file đang xem (không cho nó tiếp tục load trang lạ, nhất là
+// KHÔNG để nó có cơ hội load lại chính web_index.html vào trong iframe).
+let _codewebRecoveringNav = false; // chặn tái nhập -- tránh vòng lặp vô hạn
+// nếu vì lý do gì href vẫn sai ngay sau khi tự nạp lại (bug thật thay vì
+// điều hướng lạ 1 lần) -- tối đa tự phục hồi 1 lần rồi im lặng, không loop.
+let _codewebFrameGen = 0; // tăng mỗi lần srcdoc được set -- chống race: nếu
+// người dùng đổi tab rất nhanh 2 lần liên tiếp, listener "load" của lần SET
+// TRƯỚC có thể fire SAU lần set SAU (thứ tự load không đảm bảo khớp thứ tự
+// gọi set). Không dùng closure path cố định vì codewebShowFile không phải
+// caller duy nhất tạo load event -- dùng số thế hệ để mỗi listener tự biết
+// "mình có còn là bản mới nhất không" tại thời điểm nó thực thi.
+codewebFrameEl.addEventListener("load", () => {
+  if (_codewebRecoveringNav) { _codewebRecoveringNav = false; return; }
+  // Guard này CHỈ áp dụng cho file-tab (srcdoc + <base> giả) -- khi đang xem
+  // server-tab (codewebShowServerUrl, dùng src=URL thật), codewebActivePath
+  // luôn là null (set ở codewebShowServerUrl), nên điều kiện phục hồi bên
+  // dưới tự động false -- không cố "sửa" href thật của server thành file cũ.
+  const genAtLoad = _codewebFrameGen; // chụp lại generation NGAY lúc load fire
+  try {
+    const w = codewebFrameEl.contentWindow;
+    const href = w && w.location && w.location.href;
+    if (href && href.indexOf(CW_FAKE_BASE) !== 0 && href !== "about:srcdoc") {
+      // Chỉ tự phục hồi nếu generation KHÔNG đổi từ lúc load fire tới lúc
+      // check này chạy (đồng bộ, cùng tick -- generation chỉ đổi khi có 1
+      // lệnh set srcdoc khác chạy TRƯỚC đoạn code này, tức đã có 1
+      // codewebShowFile/reload mới hơn xảy ra) -- nếu đã đổi, bỏ qua vì
+      // iframe giờ đang hiển thị đúng nội dung MỚI HƠN rồi, không cần "sửa"
+      // bằng nội dung active path cũ (dùng codewebActivePath lúc này có thể
+      // trỏ sai file so với cái vừa navigate lỗi).
+      if (genAtLoad === _codewebFrameGen && codewebActivePath && codewebFiles[codewebActivePath]) {
+        _codewebRecoveringNav = true;
+        _codewebFrameGen++;
+        codewebFrameEl.srcdoc = codewebPrepareSrcdoc(codewebFiles[codewebActivePath]);
+      }
+    }
+  } catch (e) {
+    // contentWindow không truy cập được (hiếm với allow-same-origin) -- bỏ qua
+  }
+});
+const codewebFrameWrapEl = document.getElementById("codewebFrameWrap");
+const codewebSandboxFrameEl = document.getElementById("codewebSandboxFrame");
+const codewebReloadBtnEl   = document.getElementById("codewebReloadBtn");
+const codewebSettingsBtnEl = document.getElementById("codewebSettingsBtn");
+const codewebSettingsPanelEl = document.getElementById("codewebSettingsPanel");
+const codewebRatioOptionsEl  = document.getElementById("codewebRatioOptions");
+
+let codewebFiles = {};      // path -> html string (chỉ file đã pass check)
+let codewebActivePath = null;
+let codewebRatio = "none";  // "none" | "16:9" | "9:16" | "4:3" | "1:1" | "20:9"
+// agent THẬT nhận từ server (qua session_init/session_meta) -- xem
+// setCodewebMode() bên dưới, nơi biến này được cập nhật. Khác với class CSS
+// "codeweb-on" trên #mainSplit (chỉ là hiển thị UI) -- currentAgent luôn
+// phản ánh đúng state.agent thật ở backend tại thời điểm nhận event gần nhất.
+let currentAgent = "";
+
+// ── Tab đặc biệt cho server nội bộ (link localhost/127.0.0.1 trong chat) ──
+// Tách hoàn toàn khỏi codewebFiles/codewebActivePath vì đây không phải nội
+// dung HTML tĩnh (srcdoc) mà là 1 server THẬT đang chạy -- hiển thị bằng
+// `src=URL` (điều hướng thật, có origin thật của server đó), không phải
+// srcdoc + <base> giả. codewebServerUrl != null nghĩa là tab server đang
+// active (ưu tiên hơn mọi file .html trong thanh tab khi hiển thị active).
+let codewebServerUrl = null;
+
+// Nhận diện "URL server nội bộ" -- KHÔNG chỉ 127.x/localhost, vì agent có
+// thể mở dev server bind theo hostname máy, 0.0.0.0 (rồi log ra IP LAN thật
+// khi in địa chỉ), hoặc bất kỳ IP trong dải private chuẩn (Docker network,
+// máy ảo, thiết bị khác cùng mạng LAN...) -- không có gì đảm bảo AI luôn
+// dùng đúng 127.0.0.1. Parse OCTET THẬT (không regex string-match trên toàn
+// bộ hostname) để tránh bị bypass bởi domain giả dạng chứa chuỗi số giống
+// IP private (vd "10.0.0.1.evil.com" có hostname THẬT là "evil.com", không
+// phải IP) -- new URL().hostname đã tách đúng phần host, chỉ cần parse đúng
+// octet của NÓ, không cần lo phần path/subdomain lừa dối.
+function codewebIsPrivateIPv4(hostname) {
+  const m = hostname.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (!m) return false;
+  const o = m.slice(1, 5).map(Number);
+  if (o.some(n => n < 0 || n > 255)) return false; // "999.1.1.1" v.v. -- không phải IP hợp lệ, an toàn false
+  const [a, b] = o;
+  if (a === 127) return true;                           // 127.0.0.0/8 -- loopback
+  if (a === 10) return true;                             // 10.0.0.0/8
+  if (a === 192 && b === 168) return true;               // 192.168.0.0/16
+  if (a === 172 && b >= 16 && b <= 31) return true;       // 172.16.0.0/12
+  if (a === 0 && b === 0 && o[2] === 0 && o[3] === 0) return true; // 0.0.0.0 -- dev server thường bind địa chỉ này
+  return false;
+}
+function codewebIsLocalUrl(url) {
+  try {
+    const u = new URL(url);
+    if (u.protocol !== "http:" && u.protocol !== "https:") return false;
+    const h = u.hostname;
+    if (h === "localhost" || h === "[::1]" || h === "::1") return true;
+    return codewebIsPrivateIPv4(h);
+  } catch (e) { return false; }
+}
+
+// Hiển thị 1 server nội bộ (localhost/IP private) thật trong panel preview,
+// dùng src=URL thật (KHÔNG dùng srcdoc/<base> giả -- đây là điều hướng thật
+// tới 1 server thật, khác hẳn cơ chế preview file tĩnh). Tự bật /codeweb
+// panel nếu đang tắt để có chỗ hiển thị.
+function codewebShowServerUrl(url) {
+  if (!mainSplitEl.classList.contains("codeweb-on")) {
+    mainSplitEl.classList.add("codeweb-on");
+    codewebApplySavedSplit();
+  }
+  const isSwitching = codewebServerUrl !== url;
+  codewebServerUrl = url;
+  codewebActivePath = null; // tab server đang active -> không file nào active
+  codewebPaneEl.classList.add("has-preview");
+  if (isSwitching) {
+    codewebFrameEl.classList.remove("cw-slide-in");
+    void codewebFrameEl.offsetWidth;
+    codewebFrameEl.classList.add("cw-slide-in");
+  }
+  _codewebFrameGen++;
+  codewebFrameEl.removeAttribute("srcdoc");
+  codewebFrameEl.src = url;
+  codewebRenderTabs();
+  if (codewebRatio !== "none") codewebFitFrameToRatio();
+}
+
+function setCodewebMode(agent) {
+  currentAgent = agent || "";
+  const on = agent === "codeweb";
+  mainSplitEl.classList.toggle("codeweb-on", on);
+  if (on) {
+    codewebApplySavedSplit();
+  } else {
+    // BUG ĐÃ SỬA: trước đây tắt /codeweb chỉ gỡ class "codeweb-on", không
+    // xoá inline style.flexBasis đã set lúc kéo thanh resizer (codewebResizeTo/
+    // codewebApplySavedSplit). Inline style LUÔN thắng mọi CSS class selector
+    // (kể cả #mainSplit.codeweb-on #logScroll) -- nên sau khi từng kéo resizer
+    // 1 lần rồi /codeweb off, #logScroll bị KẸT ở % đã kéo dở thay vì trở về
+    // full-width như CSS mặc định "#logScroll { flex:0 1 100% }" quy định,
+    // dù layout lẽ ra phải về lại 1 cột đầy đủ. Xoá inline style khi tắt để
+    // CSS mặc định áp dụng lại đúng -- KHÔNG xoá logScrollFlexBasisPct (biến
+    // nhớ % riêng), vì đó là tiện nghi cố ý "giữ % đã kéo qua các lần bật/tắt
+    // trong cùng phiên" -- codewebApplySavedSplit() vẫn dùng đúng giá trị này
+    // để khôi phục khi bật /codeweb lại lần sau.
+    scrollEl.style.flexBasis = "";
+    codewebPaneEl.style.flexBasis = "";
+  }
+}
+
+// Phục hồi panel preview khi nhận session_init (reload trang F5, hoặc
+// reconnect WS sau mất mạng) -- xem codeweb_get_session_preview_state()
+// ở 13_codeweb.py. Không có gì để phục hồi -> giữ nguyên panel trống,
+// không lỗi, không cần try/catch phức tạp vì input đã validate ở server.
+function codewebRestoreFromSessionInit(preview) {
+  codewebFiles = {};
+  codewebActivePath = null;
+  codewebServerUrl = null; // tab server chỉ tồn tại tạm phía client, không lưu ở server -> luôn mất khi reload/reconnect
+  _codewebFrameGen++;
+  codewebFrameEl.removeAttribute("src");
+  codewebFrameEl.srcdoc = "";
+  codewebPaneEl.classList.remove("has-preview");
+  codewebTabsEl.innerHTML = "";
+  if (!preview || !preview.files) return;
+  const files = preview.files;
+  const paths = Object.keys(files);
+  if (paths.length === 0) return;
+  codewebFiles = { ...files };
+  const active = (preview.active && preview.active in codewebFiles) ? preview.active : paths[0];
+  codewebShowFile(active, { animate: false });
+}
+
+// Gửi ack ngược lên server mỗi khi 1 preview (auto-preview ngầm) PASS --
+// để server lưu lại (RAM, theo sid) và gửi lại đúng bản này trong
+// session_init lần tới. Không round-trip, không ai chờ trả lời.
+function codewebAckPreviewPass(path, html) {
+  try {
+    sendJson({ type: "codeweb_preview_ack", path, html });
+  } catch (e) { /* mất kết nối tạm thời -- không sao, lần pass tiếp theo sẽ ack lại */ }
+}
+
+function codewebRenderTabs() {
+  const paths = Object.keys(codewebFiles);
+  let tabsHtml = paths.map(p =>
+    `<div class="cw-tab${(!codewebServerUrl && p === codewebActivePath) ? " active" : ""}" data-path="${escapeHtml(p)}">${escapeHtml(p.split("/").pop())}</div>`
+  ).join("");
+  // Tab server (nếu người dùng đã từng bấm 1 link localhost) luôn hiện Ở
+  // CUỐI, nhãn rút gọn "🔗 :PORT" cho gọn (thanh tab vốn hẹp, tên host dài
+  // dễ tràn) -- giữ nguyên URL đầy đủ trong data-url để bấm lại vẫn đúng.
+  if (codewebServerUrl) {
+    let label = codewebServerUrl;
+    try {
+      const u = new URL(codewebServerUrl);
+      label = "🔗 " + (u.port ? ":" + u.port : u.hostname);
+    } catch (e) { /* URL lạ -- hiện nguyên văn, hiếm khi xảy ra vì đã validate lúc set */ }
+    tabsHtml += `<div class="cw-tab cw-tab-server active" data-server-url="${escapeHtml(codewebServerUrl)}">${escapeHtml(label)}</div>`;
+  }
+  codewebTabsEl.innerHTML = tabsHtml;
+  codewebTabsEl.querySelectorAll(".cw-tab[data-path]").forEach(el => {
+    el.addEventListener("click", () => codewebShowFile(el.dataset.path, { animate: true }));
+  });
+  const serverTabEl = codewebTabsEl.querySelector(".cw-tab-server");
+  if (serverTabEl) {
+    serverTabEl.addEventListener("click", () => codewebShowServerUrl(serverTabEl.dataset.serverUrl));
+  }
+}
+
+// ── Khung tỉ lệ (16:9, 9:16, 4:3, 1:1, 20:9, hoặc "Tự do") ─────────────────
+// Không ảnh hưởng nội dung HTML thật đang preview, chỉ đổi kích thước hiển
+// thị của #codewebFrame bên trong #codewebFrameWrap (nền tối xung quanh,
+// giống khung xem responsive thật của trình duyệt/devtools).
+//
+// QUAN TRỌNG: đo bằng JS (clientWidth/clientHeight của wrap) rồi tính trực
+// tiếp width/height px theo kiểu "contain" (giữ nguyên tỉ lệ, không tràn ra
+// ngoài theo CẢ 2 chiều) -- đã kiểm chứng bằng Playwright rằng CSS thuần
+// (aspect-ratio + max-width/max-height) không tự phối hợp đúng khi bị giới
+// hạn theo chiều rộng (vd 16:9, 20:9 trên khung gần vuông).
+function codewebFitFrameToRatio() {
+  if (codewebRatio === "none") return;
+  const availW = codewebFrameWrapEl.clientWidth;
+  const availH = codewebFrameWrapEl.clientHeight;
+  if (availW <= 0 || availH <= 0) return; // pane đang ẩn, ResizeObserver sẽ gọi lại khi hiện
+  const [rw, rh] = codewebRatio.split(":").map(Number);
+  const targetRatio = rw / rh;
+  const availRatio = availW / availH;
+  let w, h;
+  if (availRatio > targetRatio) {
+    // wrap rộng hơn tỉ lệ mong muốn -> giới hạn theo chiều cao
+    h = availH;
+    w = h * targetRatio;
+  } else {
+    // wrap hẹp hơn (hoặc bị giới hạn theo chiều ngang, vd 16:9/20:9 trên khung gần vuông)
+    w = availW;
+    h = w / targetRatio;
+  }
+  codewebFrameEl.style.width = `${Math.floor(w)}px`;
+  codewebFrameEl.style.height = `${Math.floor(h)}px`;
+}
+
+function codewebApplyRatio(ratio) {
+  codewebRatio = ratio;
+  if (ratio === "none") {
+    codewebFrameWrapEl.classList.remove("cw-has-ratio");
+    codewebFrameEl.style.width = "";
+    codewebFrameEl.style.height = "";
+  } else {
+    codewebFrameWrapEl.classList.add("cw-has-ratio");
+    codewebFitFrameToRatio();
+  }
+  codewebRatioOptionsEl.querySelectorAll("button").forEach(btn => {
+    btn.classList.toggle("active", btn.dataset.ratio === ratio);
+  });
+}
+
+codewebRatioOptionsEl.querySelectorAll("button").forEach(btn => {
+  btn.addEventListener("click", () => codewebApplyRatio(btn.dataset.ratio));
+});
+codewebApplyRatio("none");  // mặc định "Tự do", đúng hành vi cũ trước khi có tính năng này
+
+// Tự tính lại khung khi wrap đổi kích thước: cửa sổ resize, bật/tắt
+// codeweb-on (pane ẩn->hiện, trước đó clientWidth/Height = 0), hoặc sidebar
+// trái đổi độ rộng. Bao trùm mọi trường hợp không cần hook rải rác nơi khác.
+if (typeof ResizeObserver !== "undefined") {
+  const codewebRatioObserver = new ResizeObserver(() => codewebFitFrameToRatio());
+  codewebRatioObserver.observe(codewebFrameWrapEl);
+}
+
+// ── Thanh kéo giữa 2 cột ─────────────────────────────────────────────────
+// Pointer Events (không phải mousedown/touchstart riêng) -- 1 bộ code chạy
+// đúng cho cả chuột lẫn cảm ứng, không cần nhánh if riêng cho mobile.
+// Set trực tiếp flex-basis bằng % theo vị trí con trỏ trong #mainSplit --
+// dùng CHÍNH % này cho #logScroll, còn #codewebPane để flex-shrink tự lo
+// phần còn lại (đã fix flex-grow cố định ở CSS, chỉ flex-basis đổi).
+// Giới hạn min/max để không kéo 1 bên co về 0 làm mất hẳn cột kia.
+const CW_RESIZE_MIN_PCT = 20;
+const CW_RESIZE_MAX_PCT = 80;
+let cwResizing = false;
+// Giữ % đã kéo cuối cùng qua các lần bật/tắt /codeweb trong CÙNG 1 phiên
+// trang (không cần lưu server -- chỉ là tiện nghi UI, mất khi F5 là chấp
+// nhận được, quay lại mặc định 48/52 lúc reload).
+let logScrollFlexBasisPct = null;
+
+function codewebResizeTo(clientX) {
+  const rect = mainSplitEl.getBoundingClientRect();
+  if (rect.width <= 0) return;
+  let pct = ((clientX - rect.left) / rect.width) * 100;
+  pct = Math.max(CW_RESIZE_MIN_PCT, Math.min(CW_RESIZE_MAX_PCT, pct));
+  logScrollFlexBasisPct = pct;
+  scrollEl.style.flexBasis = `${pct}%`;
+  codewebPaneEl.style.flexBasis = `${100 - pct}%`;
+  // "Kéo là thay đổi rồi" -- mỗi lần kéo phải render lại khung tỉ lệ ngay
+  // lập tức (không đợi ResizeObserver, vốn có thể trễ vài ms so với thao
+  // tác kéo liên tục, gây cảm giác preview "chạy theo sau" ngón tay).
+  codewebFitFrameToRatio();
+}
+
+function codewebApplySavedSplit() {
+  if (logScrollFlexBasisPct == null) return;
+  scrollEl.style.flexBasis = `${logScrollFlexBasisPct}%`;
+  codewebPaneEl.style.flexBasis = `${100 - logScrollFlexBasisPct}%`;
+}
+
+codewebResizerEl.addEventListener("pointerdown", (ev) => {
+  if (!mainSplitEl.classList.contains("codeweb-on")) return;
+  cwResizing = true;
+  mainSplitEl.classList.add("cw-resizing");
+  codewebResizerEl.classList.add("cw-dragging");
+  codewebResizerEl.setPointerCapture(ev.pointerId);
+  ev.preventDefault();
+});
+codewebResizerEl.addEventListener("pointermove", (ev) => {
+  if (!cwResizing) return;
+  codewebResizeTo(ev.clientX);
+});
+function codewebEndResize(ev) {
+  if (!cwResizing) return;
+  cwResizing = false;
+  mainSplitEl.classList.remove("cw-resizing");
+  codewebResizerEl.classList.remove("cw-dragging");
+  try { codewebResizerEl.releasePointerCapture(ev.pointerId); } catch (e) {}
+}
+codewebResizerEl.addEventListener("pointerup", codewebEndResize);
+codewebResizerEl.addEventListener("pointercancel", codewebEndResize);
+
+codewebSettingsBtnEl.addEventListener("click", (ev) => {
+  ev.stopPropagation();
+  codewebSettingsPanelEl.classList.toggle("show");
+});
+// Bấm ra ngoài popover -> tự đóng lại (UX chuẩn cho mọi popover khác trong app)
+document.addEventListener("click", (ev) => {
+  if (!codewebSettingsPanelEl.classList.contains("show")) return;
+  if (codewebSettingsPanelEl.contains(ev.target) || ev.target === codewebSettingsBtnEl) return;
+  codewebSettingsPanelEl.classList.remove("show");
+});
+
+// ── Click vào link trong bubble chat (được linkifyHtml() chèn) ───────────
+// URL server nội bộ (localhost + mọi dải IP private chuẩn -- xem
+// codewebIsLocalUrl/codewebIsPrivateIPv4, KHÔNG chỉ 127.0.0.1, vì agent có
+// thể bind dev server theo hostname máy/0.0.0.0/IP LAN khác) -> hiển thị
+// THẲNG trong panel preview bên phải (tab riêng "🔗 :PORT", tách khỏi các
+// tab file .html tĩnh) thay vì rời khỏi app.
+// URL khác (github.com, docs, hay bất kỳ IP CÔNG KHAI nào) -> mở tab trình
+// duyệt MỚI bình thường, không đụng gì tới preview -- đây là hành vi mặc
+// định của <a> nên chỉ cần KHÔNG preventDefault, để trình duyệt tự xử lý
+// (đã có target=_blank set sẵn ở dưới cho những link này qua thuộc tính
+// rel/target gán động).
+document.addEventListener("click", (ev) => {
+  const a = ev.target.closest && ev.target.closest("a.cw-chat-link[data-cw-link]");
+  if (!a) return;
+  const url = a.getAttribute("href");
+  if (!url) return;
+  // Tôn trọng ý định user khi giữ modifier key hoặc bấm chuột giữa -- đây
+  // là tín hiệu chuẩn "mở tab mới" của mọi trình duyệt, nên KHÔNG ép vào
+  // preview dù url là local. Để mặc định (target=_blank đã set sẵn) tự lo.
+  if (ev.ctrlKey || ev.metaKey || ev.shiftKey || ev.button === 1) return;
+  if (codewebIsLocalUrl(url)) {
+    ev.preventDefault();
+    if (currentAgent !== "codeweb") {
+      if (isBusy) {
+        appendStandaloneCard(
+          "Đợi AI trả lời xong rồi bấm lại — cần bật /codeweb trước khi mở preview.",
+          "warn"
+        );
+        return;
+      }
+      sendJson({ type: "input", value: "/codeweb on" });
+    }
+    codewebShowServerUrl(url);
+  }
+  // else: để trình duyệt tự mở -- target="_blank" đã set sẵn lúc linkify
+  // KHÔNG áp dụng ở đây (link localhost cần preventDefault trước khi tab
+  // mới kịp mở), nên gán target/rel ngay trong linkifyHtml() thay vì đây.
+});
+
+// ── Nút reload preview: tải lại NỘI DUNG HIỆN TẠI (srcdoc lại từ đầu) ─────
+// Dùng khi trang preview bị đơ/treo (vd JS vô hạn, animation kẹt) --
+// KHÔNG chạy lại sandbox-check, chỉ đơn giản gán lại srcdoc để browser tạo
+// document mới tinh cho iframe hiển thị (tương đương bấm F5 trong 1 tab
+// bình thường). Không có gì để reload -> vô hiệu hoá im lặng.
+codewebReloadBtnEl.addEventListener("click", () => {
+  if (!codewebActivePath || !(codewebActivePath in codewebFiles)) return;
+  codewebReloadBtnEl.classList.add("cw-spinning");
+  const html = codewebFiles[codewebActivePath];
+  // Gán rỗng trước rồi gán lại -- đảm bảo browser huỷ document cũ (kể cả
+  // nếu nó đang treo/vòng lặp vô hạn) trước khi tạo document mới, thay vì
+  // gán lại y hệt (một số trình duyệt có thể no-op nếu srcdoc không đổi).
+  _codewebFrameGen++;
+  codewebFrameEl.srcdoc = "";
+  requestAnimationFrame(() => {
+    _codewebFrameGen++;
+    codewebFrameEl.srcdoc = codewebPrepareSrcdoc(html);
+    setTimeout(() => codewebReloadBtnEl.classList.remove("cw-spinning"), 400);
+  });
+});
+
+// ── Chặn navigation trong preview vô tình chạm tới app cha ────────────────
+// Vấn đề gốc: iframe dùng `srcdoc` (không có URL thật) -- theo spec, base URL
+// của document trong `srcdoc` KẾ THỪA base URL của trang chứa nó (chính
+// web_index.html). Nghĩa là bất kỳ URL tương đối trong file preview (href,
+// src, action, hay JS tự set location) có thể bị resolve NHẦM về app cha,
+// và tệ nhất là load lại chính web_index.html LỒNG VÀO TRONG iframe preview
+// (UI chat hiện trong preview, trong đó lại có preview...). Anchor nội bộ
+// dạng "#id" thường vô hại, nhưng để chắc chắn 100% không phụ thuộc hành vi
+// trình duyệt, tiêm 1 <base> giả (origin vô hại, không tồn tại) vào đầu mọi
+// srcdoc trước khi gán -- mọi URL tương đối trong file giờ resolve về origin
+// giả đó (404 vô hại) thay vì origin thật của app.
+// Script tiêm vào CHÍNH nội dung srcdoc (chạy bên trong iframe con) --
+// bắt click trên <a> TRƯỚC khi trình duyệt điều hướng thật ra CW_FAKE_BASE
+// (".invalid" -> lỗi DNS xấu, đã xác nhận là bug thật). KHÔNG chặn/vô hiệu
+// hoá link -- rule là MỞ link, không bỏ tính năng. Phân loại và mở đúng nơi:
+//   - href="#id" (fragment nội bộ) -> KHÔNG thể để trình duyệt tự xử lý,
+//     dù trông vô hại: document.URL thật của srcdoc là "about:srcdoc", còn
+//     <base> giả trỏ CW_FAKE_BASE -- 2 URL khác nhau, nên trình duyệt resolve
+//     "#id" thành 1 navigate CROSS-DOCUMENT thật tới CW_FAKE_BASE (gây đúng
+//     lỗi DNS đã thấy ở bug report), KHÔNG PHẢI same-page scroll như tưởng.
+//     Phải tự preventDefault + tự scrollIntoView bằng JS để thay thế.
+//   - href tuyệt đối (http/https domain thật) -> báo ra ngoài (postMessage)
+//     để web_index.html (không bị sandbox giới hạn) tự window.open tab mới.
+//   - href tương đối khác (vd "page2.html") -> có thể là 1 FILE KHÁC agent
+//     đã viết cùng lúc (nằm trong codewebFiles của cửa sổ cha) -> báo ra
+//     ngoài để cha tự chuyển preview sang file đó (codewebShowFile), y hệt
+//     bấm tab -- link vẫn "mở" được, chỉ là đổi tab thay vì navigate thật
+//     (network request thật tới CW_FAKE_BASE luôn fail, domain không tồn tại).
+const CW_LINK_GUARD_SCRIPT = `<script>
+(function(){
+  function routeHref(href, ev){
+    if (!href || href.indexOf("javascript:") === 0) return;
+    if (href.charAt(0) === "#") {
+      // QUAN TRỌNG: dù chỉ là fragment, document.URL thật của srcdoc là
+      // "about:srcdoc", còn <base> giả trỏ codeweb-preview.invalid -- 2 URL
+      // khác nhau, nên trình duyệt resolve href này thành 1 navigate CROSS-
+      // DOCUMENT thật (không phải same-page scroll), gây đúng lỗi DNS đã
+      // thấy. Phải tự chặn + tự cuộn bằng JS để thay thế hành vi native.
+      if (ev) ev.preventDefault();
+      var id = href.slice(1);
+      if (id) {
+        var target = document.getElementById(id) || document.getElementsByName(id)[0];
+        if (target && target.scrollIntoView) {
+          target.scrollIntoView({ behavior: "smooth", block: "start" });
+        }
+      }
+      return;
+    }
+    // Dùng indexOf thay vì regex literal -- tránh lỗi double-escape backslash
+    // khi source này nằm trong 1 template literal của outer JS (đã gặp lỗi
+    // này trước đó với \\/ -> \\\\/ khi ghi ra text thật cho iframe con).
+    var schemeIdx = href.indexOf("://");
+    var isAbsolute = (schemeIdx > 0 && schemeIdx < 10) || href.indexOf("//") === 0;
+    if (ev) ev.preventDefault();
+    try {
+      window.parent.postMessage({
+        __cwLink: isAbsolute ? "external" : "internal",
+        href: href
+      }, "*");
+    } catch (e) {}
+  }
+  document.addEventListener("click", function(ev){
+    var a = ev.target && ev.target.closest ? ev.target.closest("a[href]") : null;
+    if (!a) return;
+    routeHref(a.getAttribute("href") || "", ev);
+  }, true);
+  // Form submit (GET/POST tới action tương đối) navigate y hệt <a> -- bắt
+  // bằng "submit" event, cùng cơ chế route như click. action="" (submit về
+  // chính nó, mặc định khi không set action) coi như fragment rỗng -- không
+  // có gì để cuộn/mở, chỉ chặn navigate lỗi, im lặng.
+  document.addEventListener("submit", function(ev){
+    var f = ev.target;
+    if (!f || f.tagName !== "FORM") return;
+    var action = f.getAttribute("action") || "";
+    routeHref(action || "#", ev);
+  }, true);
+  // location.href="..."/location.assign()/location.replace() gọi từ JS của
+  // chính trang preview KHÔNG thể bắt bằng addEventListener (không có hook
+  // nào chạy trước khi trình duyệt bắt đầu navigate). <meta http-equiv=
+  // "refresh"> cũng vậy (browser tự xử lý ở tầng HTML parser, không có JS
+  // hook). Đây là giới hạn thật của kỹ thuật click/submit-intercept -- lớp
+  // phòng thủ cho 2 case này nằm Ở NGOÀI iframe: xem listener "load" trên
+  // codewebFrameEl (web_index.html) tự phát hiện href lạ sau khi load và
+  // nạp lại nội dung cũ.
+})();
+<\/script>`;
+
+function codewebPrepareSrcdoc(html) {
+  if (typeof html !== "string") return html;
+  const baseTag = `<base href="${CW_FAKE_BASE}">`;
+  const headIdx = html.search(/<head[^>]*>/i);
+  if (headIdx !== -1) {
+    const insertAt = html.indexOf(">", headIdx) + 1;
+    return html.slice(0, insertAt) + baseTag + html.slice(insertAt) + CW_LINK_GUARD_SCRIPT;
+  }
+  const htmlIdx = html.search(/<html[^>]*>/i);
+  if (htmlIdx !== -1) {
+    const insertAt = html.indexOf(">", htmlIdx) + 1;
+    return html.slice(0, insertAt) + `<head>${baseTag}</head>` + html.slice(insertAt) + CW_LINK_GUARD_SCRIPT;
+  }
+  // Không có <head>/<html> rõ ràng (file HTML tối giản) -- chèn ngay đầu,
+  // trình duyệt vẫn tự tạo <head> hợp lệ khi parse. Guard nối cuối (chạy
+  // sau khi phần còn lại đã parse xong, an toàn để querySelector DOM).
+  return baseTag + html + CW_LINK_GUARD_SCRIPT;
+}
+
+// Nhận postMessage từ CW_LINK_GUARD_SCRIPT bên trong iframe preview --
+// xử lý routing thật ở cửa sổ cha (không bị sandbox giới hạn window.open).
+window.addEventListener("message", (ev) => {
+  const d = ev.data;
+  if (!d || typeof d !== "object" || !d.__cwLink) return;
+  const href = String(d.href || "");
+  if (!href) return;
+  if (d.__cwLink === "external") {
+    // Link tuyệt đối -- nếu là server nội bộ (localhost/dải private, dùng
+    // ĐÚNG codewebIsLocalUrl đã có sẵn cho linkify chat, nhất quán 1 luật
+    // duy nhất) thì mở luôn trong preview như 1 server-tab; ngược lại (domain
+    // thật ngoài) mới mở tab trình duyệt mới.
+    if (codewebIsLocalUrl(href)) {
+      codewebShowServerUrl(href);
+    } else {
+      window.open(href, "_blank", "noopener,noreferrer");
+    }
+    return;
+  }
+  // Link tương đối ("page2.html", có thể kèm "./", "../") -- tìm đúng file
+  // trong codewebFiles bằng cách so khớp phần tên file cuối cùng (bỏ qua
+  // "./"/"../" và query/hash), vì agent thường ghi path phẳng không thư mục.
+  const clean = href.split("#")[0].split("?")[0].replace(/^\.\/?/, "");
+  if (clean in codewebFiles) {
+    codewebShowFile(clean, { animate: true });
+    return;
+  }
+  const base = clean.split("/").pop();
+  if (base && base in codewebFiles) {
+    codewebShowFile(base, { animate: true });
+    return;
+  }
+  // Không tìm thấy file tương ứng (agent chưa viết file đó) -- không có gì
+  // để "mở", im lặng bỏ qua thay vì hiện lỗi DNS xấu.
+});
+
+function codewebShowFile(path, opts) {
+  if (!(path in codewebFiles)) return;
+  const isSwitchingFile = path !== codewebActivePath || codewebServerUrl !== null;
+  codewebActivePath = path;
+  codewebServerUrl = null; // rời tab server (nếu đang xem) -> quay lại file tĩnh
+  codewebPaneEl.classList.add("has-preview");
+  // Animation trượt ngang khi ĐỔI SANG file khác (không animate khi chỉ là
+  // cùng 1 file được update nội dung -- tránh nháy liên tục lúc AI edit
+  // nhiều lần liên tiếp vào đúng 1 file đang xem).
+  if (opts && opts.animate && isSwitchingFile) {
+    codewebFrameEl.classList.remove("cw-slide-in");
+    // force reflow để restart animation nếu đổi tab nhanh liên tiếp
+    void codewebFrameEl.offsetWidth;
+    codewebFrameEl.classList.add("cw-slide-in");
+  }
+  _codewebFrameGen++;
+  codewebFrameEl.removeAttribute("src"); // rời server-tab (nếu vừa đang xem) -- tránh 2 nguồn nội dung (src + srcdoc) cùng tồn tại
+  codewebFrameEl.srcdoc = codewebPrepareSrcdoc(codewebFiles[path]);
+  codewebRenderTabs();
+  // Lần đầu pane chuyển ẩn->hiện ("has-preview" vừa thêm ở trên), wrap có
+  // thể đổi layout ngay trong cùng frame -- gọi lại fit để không bị lệch
+  // (ResizeObserver vẫn là nguồn chính, đây chỉ là double-check rẻ tiền).
+  if (codewebRatio !== "none") codewebFitFrameToRatio();
+}
+
+// ── Chạy thử 1 file HTML trong iframe SANDBOX ẨN, bắt lỗi runtime, chỉ swap
+// sang iframe HIỂN THỊ (#codewebFrame) nếu không lỗi. Lỗi -> giữ nguyên bản
+// cũ, không đụng gì tới #codewebFrame/#codewebTabs hiện có.
+// Caller duy nhất: codewebRunAutoPreview() (auto-preview ngầm). Không tự
+// quyết định phải làm gì với kết quả -- gọi onDone(result) rồi để caller
+// tự xử lý (swap tab hay im lặng).
+function codewebSandboxCheck(html, onDone) {
+  const CHECK_TIMEOUT_MS = 4000;
+  const frame = codewebSandboxFrameEl;
+  let errorMsg = null;
+  let settled = false;
+
+  function onFrameError(ev) {
+    errorMsg = (ev && ev.detail) || "unhandled error trong preview";
+    finish();
+  }
+  frame.addEventListener("codeweb-preview-error", onFrameError, { once: true });
+
+  function cleanup() {
+    frame.removeEventListener("codeweb-preview-error", onFrameError);
+    frame.onload = null;
+    clearTimeout(timer);
+  }
+
+  async function finish() {
+    if (settled) return;
+    settled = true;
+    cleanup();
+    if (errorMsg) {
+      onDone({ ok: false, error: String(errorMsg).slice(0, 500) });
+      return;
+    }
+    // Không lỗi -> pass. KHÔNG còn chụp ảnh iframe nữa (đã bỏ tool
+    // preview_check — không ai tiêu thụ screenshot nữa, chụp+resize+nén mỗi
+    // lần auto-preview chỉ tốn CPU vô ích). Chỉ auto-preview ngầm dùng lõi
+    // này, và nó chỉ cần biết ok/fail để quyết định swap tab hay im lặng.
+    onDone({ ok: true });
+  }
+
+  const timer = setTimeout(() => {
+    // Không load xong / không báo lỗi cũng không báo xong trong thời gian
+    // hợp lý -- coi như lỗi (vd vòng lặp vô hạn, treo).
+    errorMsg = errorMsg || `timeout sau ${CHECK_TIMEOUT_MS}ms — trang có thể bị treo`;
+    finish();
+  }, CHECK_TIMEOUT_MS);
+
+  frame.onload = () => {
+    // Tiêm bắt lỗi runtime NGAY sau khi document load xong — sandbox iframe
+    // same-origin (allow-same-origin) nên contentWindow truy cập được.
+    try {
+      const w = frame.contentWindow;
+      // Kiểm tra navigation lạ NGAY tại đây: nếu location không còn ở origin
+      // giả CW_FAKE_BASE, nghĩa là file tự điều hướng đi chỗ khác ngay khi
+      // load (vd JS redirect đồng bộ). Coi đây là LỖI THẬT -- không cho pass
+      // giả, vì contentWindow bây giờ có thể là 1 document hoàn toàn khác
+      // (tệ nhất: web_index.html bị load lồng vào sandbox), onerror gắn vào
+      // đó sẽ vô nghĩa và mọi check sau này cũng sai theo.
+      const href = w && w.location && w.location.href;
+      if (href && href.indexOf(CW_FAKE_BASE) !== 0 && href !== "about:srcdoc") {
+        errorMsg = "trang tự điều hướng ra ngoài preview (navigation ngoài ý muốn) — bị chặn";
+        finish();
+        return;
+      }
+      w.onerror = (m) => {
+        frame.dispatchEvent(new CustomEvent("codeweb-preview-error", { detail: m }));
+      };
+      w.addEventListener("unhandledrejection", (ev) => {
+        frame.dispatchEvent(new CustomEvent("codeweb-preview-error",
+          { detail: "unhandled promise rejection: " + (ev.reason && ev.reason.message || ev.reason) }));
+      });
+      // Navigation CHẬM hơn (vd setTimeout rồi mới redirect) không bắt được
+      // ngay ở đây -- gắn thêm 1 listener 'unload' để phát hiện nếu document
+      // hiện tại (đã pass onload) bị thay bằng document khác sau đó, TRƯỚC
+      // khi finish() thật sự chốt kết quả. Sau khi finish() đã chạy thì
+      // listener này vô hại (settled=true, finish() no-op).
+      w.addEventListener("unload", () => {
+        if (!settled) {
+          errorMsg = "trang tự điều hướng ra ngoài preview sau khi load — bị chặn";
+          finish();
+        }
+      }, { once: true });
+    } catch (e) {
+      // Không gắn được listener (hiếm, vd trình duyệt chặn) -- vẫn coi là
+      // "load xong không lỗi phát hiện được", finish() sau 1 khoảng ngắn để
+      // window có cơ hội tự ném lỗi đồng bộ trước đó.
+    }
+    setTimeout(finish, 300);
+  };
+
+  frame.srcdoc = codewebPrepareSrcdoc(html);
+}
+
+// (Đã bỏ codewebRunPreviewCheck — tool "preview_check" không còn tồn tại,
+// không còn round-trip nào để xử lý ở đây.)
+
+// ── Morph DOM sống của iframe HIỂN THỊ (khi update = CÙNG file đang xem) ──
+// Mục tiêu: tránh reload cứng (mất scroll, chớp trắng, huỷ state JS) mỗi lần
+// AI sửa 1 file đang được xem. Thay vào đó patch trực tiếp DOM đang sống
+// trong #codewebFrame để khớp với HTML mới, rồi:
+//   - Scroll tới đúng chỗ vừa đổi (không phải giữ y chỗ cũ im re).
+//   - Highlight nhẹ (flash) đúng node vừa đổi để người dùng nhận ra.
+//   - <script> có nội dung mới/khác cũ -> tự tạo script node mới để chạy lại
+//     (script không tự re-run khi bị patch qua DOM API bình thường).
+// An toàn: BẤT KỲ lỗi nào trong quá trình patch (kể cả script mới ném lỗi
+// runtime ngay khi chạy) -> ném exception -> caller bắt và fallback về full
+// reload (codewebShowFile), không cố giữ DOM "nửa cũ nửa mới".
+const CW_FLASH_STYLE_ID = "__cw_flash_style__";
+const CW_FLASH_CSS = `
+@keyframes cwNodeFlash {
+  0%   { outline: 2px solid rgba(90,170,255,.9); background-color: rgba(90,170,255,.16); }
+  100% { outline: 2px solid rgba(90,170,255,0); background-color: rgba(90,170,255,0); }
+}
+.__cw_flash__ { animation: cwNodeFlash 1.1s ease-out; outline-offset: 2px; }
+`;
+
+function codewebEnsureFlashStyle(doc) {
+  if (doc.getElementById(CW_FLASH_STYLE_ID)) return;
+  const style = doc.createElement("style");
+  style.id = CW_FLASH_STYLE_ID;
+  style.textContent = CW_FLASH_CSS;
+  doc.head.appendChild(style);
+}
+
+function codewebFlashNode(doc, node) {
+  // Chỉ flash được element node (Text node không nhận class/outline) -- lấy
+  // parentElement nếu node là text.
+  const el = node && node.nodeType === 1 ? node : (node && node.parentElement);
+  if (!el || typeof el.classList === "undefined") return;
+  codewebEnsureFlashStyle(doc);
+  el.classList.remove("__cw_flash__");
+  void el.offsetWidth; // restart animation nếu đổi liên tiếp cùng chỗ
+  el.classList.add("__cw_flash__");
+  setTimeout(() => el.classList && el.classList.remove("__cw_flash__"), 1300);
+}
+
+// So khớp 2 element theo "chữ ký" tối thiểu (tag + id + đôi khi class) để
+// quyết định patch tại chỗ hay replace hẳn -- không cần key thật (project
+// không có framework component), heuristic vị trí + tag đủ tốt cho HTML tay viết.
+function codewebSameNodeShape(a, b) {
+  if (a.nodeType !== b.nodeType) return false;
+  if (a.nodeType === 1) return a.tagName === b.tagName; // Element: cùng tag = coi là "cùng node" để patch attr/con
+  if (a.nodeType === 3) return true; // Text node: luôn patch text content
+  return a.nodeType === b.nodeType;
+}
+
+// ── BUG ĐÃ SỬA: khớp node theo INDEX thuần túy (oldNodes[i] vs newNodes[i])
+// bị lệch hoàn toàn khi model chèn/xoá 1 node ở GIỮA danh sách con -- mọi
+// node phía sau bị so sai cặp, dẫn tới patch nhầm hoặc coi nhầm là "không
+// đổi". Giờ dùng KEYED-DIFF: mỗi node con được gán 1 khoá nhận diện --
+// Element có "id" thật -> dùng "id:xxx" (ổn định qua chèn/xoá node khác).
+// Element không có id -> dùng "tag:TAGNAME:n" với n là thứ tự xuất hiện
+// TRONG NHÓM CÙNG TAGNAME (vẫn ổn định nếu chèn node KHÁC tag ở giữa, dù
+// không hoàn hảo bằng id thật -- đây là heuristic chấp nhận được cho HTML
+// tay viết, không phải framework có key tường minh).
+// Text node không có khoá ổn định qua nội dung đổi -> dùng vị trí thô
+// trong danh sách con CÙNG LOẠI text (so sánh xuôi theo thứ tự còn lại).
+// GIỚI HẠN THẬT (không giấu): heuristic "tag:TAG:n" chỉ ổn định khi node
+// KHÔNG CÓ ID được CHÈN/XOÁ ở CUỐI nhóm cùng tag, hoặc khi toàn bộ thay đổi
+// chỉ là sửa nội dung tại chỗ (không chèn/xoá). Nếu model chèn 1 <p> mới ở
+// ĐẦU/GIỮA nhiều <p> không-id, thứ tự đếm bị lệch -> vẫn có thể patch nhầm
+// nội dung vào node cũ thay vì tạo node mới đúng vị trí (dù không còn crash
+// hàng loạt như bug index-thuần cũ). Cách duy nhất loại bỏ hoàn toàn giới
+// hạn này là dùng "id" thật trên các phần tử có thể bị chèn/xoá xen kẽ --
+// nằm ngoài khả năng ép buộc của Claude vì đó là code model tự viết.
+function codewebKeyOf(node, tagCounters) {
+  if (node.nodeType === 1) {
+    const id = node.getAttribute && node.getAttribute("id");
+    if (id) return `id:${id}`;
+    const tag = node.tagName;
+    // BUG ĐÃ SỬA: <script> không-id từng dùng key positional "tag:SCRIPT:n"
+    // giống mọi element khác -- nhưng chèn 1 script MỚI ở giữa các script
+    // cũ không-id làm lệch số thứ tự, khiến script cũ B bị khớp NHẦM với
+    // script mới ở cùng vị trí đếm (dù nội dung khác hẳn), rồi bị giữ
+    // nguyên trong DOM không rerun, trong khi script thật cần thêm lại bị
+    // clone/rerun sai chỗ -- thứ tự chạy thực tế bị đảo lộn. Vì script
+    // không có state cần "giữ nguyên qua patch" như input/video (nó chỉ
+    // chạy 1 lần lúc insert), khớp theo NỘI DUNG (textContent+src) chính
+    // xác hơn nhiều so với vị trí đếm thô -- 2 script cùng nội dung ở đâu
+    // trong tài liệu cũng nên coi là "cùng node, không cần rerun".
+    //
+    // BUG ĐÃ SỬA (delimiter): ghép "src::text" bằng dấu phân cách cố định
+    // "::" có thể va chạm THẬT nếu chính src chứa chuỗi "::" -- ví dụ
+    // src="a::b",text="c" và src="a",text="b::c" ghép ra CÙNG một chuỗi
+    // "script:a::b::c", khiến 2 script khác hẳn nhau bị coi là cùng khoá.
+    // Cực hiếm xảy ra tự nhiên (URL script hợp lệ hiếm khi chứa "::"),
+    // nhưng để loại bỏ hoàn toàn khả năng này (không dựa vào xác suất
+    // thấp), dùng length-prefix cho src -- không có cách tách nào khác
+    // cho ra cùng 1 chuỗi kết quả vì độ dài src được ghi rõ trước khi nó
+    // xuất hiện.
+    if (tag === "SCRIPT") {
+      const src = node.getAttribute("src") || "";
+      const text = node.textContent || "";
+      return `script:${src.length}:${src}:${text}`;
+    }
+    const n = tagCounters[tag] = (tagCounters[tag] || 0) + 1;
+    return `tag:${tag}:${n}`;
+  }
+  if (node.nodeType === 3) {
+    const n = tagCounters["#text"] = (tagCounters["#text"] || 0) + 1;
+    return `text:${n}`;
+  }
+  const n = tagCounters["#other"] = (tagCounters["#other"] || 0) + 1;
+  return `other:${n}`;
+}
+
+function codewebPatchAttrs(oldEl, newEl) {
+  const oldAttrs = oldEl.attributes, newAttrs = newEl.attributes;
+  // Xoá attr không còn tồn tại
+  for (let i = oldAttrs.length - 1; i >= 0; i--) {
+    const name = oldAttrs[i].name;
+    if (!newEl.hasAttribute(name)) oldEl.removeAttribute(name);
+  }
+  // Thêm/cập nhật attr mới hoặc đổi giá trị
+  for (let i = 0; i < newAttrs.length; i++) {
+    const name = newAttrs[i].name, val = newAttrs[i].value;
+    if (oldEl.getAttribute(name) !== val) oldEl.setAttribute(name, val);
+  }
+}
+
+// Patch đệ quy con cái của oldParent để khớp newParent, dùng keyed-diff
+// (xem codewebKeyOf) thay vì index thuần -- chèn/xoá node ở giữa không còn
+// làm lệch các node phía sau. Trả về true nếu CÓ thay đổi thật. changedNodes
+// gom các node thật đã bị patch/thêm/thay để caller flash + scroll tới đầu.
+//
+// BUG ĐÃ SỬA: script mới/đổi từng được tạo bằng createElement NGAY TẠI ĐÂY
+// (trong lúc morph head hoặc body) -- đúng vị trí trong cây, nhưng insert
+// script bằng createElement khiến nó THỰC THI NGAY LÚC ĐÓ, TRƯỚC KHI phần
+// cây còn lại (head hoặc body, tuỳ cái nào morph sau) đã patch xong. Ví dụ
+// script mới trong <head> chạy và set nội dung 1 phần tử trong <body> --
+// nhưng codewebMorphChildren(doc.body,...) chạy NGAY SAU ĐÓ lại patch đè
+// phần tử này về nội dung cũ (vì bản thân nội dung "gốc" trong newDoc
+// không đổi), xoá sạch hiệu ứng script vừa chạy. Giờ KHÔNG tạo script thật
+// ở đây nữa -- chỉ tạo 1 placeholder rỗng (không textContent -> không tự
+// chạy gì) để giữ đúng vị trí trong cây, và ghi lại info cần thiết
+// (placeholder + nội dung/attr cần chạy) vào deferredScripts (mảng dùng
+// chung, truyền xuyên suốt đệ quy) -- caller (codewebMorphUpdate) sẽ thực
+// thi TOÀN BỘ script hoãn lại này SAU KHI head+body đã patch xong hết.
+function codewebMorphChildren(oldParent, newParent, changedNodes, deferredScripts) {
+  let changed = false;
+  const oldNodes = Array.from(oldParent.childNodes);
+  const newNodes = Array.from(newParent.childNodes);
+
+  const oldCounters = {}, newCounters = {};
+  const oldKeys = oldNodes.map(n => codewebKeyOf(n, oldCounters));
+  const newKeys = newNodes.map(n => codewebKeyOf(n, newCounters));
+
+  // Map khoá -> node cũ (giữ nguyên tham chiếu DOM thật để patch tại chỗ).
+  const oldByKey = new Map();
+  oldNodes.forEach((n, i) => oldByKey.set(oldKeys[i], n));
+  const usedOldKeys = new Set();
+
+  // Danh sách "kết quả cuối" theo đúng thứ tự newNodes -- mỗi phần tử là
+  // node DOM thật (cũ đã patch, hoặc clone mới) sẽ nằm ở vị trí đó.
+  const finalNodes = [];
+
+  for (let i = 0; i < newNodes.length; i++) {
+    const newNode = newNodes[i];
+    const key = newKeys[i];
+    const oldNode = oldByKey.get(key);
+
+    if (!oldNode || usedOldKeys.has(key) || !codewebSameNodeShape(oldNode, newNode)) {
+      // Không có node cũ khớp khoá này (mới thêm), khoá bị trùng dùng lần
+      // 2 (an toàn: coi như node mới), hoặc khớp khoá nhưng lệch loại node
+      // (hiếm, vd đổi tag nhưng giữ id) -> tạo clone mới, không cố patch.
+      //
+      // Script mới hoàn toàn (không có oldNode khớp) -- không cloneNode
+      // (script clone không tự chạy, đúng DOM spec) và không createElement
+      // ngay tại đây (chạy quá sớm, có thể bị bước morph sau ghi đè hiệu
+      // ứng, xem comment đầu hàm). Tạo 1 placeholder <script> RỖNG (giữ
+      // đúng vị trí trong cây), ghi vào deferredScripts để chạy thật sau.
+      if (newNode.nodeType === 1 && newNode.tagName === "SCRIPT") {
+        const placeholder = oldParent.ownerDocument.createElement("script");
+        deferredScripts.push({ placeholder, attrs: Array.from(newNode.attributes), text: newNode.textContent });
+        finalNodes.push(placeholder);
+        changedNodes.push(placeholder);
+        changed = true;
+        continue;
+      }
+      const clone = newNode.cloneNode(true);
+      finalNodes.push(clone);
+      changedNodes.push(clone);
+      changed = true;
+      continue;
+    }
+
+    usedOldKeys.add(key);
+
+    if (oldNode.nodeType === 3) { // Text
+      if (oldNode.textContent !== newNode.textContent) {
+        oldNode.textContent = newNode.textContent;
+        changedNodes.push(oldNode);
+        changed = true;
+      }
+      finalNodes.push(oldNode);
+      continue;
+    }
+
+    if (oldNode.nodeType === 1) { // Element
+      const tag = oldNode.tagName;
+      if (tag === "SCRIPT") {
+        // Script khớp khoá (id thật, hoặc nội dung giống -- xem
+        // codewebKeyOf) với oldNode. Giống -> giữ nguyên, không rerun
+        // (tránh chạy lại vô ích). Khác (chỉ xảy ra khi khớp theo ID vì
+        // script không-id đã tự bao gồm nội dung trong khoá) -> cần rerun,
+        // dùng placeholder + deferredScripts giống nhánh script-mới ở
+        // trên, cùng lý do (tránh chạy quá sớm, bị bước morph sau ghi đè).
+        const scriptChanged = oldNode.textContent !== newNode.textContent ||
+          oldNode.getAttribute("src") !== newNode.getAttribute("src");
+        if (scriptChanged) {
+          const placeholder = oldParent.ownerDocument.createElement("script");
+          deferredScripts.push({ placeholder, attrs: Array.from(newNode.attributes), text: newNode.textContent });
+          finalNodes.push(placeholder);
+          changedNodes.push(placeholder);
+          changed = true;
+        } else {
+          finalNodes.push(oldNode);
+        }
+        continue;
+      }
+      const before = oldNode.cloneNode(false); // để so sánh attr nhẹ
+      codewebPatchAttrs(oldNode, newNode);
+      let attrsChanged = false;
+      if (oldNode.attributes.length !== before.attributes.length ||
+          Array.from(newNode.attributes).some(a => before.getAttribute(a.name) !== a.value)) {
+        attrsChanged = true;
+      }
+      const childChanged = codewebMorphChildren(oldNode, newNode, changedNodes, deferredScripts);
+      if (attrsChanged || childChanged) {
+        if (attrsChanged && !childChanged) changedNodes.push(oldNode);
+        changed = true;
+      }
+      finalNodes.push(oldNode);
+      continue;
+    }
+
+    finalNodes.push(oldNode);
+  }
+
+  // Node cũ không được dùng lại (khoá không còn xuất hiện trong new) -> xoá.
+  const usedOldNodes = new Set();
+  for (const key of usedOldKeys) usedOldNodes.add(oldByKey.get(key));
+  for (const oldNode of oldNodes) {
+    if (!usedOldNodes.has(oldNode) && oldNode.parentNode === oldParent) {
+      oldParent.removeChild(oldNode);
+      changed = true;
+    }
+  }
+
+  // Sắp lại DOM thật theo đúng thứ tự finalNodes -- insertBefore khi vị trí
+  // hiện tại không khớp (no-op nếu đã đúng chỗ, insertBefore(x, x.nextSibling)
+  // an toàn dù x đã ở đúng vị trí). Đây là bước bắt buộc để CHÈN đúng chỗ
+  // (không phải luôn append cuối như bản index-thuần trước đây) và để thứ
+  // tự hiển thị khớp đúng ý đồ mới kể cả khi có node bị di chuyển.
+  let cursor = oldParent.firstChild;
+  for (const node of finalNodes) {
+    if (cursor !== node) {
+      oldParent.insertBefore(node, cursor);
+    } else {
+      cursor = cursor.nextSibling;
+    }
+  }
+
+  return changed;
+}
+
+// BUG ĐÃ SỬA: hàm này (codewebRerunChangedScripts) từng chạy SAU khi
+// codewebMorphChildren patch xong toàn bộ cây, so newScripts/oldScripts
+// theo INDEX PHẲNG toàn document -- độc lập, không biết gì về keyed-diff
+// thật của cây. Khi 1 script mới được chèn ở GIỮA các script cũ, mọi
+// script phía sau bị lệch index đúng kiểu bug "index-thuần" đã sửa cho
+// node thường (xem codewebKeyOf) -- script cũ bị patch nhầm chỗ, script
+// đúng bị chạy lại sai thứ tự hoặc chạy lại thừa. Giờ TOÀN BỘ việc tạo
+// script chạy-được-đúng-vị-trí đã dồn vào chính codewebMorphChildren
+// (script mới hoàn toàn -> createElement ngay tại đúng vị trí trong cây;
+// script khớp nội dung với oldNode -> giữ nguyên, không rerun) -- hàm này
+// không còn cần thiết, xoá để tránh 2 nguồn xử lý script mâu thuẫn nhau.
+
+// Điểm vào chính. Trả về true nếu morph thành công (đã patch xong), false
+// nếu quyết định KHÔNG áp dụng được (caller nên fallback full reload). Ném
+// exception cũng được caller coi như "không áp dụng được".
+//
+// BUG ĐÃ SỬA: bản trước chỉ patch <title> và BỎ QUA HOÀN TOÀN phần còn lại
+// của <head> (style/link/meta mới hay đổi) -- nhưng vẫn return true (coi
+// là "thành công"), nên caller không bao giờ fallback full reload dù nội
+// dung head thực sự KHÔNG được áp dụng. Giờ patch <head> bằng ĐÚNG thuật
+// toán keyed-diff dùng chung với <body> -- style/link/meta thêm/sửa/xoá
+// đều được áp dụng thật, và vẫn tính vào changedNodes để không bỏ sót.
+function codewebMorphUpdate(newHtml) {
+  const doc = codewebFrameEl.contentDocument;
+  if (!doc || !doc.body || !doc.head) return false; // iframe chưa từng load gì -- không có gì để morph
+
+  const parser = new DOMParser();
+  const newDoc = parser.parseFromString(newHtml, "text/html");
+  if (!newDoc || !newDoc.body || !newDoc.head) return false;
+
+  if (doc.title !== newDoc.title) doc.title = newDoc.title; // <title> nằm ngoài luồng children thường, patch riêng
+
+  // Script (head lẫn body) được đặt placeholder đúng vị trí ngay trong
+  // codewebMorphChildren, nhưng CHƯA chạy -- deferredScripts gom info cần
+  // để tạo bản chạy-được thật. Chạy chúng SAU KHI head+body đã patch xong
+  // hoàn toàn (xem comment đầu codewebMorphChildren) để side-effect của
+  // script không bị bước patch cây còn lại ghi đè.
+  const changedNodes = [];
+  const deferredScripts = [];
+  codewebMorphChildren(doc.head, newDoc.head, changedNodes, deferredScripts);
+  codewebMorphChildren(doc.body, newDoc.body, changedNodes, deferredScripts);
+
+  // Thay placeholder bằng script thật (createElement, đúng spec) đúng vị
+  // trí nó đang đứng trong DOM -- thứ tự deferredScripts theo đúng thứ tự
+  // duyệt cây (head trước, rồi body, mỗi bên theo thứ tự xuất hiện), khớp
+  // đúng thứ tự chạy script bình thường của trình duyệt khi load 1 trang.
+  for (const { placeholder, attrs, text } of deferredScripts) {
+    const fresh = doc.createElement("script");
+    for (const attr of attrs) fresh.setAttribute(attr.name, attr.value);
+    fresh.textContent = text;
+    if (placeholder.parentNode) {
+      placeholder.parentNode.replaceChild(fresh, placeholder);
+    }
+  }
+
+  if (changedNodes.length > 0) {
+    const target = changedNodes[0];
+    const scrollEl = target.nodeType === 1 ? target : target.parentElement;
+    if (scrollEl && typeof scrollEl.scrollIntoView === "function") {
+      try {
+        scrollEl.scrollIntoView({ block: "center", behavior: "smooth" });
+      } catch (e) { /* trình duyệt cũ không hỗ trợ options object -- bỏ qua */ }
+    }
+    for (const n of changedNodes) codewebFlashNode(doc, n);
+  }
+  return true;
+}
+
+// Caller duy nhất còn lại: auto-preview NGẦM (fire-and-forget, xem codeweb_maybe_auto_preview
+// ở 13_codeweb.py) -- KHÔNG reply gì cả, không ai chờ. Pass -> swap + chuyển
+// tab có animation (khác file) HOẶC morph DOM sống (cùng file đang xem, mượt
+// hơn, giữ scroll gần đúng + tự scroll/flash tới chỗ đổi). Fail -> im lặng
+// tuyệt đối, giữ nguyên preview đang có.
+let _codewebAutoPreviewQueue = Promise.resolve();
+function codewebRunAutoPreview(path, html) {
+  if (!path || typeof html !== "string") return;
+  // Nối hàng đợi -- nếu AI ghi nhiều file/nhiều lần liên tiếp rất nhanh,
+  // tránh nhiều iframe sandbox check đè lên nhau (chỉ 1 #codewebSandboxFrame
+  // dùng chung). Mỗi check đợi check trước xong mới chạy.
+  _codewebAutoPreviewQueue = _codewebAutoPreviewQueue.then(() => new Promise((resolve) => {
+    codewebSandboxCheck(html, (result) => {
+      // BUG ĐÃ SỬA: try/catch trước đây chỉ bọc RIÊNG codewebMorphUpdate.
+      // Nếu bất kỳ bước NÀO KHÁC sau đó ném lỗi (codewebShowFile fallback,
+      // codewebRenderTabs, codewebAckPreviewPass...) thì exception thoát ra
+      // NGOÀI callback này -> resolve() không bao giờ chạy -> _codewebAuto-
+      // PreviewQueue bị TREO VĨNH VIỄN, mọi lần ghi file .html SAU ĐÓ trong
+      // suốt phiên im lặng không preview gì cả (đúng triệu chứng "có lúc
+      // không tự load lại trang"). Giờ bọc TOÀN BỘ xử lý trong try/finally
+      // -- resolve() LUÔN chạy dù bước nào lỗi, hàng đợi không bao giờ kẹt.
+      try {
+        if (result.ok) {
+          const isSameFileBeingViewed = path === codewebActivePath && (path in codewebFiles);
+          codewebFiles[path] = html;
+          if (isSameFileBeingViewed) {
+            // Thử morph trước (mượt, giữ scroll gần đúng + tự cuộn tới chỗ
+            // đổi) -- fallback full reload nếu morph tự nó lỗi (DOM lạ,
+            // parse lỗi, script mới ném exception khi chạy lại...).
+            let morphed = false;
+            try {
+              morphed = codewebMorphUpdate(html);
+            } catch (e) {
+              morphed = false;
+            }
+            if (!morphed) {
+              codewebShowFile(path, { animate: false });
+            } else {
+              codewebRenderTabs(); // path không đổi nhưng label/order tab có thể cần refresh
+            }
+          } else {
+            // File khác với file đang xem (hoặc chưa từng xem) -- full
+            // reload thật + animation trượt tab như trước giờ.
+            codewebShowFile(path, { animate: true });
+          }
+          codewebAckPreviewPass(path, html);
+        }
+        // fail -> không làm gì, không báo lỗi ở đâu cả (kiểm tra ngầm)
+      } catch (e) {
+        // Lớp bảo vệ cuối cùng -- lỗi bất ngờ ở BẤT KỲ bước nào bên trên
+        // (không chỉ morph) không được phép làm treo hàng đợi. Coi như lần
+        // preview này thất bại, giữ nguyên preview đang hiển thị, các lần
+        // ghi file tiếp theo vẫn chạy bình thường.
+      } finally {
+        resolve();
+      }
+    });
+  }));
+}
+
+// (Đã bỏ codewebCaptureFrameScreenshot — không còn ai tiêu thụ screenshot
+// sau khi bỏ tool preview_check. resizeImageIfNeeded/fileToBase64 bên dưới
+// vẫn giữ nguyên, dùng chung cho ảnh người dùng upload — không đụng tới.)
 
 const MAX_IMAGE_DIM = 1568; // cạnh dài tối đa (px) -- mức phổ biến các vision
 // model khuyến nghị, đủ chi tiết để đọc text/UI trong screenshot mà không

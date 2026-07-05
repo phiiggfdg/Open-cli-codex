@@ -29,6 +29,47 @@ _pool_lock = threading.RLock()
 _KEY_COOLDOWN_DEFAULT = 60.0   # giây — dùng khi 429 không kèm Retry-After
 _KEY_POOL_STRATEGIES  = ("round_robin", "fill_first")
 
+# Ngưỡng để nhận biết "đây là lần gọi LẶP LẠI của CÙNG 1 sự kiện 429 vừa
+# đánh dấu xong" thay vì "1 lần 429 MỚI thật sự xảy ra sau đó". Không thể
+# dùng "cooldown_until > now" đơn thuần để phân biệt 2 trường hợp này, vì cả
+# 2 đều cho kết quả True (key vẫn đang cooldown là chuyện bình thường trong
+# cả 2 trường hợp). Dấu hiệu đáng tin hơn: nếu cooldown_until đã được set xa
+# hơn thời điểm hiện tại ÍT NHẤT gần bằng khoảng cooldown vừa yêu cầu (retry_after
+# hoặc mặc định) trừ đi 1 sai số nhỏ, nghĩa là bản ghi cooldown đó vừa được
+# tạo ra RẤT GẦN ĐÂY (không phải còn sót lại từ 1 lần 429 cũ đã qua từ lâu,
+# lúc đó cooldown_until sẽ gần hết hạn, chênh lệch với now nhỏ hơn nhiều).
+_DEDUPE_WINDOW_SEC = 2.0
+
+
+def _mark_429(entry: dict, now: float, retry_after: float | None):
+    """Đánh dấu 1 entry vừa dính 429 -- CHUẨN HOÁ DÙNG CHUNG cho cả
+    pool_rotate_after_429 và pool_rotate_after_429_verbose (trước đây mỗi
+    hàm tự viết `fail_count += 1` + set cooldown_until riêng, giống hệt
+    nhau nhưng KHÔNG dùng chung 1 hàm -- khiến việc sửa bug ở 1 chỗ dễ quên
+    sửa chỗ còn lại).
+
+    BUG ĐÃ SỬA: trước đây `fail_count += 1` chạy VÔ ĐIỀU KIỆN mỗi lần hàm
+    được gọi -- kể cả khi gọi 2 lần liên tiếp CHO CÙNG 1 sự kiện 429 (đúng
+    tình huống mà pool_rotate_after_429_verbose tự nhận trong docstring cũ
+    là "AN TOÀN, idempotent" nhưng thực tế lại cộng dồn fail_count 2 lần).
+    Test thực nghiệm xác nhận: gọi verbose 2 lần liên tiếp cùng current_key
+    làm fail_count tăng 1 -> 2 thay vì giữ nguyên.
+
+    Fix: nếu entry NÀY đã có cooldown_until đặt trong khoảng RẤT GẦN đây
+    (còn lại >= khoảng cooldown vừa yêu cầu - _DEDUPE_WINDOW_SEC), coi đây
+    là lần gọi LẶP LẠI của CÙNG 1 lần 429 vừa xử lý xong ngay trước đó ->
+    CHỈ giữ nguyên cooldown_until cũ (không rút ngắn lại nếu retry_after lần
+    gọi lặp nhỏ hơn), KHÔNG cộng thêm fail_count. Chỉ khi cooldown đã gần hết
+    hạn hoặc chưa từng đặt (đúng nghĩa 1 lần 429 MỚI xảy ra) mới cộng
+    fail_count + set cooldown mới."""
+    requested = retry_after if retry_after is not None else _KEY_COOLDOWN_DEFAULT
+    remaining = entry.get("cooldown_until", 0) - now
+    is_duplicate_call = remaining >= (requested - _DEDUPE_WINDOW_SEC) and remaining > 0
+    if is_duplicate_call:
+        return  # cùng 1 lần 429 đã xử lý -- không đổi gì thêm, đúng ý "idempotent"
+    entry["cooldown_until"] = now + requested
+    entry["fail_count"] = entry.get("fail_count", 0) + 1
+
 
 def _pool_config_key(prov_key: str | None = None) -> str:
     """Tên field trong config.json chứa pool, vd 'fireworks_api_key_pool'."""
@@ -135,21 +176,19 @@ def pool_rotate_after_429(current_key: str, retry_after: float | None,
     with _pool_lock:
         prov_key = prov_key or _active_provider
         pool = _pool_load(prov_key)
+        now = time.time()
         if len(pool) <= 1:
             # Chỉ 1 key (hoặc chưa cấu hình pool) — không có gì để xoay.
             # Vẫn ghi cooldown để lần request kế (sau khi hết retry ở đây)
             # không vội đấm lại đúng key này ngay lập tức nếu caller gọi lại.
             if pool:
-                pool[0]["cooldown_until"] = time.time() + (retry_after or _KEY_COOLDOWN_DEFAULT)
-                pool[0]["fail_count"] = pool[0].get("fail_count", 0) + 1
+                _mark_429(pool[0], now, retry_after)
                 _pool_save(prov_key, pool)
             return None
 
-        now = time.time()
         for e in pool:
             if e["key"] == current_key:
-                e["cooldown_until"] = now + (retry_after or _KEY_COOLDOWN_DEFAULT)
-                e["fail_count"] = e.get("fail_count", 0) + 1
+                _mark_429(e, now, retry_after)
                 break
         _pool_save(prov_key, pool)
 
@@ -183,9 +222,15 @@ def pool_rotate_after_429_verbose(current_key: str, retry_after: float | None,
 
     Không dùng hàm này để lấy key thật cho request — vẫn gọi
     pool_rotate_after_429() như cũ cho việc đó, hàm này chỉ để log.
-    Gọi 2 hàm liên tiếp là AN TOÀN: cooldown/fail_count được ghi lại bằng
-    key nên lần gọi thứ 2 (idempotent theo current_key) chỉ cập nhật lại
-    đúng entry đó, không tạo side-effect khác hay xoay thêm lần nữa.
+
+    Gọi 2 hàm liên tiếp (hoặc gọi lại chính hàm này 2 lần) cho CÙNG
+    current_key là AN TOÀN và THẬT SỰ idempotent (đã verify bằng test):
+    dùng chung _mark_429() để nhận biết lần gọi thứ 2 là lặp lại của cùng
+    1 sự kiện 429 vừa xử lý (dựa vào cooldown_until vừa đặt còn rất mới) —
+    khi đó KHÔNG cộng thêm fail_count, không rút ngắn lại cooldown, chỉ trả
+    lại đúng thông tin key mới/soonest đã chọn từ lần đầu. fail_count chỉ
+    tăng thêm khi đây thực sự là 1 lần 429 MỚI (cooldown cũ đã gần hết hạn
+    hoặc chưa từng đặt).
     """
     with _pool_lock:
         prov_key = prov_key or _active_provider
@@ -206,21 +251,19 @@ def pool_rotate_after_429_verbose(current_key: str, retry_after: float | None,
             "soonest_index": None, "soonest_mask": None, "soonest_wait": None,
         }
 
+        now = time.time()
         if total <= 1:
             if pool:
-                pool[0]["cooldown_until"] = time.time() + (retry_after or _KEY_COOLDOWN_DEFAULT)
-                pool[0]["fail_count"] = pool[0].get("fail_count", 0) + 1
+                _mark_429(pool[0], now, retry_after)
                 _pool_save(prov_key, pool)
                 result["soonest_index"] = 1
                 result["soonest_mask"] = _pool_mask(pool[0]["key"])
-                result["soonest_wait"] = retry_after or _KEY_COOLDOWN_DEFAULT
+                result["soonest_wait"] = max(0.0, pool[0].get("cooldown_until", 0) - now)
             return result
 
-        now = time.time()
         for e in pool:
             if e["key"] == current_key:
-                e["cooldown_until"] = now + (retry_after or _KEY_COOLDOWN_DEFAULT)
-                e["fail_count"] = e.get("fail_count", 0) + 1
+                _mark_429(e, now, retry_after)
                 break
         _pool_save(prov_key, pool)
 

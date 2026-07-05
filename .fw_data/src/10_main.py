@@ -728,7 +728,12 @@ def main():
         # "choice"/"text"), không có input()/print() trần hay raw-mode
         # terminal nào (đã xác nhận qua đọc source, giống lý do 5 lệnh
         # key + /model/mode được whitelist ở trên).
-        _WEB_ALLOWED_CMDS = ("/listkeys", "/rmkey", "/deletekey", "/addkey", "/setkey", "/model", "/mode", "/format")
+        # /codeweb: xem 13_codeweb.py — handler (codeweb_handle_command) chỉ
+        # dùng state.emit()/state.bus.ask(), không input()/print() trần,
+        # giống lý do các lệnh trên được whitelist. Lệnh này CHỈ có ý nghĩa
+        # khi armed trong web (đổi agent + bật layout 2 cột cho chính phiên
+        # web đang mở), nên bắt buộc phải nằm trong whitelist này.
+        _WEB_ALLOWED_CMDS = ("/listkeys", "/rmkey", "/deletekey", "/addkey", "/setkey", "/model", "/mode", "/format", "/codeweb")
         _cmd0 = user.split(None, 1)[0].lower() if user.split(None, 1) else ""
         if (state is not None and state.web_bridge is not None
                 and state.web_bridge.is_armed()
@@ -737,7 +742,8 @@ def main():
             state.emit(EV_WARN, text=(
                 "Lệnh / (và exit/quit) không dùng được qua Web UI — bấm Esc "
                 "trên CLI để chạy lệnh, Web UI chỉ để chat/thao tác code.\n"
-                "(Riêng /listkeys /rmkey /deletekey /addkey /setkey /model /mode /format dùng được.)\n"
+                "(Riêng /listkeys /rmkey /deletekey /addkey /setkey /model /mode /format "
+                "/codeweb on|off dùng được.)\n"
             ))
             continue
 
@@ -766,6 +772,34 @@ def main():
             # Khoá bàn phím CLI hiện tại, arm() web_bridge, chờ Esc/Ctrl-C để
             # lấy lại quyền. Server + kết nối WS vẫn chạy nền trong lúc này.
             wait_web_mode(state, host, port, color_fns={"GREEN": GREEN, "DIM": DIM, "R": R})
+            continue
+
+        if user.lower() == "/codeweb" or user.lower().startswith("/codeweb "):
+            # Toàn bộ logic thật nằm ở 13_codeweb.py (file riêng, tách khỏi
+            # /web gốc — xem module đó để biết chi tiết). Chỉ có ý nghĩa khi
+            # đang armed qua web (đã được đảm bảo bởi whitelist phía trên +
+            # bản thân handler tự kiểm tra lại state.web_bridge). Cú pháp:
+            # "/codeweb on" | "/codeweb off" — handler tự báo lỗi nếu thiếu
+            # hoặc sai arg, không đoán ý.
+            #
+            # BUG ĐÃ SỬA: trước đây chỉ gọi codeweb_handle_command(state, arg)
+            # và bỏ qua giá trị trả về — handler chỉ set state.agent/
+            # _current_agent, KHÔNG đụng biến `agent` CỤC BỘ của main() (dòng
+            # ~550, ~1848 dùng chính biến này khi gọi agent_turn(...,
+            # agent=agent, ...)). Hệ quả: bấm /codeweb on/off qua lại nhiều
+            # lần chỉ đổi label hiển thị trên web (qua EV_SESSION_META) chứ
+            # KHÔNG đổi system prompt thật gửi lên provider — turn kế tiếp
+            # vẫn dùng agent cũ. Giống hệt bug đã từng gặp và sửa cho /agent
+            # gốc (xem dòng ~997: agent = choose_agent(); state.agent = agent)
+            # và cho custom-command override (xem comment "BUG ĐÃ SỬA" quanh
+            # dòng ~1770). Sửa: handler trả về agent mới (hoặc None nếu lỗi
+            # cú pháp/chưa armed), gán lại biến cục bộ + session_update để
+            # bền qua resume session sau, đúng pattern /agent gốc.
+            _cw_arg = user.split(None, 1)[1] if " " in user else ""
+            _cw_new_agent = codeweb_handle_command(state, _cw_arg)
+            if _cw_new_agent is not None:
+                agent = _cw_new_agent
+                session_update(conn, sid, agent=agent)
             continue
 
         if user.lower() == "/todos":

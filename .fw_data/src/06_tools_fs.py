@@ -85,7 +85,442 @@ _BASH_INSPECT_PATTERNS = [
 ]
 _BASH_INSPECT_RE = re.compile("|".join(_BASH_INSPECT_PATTERNS))
 
+# ── Nhánh riêng: "serve:" — chạy 1 process SỐNG MÃI (preview dev server) ────
+# Lý do cần tách hẳn khỏi logic bash thường (không chung code path, không
+# đụng allowlist/deny/timeout cũ ở dưới): subprocess.run(...) mặc định CHỜ
+# process kết thúc. Với 1 lệnh cố ý chạy mãi mãi (http.server, node listen,
+# npm run dev...), nó KHÔNG BAO GIỜ tự thoát -- tool_bash cũ luôn timeout sau
+# N giây, và tệ hơn: shell=True tạo ra shell (con) -> lệnh thật (cháu), khi
+# TimeoutExpired chỉ kill được shell (con), process thật (cháu) SỐNG SÓT làm
+# zombie giữ nguyên cổng mãi mãi -- xác nhận bằng thực nghiệm (pgrep vẫn thấy
+# process sau khi TimeoutExpired). Mỗi lần agent thử lại -> thêm 1 zombie mới,
+# không dọn cái cũ, cổng dần bị chiếm hết không rõ lý do.
+#
+# Cú pháp: "serve: <lệnh thật>", ví dụ "serve: python3 -m http.server 8080".
+# Không dùng cú pháp này -> rơi xuống nhánh bash thường bên dưới, KHÔNG đổi
+# hành vi hiện có cho bất kỳ lệnh nào khác (git/pytest/npm/make/...).
+#
+# Hành vi:
+#   - Luôn chạy NỀN (Popen, không chờ), trả về ngay lập tức -- không timeout,
+#     vì đây là hành vi MONG MUỐN (server phải sống mãi), không phải lỗi.
+#   - start_new_session=True (tương đương setsid) -- process con nằm trong
+#     process group RIÊNG, nên khi cần kill, os.killpg() dọn được CẢ shell
+#     lẫn process thật bên trong nó (khác hẳn lỗi zombie ở tool_bash thường).
+#   - Gọi "serve: <lệnh y hệt lệnh cũ>" lần nữa -> tự kill server cũ (cùng
+#     lệnh, so khớp chuỗi lệnh y hệt) rồi start lại, KHÔNG báo lỗi "đã chạy
+#     rồi" dù trùng -- đúng yêu cầu: luôn thay thế êm, không báo lỗi.
+#   - Gọi "serve: <lệnh KHÁC>" -> vẫn kill lệnh serve TRƯỚC ĐÓ (chỉ giữ tối đa
+#     1 server serve sống tại 1 thời điểm cho mỗi session/project) rồi start
+#     lệnh mới -- tránh tích luỹ nhiều zombie như bug đã xác nhận ở tool_bash.
+#   - Không đụng chạm allowlist/deny/timeout của nhánh bash thường bên dưới.
+_SERVE_PREFIX_RE = re.compile(r"^\s*serve\s*:\s*", re.IGNORECASE)
+_serve_procs: dict[str, dict] = {}  # project_dir_str -> {"proc": Popen, "cmd": str, "port_hint": str}
+
+# Nhận diện cổng CHỈ cho `python(3) -m http.server [PORT]` -- đây là lệnh serve
+# duy nhất mà ta CHẮC CHẮN biết quy tắc định tuyến của nó (phục vụ file tĩnh
+# đúng theo cây thư mục, không có routing/rewrite riêng như dev server
+# framework). Với các lệnh khác (npm run dev, node server.js, vite...) không
+# thể đoán chắc port lẫn file entry thật (có thể có SPA fallback, proxy, hay
+# port tự chọn ngẫu nhiên nếu bận) -- cố đoán bừa sẽ đưa ra gợi ý SAI còn tệ
+# hơn không gợi ý, nên các lệnh đó không kích hoạt auto-detect bên dưới.
+_HTTP_SERVER_RE = re.compile(
+    r"^\s*python3?\s+-m\s+http\.server(?:\s+(\d+))?\s*$", re.IGNORECASE
+)
+
+def _serve_detect_entry_file(run_cwd: str) -> tuple[bool, str | None]:
+    """Trả về (index_ok, suggested_file):
+      - index_ok=True  -> đã có "index.html" ở root, http.server tự phục vụ
+        đúng, KHÔNG cần cảnh báo/gợi ý gì thêm (suggested_file luôn None).
+      - index_ok=False, suggested_file=<tên file> -> không có index.html,
+        nhưng có ĐÚNG 1 file *.html khác ở root -- an toàn để gợi ý thẳng.
+      - index_ok=False, suggested_file=None -> mơ hồ (0 hoặc >1 file .html,
+        không phải index.html) -- KHÔNG đoán, gọi _serve_list_html_files()
+        riêng để lấy danh sách đầy đủ cho việc báo cáo.
+    Đây là fallback khi agent QUÊN nêu path cụ thể trong câu trả lời cho
+    user -- lý do bug 404 thực tế đã xảy ra: server chạy đúng thư mục
+    project, nhưng agent chỉ báo "http://localhost:8080" (root, không có
+    file), trong khi `python -m http.server` không tự phục vụ index.html
+    nếu KHÔNG có file tên đúng "index.html" ở root -- nó liệt kê thư mục
+    (hoặc 404 nếu directory listing bị tắt), không tự đoán sang file .html
+    khác có sẵn.
+    """
+    try:
+        root = Path(run_cwd)
+        if (root / "index.html").is_file():
+            return True, None
+        html_files = sorted(
+            p.name for p in root.iterdir()
+            if p.is_file() and p.suffix.lower() == ".html"
+        )
+    except Exception:
+        return True, None  # best-effort -- lỗi quét thư mục không được làm hỏng serve;
+        # coi như "ok" để KHÔNG in cảnh báo sai khi thực ra không quét được.
+    if len(html_files) == 1:
+        return False, html_files[0]
+    return False, None  # 0 hoặc >1 file -- mơ hồ, không đoán bừa
+
+def _serve_list_html_files(run_cwd: str) -> list[str]:
+    """Liệt kê TẤT CẢ file .html ở root run_cwd -- dùng khi không thể auto-pick
+    1 file duy nhất (0 hoặc >1 file), để tool trả thông tin đầy đủ cho agent
+    tự chọn thay vì im lặng/đoán sai."""
+    try:
+        root = Path(run_cwd)
+        return sorted(
+            p.name for p in root.iterdir()
+            if p.is_file() and p.suffix.lower() == ".html"
+        )
+    except Exception:
+        return []
+
+def _serve_log(run_cwd: str, message: str) -> None:
+    """No-op: đã tắt ghi file log debug .cw_serve_log.txt (từng dùng để debug
+    trên máy thật khi không gắn được pdb). Giữ nguyên hàm + chữ ký để mọi lời
+    gọi _serve_log(...) rải rác trong code không cần sửa lại -- chỉ đổi hành
+    vi bên trong thành không làm gì, không tạo file rác trong project user."""
+    pass
+
+def _serve_key() -> str:
+    """1 server 'serve' sống tối đa mỗi project -- dùng project_dir làm key
+    (không phải sid) để agent nào cũng thấy/kill đúng process của project đó,
+    nhất quán với cách project_dir đã là ranh giới cho mọi tool file khác."""
+    if _project_dir is not None:
+        return str(_project_dir.resolve())
+    return os.getcwd()
+
+def _serve_kill_existing(key: str) -> str | None:
+    """Kill server 'serve' cũ của project này (nếu có), trả về lệnh cũ đã bị
+    kill (để log/thông báo), hoặc None nếu chưa có gì chạy. Im lặng nếu
+    process đã tự chết từ trước (poll() != None) -- không coi là lỗi."""
+    entry = _serve_procs.pop(key, None)
+    if not entry:
+        return None
+    proc = entry["proc"]
+    old_cmd = entry["cmd"]
+    if proc.poll() is None:  # vẫn đang chạy thật
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)  # cứng đầu -> kill hẳn
+        except ProcessLookupError:
+            pass  # đã chết giữa lúc kiểm tra -- không sao
+        except Exception:
+            pass  # dọn best-effort, không để lỗi kill làm hỏng luồng start-mới
+    return old_cmd
+
+# Bắt số port từ CUỐI lệnh serve (vd "python3 -m http.server 8080",
+# "node server.js 3000", "vite --port 5173") -- chỉ cần số đứng riêng lẻ
+# (ranh giới \b) để không bắt nhầm số bên trong path/tên file. Không bắt
+# được -> bỏ qua bước check port (an toàn, không đoán bừa), rơi về hành vi
+# cũ y hệt trước khi có fix này.
+_SERVE_PORT_RE = re.compile(r"\b(\d{2,5})\b")
+
+def _serve_find_port(inner_command: str) -> int | None:
+    """Đoán port từ lệnh serve, ưu tiên số đứng SAU CÙNG (thường là port thật,
+    vd "http.server 8080" hay "--port 5173") -- best-effort, chỉ dùng để check
+    port bận trước khi Popen, không dùng cho auto-detect entry file (đã có
+    _HTTP_SERVER_RE riêng, chặt chẽ hơn, cho việc đó)."""
+    nums = _SERVE_PORT_RE.findall(inner_command)
+    if not nums:
+        return None
+    port = int(nums[-1])
+    if 1 <= port <= 65535:
+        return port
+    return None
+
+def _serve_kill_port_owner(run_cwd: str, port: int) -> str | None:
+    """Nếu có process NGOÀI hệ thống 'serve:' (không phải _serve_procs đang
+    track) đang chiếm sẵn `port` -- ví dụ 1 lệnh `node -e ...`/server cũ user
+    tự chạy tay từ trước, hoặc zombie sống sót qua 1 lần app bị kill cứng --
+    dò và kill nó trước khi Popen lệnh serve mới. Lý do cần bước này: nếu
+    không kill, lệnh serve mới có thể bind FAIL (EADDRINUSE, phát hiện được
+    qua nhánh 'Process thoát ngay' bên dưới) HOẶC tệ hơn, tuỳ hệ điều hành/
+    tuỳ cấu hình SO_REUSEPORT, request có thể vẫn lọt vào process CŨ thay vì
+    process MỚI -- kết quả là server tưởng đã chạy nhưng client luôn thấy
+    404/nội dung cũ, không có cách nào phát hiện qua exit_code vì process
+    mới của TA vẫn sống bình thường (bug 404 thực tế đã xảy ra với Termux +
+    'node -e' chiếm port 8080 từ trước, xác nhận qua ps aux + curl).
+    Trả về mô tả process đã kill (để log/báo), hoặc None nếu port đang rảnh
+    hoặc không dò được gì (best-effort, không có quyền root/netlink trên
+    Termux nên KHÔNG dùng ss/netstat/lsof -- quét /proc trực tiếp thay thế).
+    """
+    import socket as _sock
+    # CHẶN AN TOÀN: không bao giờ kill nếu port này chính là port của web UI
+    # server chính (12_web.py, /web mode) -- đây là server phục vụ CHÍNH cái
+    # web UI mà agent đang chạy trong đó, kill nhầm nó = tự cắt kết nối của
+    # chính mình. web_server_addr() chỉ tồn tại nếu module 12_web.py đã được
+    # load (dùng globals().get() để không NameError ở nhánh CLI thuần, nơi
+    # /web chưa từng được bật -- symbol có thể chưa tồn tại trong namespace
+    # chung tại thời điểm này). Chỉ áp dụng đúng khi web server ĐANG chạy
+    # (web_server_addr() trả None nếu chưa start) -- nhánh CLI không bị ảnh
+    # hưởng gì, hành vi kill-port vẫn hoạt động bình thường như cũ.
+    _addr_fn = globals().get("web_server_addr")
+    if _addr_fn is not None:
+        try:
+            _addr = _addr_fn()
+        except Exception:
+            _addr = None
+        if _addr is not None and _addr[1] == port:
+            _serve_log(run_cwd, f"Port {port} trùng port web UI server đang chạy "
+                                 f"({_addr}) -- BỎ QUA kill để không tự cắt kết nối "
+                                 f"chính mình.")
+            return None
+    # 1) Test nhanh: port có đang bận không? Bind thử lên 127.0.0.1 -- nếu
+    # thành công nghĩa là port đang RẢNH, không cần làm gì thêm.
+    s = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+    s.setsockopt(_sock.SOL_SOCKET, _sock.SO_REUSEADDR, 1)
+    try:
+        s.bind(("127.0.0.1", port))
+        s.close()
+        return None  # port rảnh -- không có gì để kill
+    except OSError:
+        s.close()  # port đang bận -- tiếp tục dò process nào giữ nó
+    # 2) Quét /proc để tìm pid nào có socket inode khớp port đang LISTEN.
+    # Không cần root: đọc /proc/net/tcp (địa chỉ hex, port ở dạng hex sau
+    # dấu ":") để lấy inode, rồi map inode -> pid qua /proc/<pid>/fd/*.
+    try:
+        port_hex = format(port, "04X")
+        target_inodes = set()
+        for tcp_file in ("/proc/net/tcp", "/proc/net/tcp6"):
+            try:
+                with open(tcp_file) as f:
+                    next(f)  # bỏ header
+                    for line in f:
+                        parts = line.split()
+                        local_addr, state, inode = parts[1], parts[3], parts[9]
+                        if local_addr.split(":")[1] == port_hex and state == "0A":  # 0A = LISTEN
+                            target_inodes.add(inode)
+            except FileNotFoundError:
+                pass
+        candidate_pid = None
+        candidate_cmd = None
+        if target_inodes:
+            # Đường chính: map inode -> pid qua /proc/<pid>/fd/* (chính xác
+            # tuyệt đối khi network namespace không bị ảo hoá lệch, đúng
+            # trường hợp Termux/Android thật).
+            for pid_dir in Path("/proc").glob("[0-9]*"):
+                pid = pid_dir.name
+                fd_dir = pid_dir / "fd"
+                try:
+                    matched = False
+                    for fd in fd_dir.iterdir():
+                        try:
+                            link = os.readlink(fd)
+                        except OSError:
+                            continue
+                        if link.startswith("socket:[") and link[8:-1] in target_inodes:
+                            matched = True
+                            break
+                    if matched:
+                        candidate_pid = pid
+                        break
+                except Exception:
+                    continue  # 1 pid lỗi đọc /proc (race condition, permission...) -- thử pid khác
+        if candidate_pid is None:
+            # Fallback: 1 vài môi trường (container ảo hoá network namespace
+            # khác lạ) khiến inode ở /proc/net/tcp không khớp trực tiếp với
+            # /proc/<pid>/fd dù cùng 1 process thật -- xác nhận qua thực
+            # nghiệm. Dò thêm bằng cách tìm process có cmdline chứa đúng số
+            # port này VÀ đang có ít nhất 1 fd loại socket đang mở -- kém
+            # chính xác hơn (có thể trùng số ngẫu nhiên trong cmdline), nên
+            # CHỈ dùng khi đường chính thất bại, và chỉ kill nếu tìm được
+            # ĐÚNG 1 ứng viên duy nhất (mơ hồ -> bỏ qua, không đoán bừa).
+            port_str = str(port)
+            found = []
+            for pid_dir in Path("/proc").glob("[0-9]*"):
+                pid = pid_dir.name
+                try:
+                    cmdline = (pid_dir / "cmdline").read_bytes().decode(errors="replace").replace("\x00", " ").strip()
+                except OSError:
+                    continue
+                if port_str not in cmdline:
+                    continue
+                try:
+                    has_socket = any(
+                        os.readlink(fd).startswith("socket:[")
+                        for fd in (pid_dir / "fd").iterdir()
+                        if True
+                    )
+                except Exception:
+                    has_socket = False
+                if has_socket:
+                    found.append((pid, cmdline))
+            if len(found) == 1:
+                candidate_pid, candidate_cmd = found[0]
+        if candidate_pid is None:
+            return None  # không dò ra được (0 hoặc >1 ứng viên mơ hồ) -- bỏ qua an toàn
+        # CHẶN AN TOÀN THỨ 2 (tự vệ tuyệt đối): không bao giờ kill chính pid
+        # process app đang chạy (os.getpid()), pid cha của nó (os.getppid(),
+        # vd tiến trình shell/Termux bao ngoài), hay bất kỳ pid nào đang được
+        # CHÍNH hệ thống serve: track trong _serve_procs (những pid đó đã có
+        # đường dọn riêng qua _serve_kill_existing/killpg ở trên rồi -- nếu
+        # lọt tới đây nghĩa là có sai lệch dò tìm, an toàn nhất là bỏ qua
+        # thay vì kill nhầm process CỦA CHÍNH HỆ THỐNG).
+        _protected_pids = {str(os.getpid()), str(os.getppid())}
+        for _entry in _serve_procs.values():
+            _protected_pids.add(str(_entry["proc"].pid))
+        if candidate_pid in _protected_pids:
+            _serve_log(run_cwd, f"Dò ra pid={candidate_pid} giữ port {port} nhưng đây là "
+                                 f"process được bảo vệ (chính app hoặc server serve: đang "
+                                 f"track) -- BỎ QUA kill để tránh tự hại chính mình.")
+            return None
+        if candidate_cmd is None:
+            try:
+                candidate_cmd = (Path("/proc") / candidate_pid / "cmdline").read_bytes().decode(errors="replace").replace("\x00", " ").strip()
+            except OSError:
+                candidate_cmd = "?"
+        try:
+            os.kill(int(candidate_pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError) as e:
+            _serve_log(run_cwd, f"Dò thấy pid={candidate_pid} ({candidate_cmd}) giữ port {port} "
+                                f"nhưng KHÔNG kill được: {e!r}")
+            return None
+        _serve_log(run_cwd, f"Port {port} đang bị pid={candidate_pid} ({candidate_cmd}) chiếm "
+                             f"(ngoài hệ thống serve:) -- đã kill để nhường chỗ.")
+        return f"pid={candidate_pid} ({candidate_cmd})"
+    except Exception as e:
+        _serve_log(run_cwd, f"LỖI dò process giữ port {port}: {e!r}")
+    return None
+
+def tool_bash_serve(inner_command: str) -> str:
+    """Nhánh 'serve:' của tool_bash -- xem comment khối phía trên. Tách hàm
+    riêng để code path hoàn toàn độc lập, dễ đọc, không lẫn vào nhánh bash
+    thường (không share biến/state nào ngoài _project_dir đọc-only)."""
+    inner_command = inner_command.strip()
+    if not inner_command:
+        return "[serve] Thiếu lệnh sau 'serve:'. Cú pháp: serve: <lệnh chạy server>."
+    key = _serve_key()
+    old_cmd = _serve_kill_existing(key)
+    if old_cmd:
+        time.sleep(0.15)  # đệm nhỏ: os.killpg gửi SIGTERM cho cả process group,
+        # nhưng proc.wait() ở _serve_kill_existing chỉ đảm bảo process CHA (shell,
+        # do shell=True) đã chết -- process CON thật (vd http.server) nhận SIGTERM
+        # cùng lúc nhưng có thể cần thêm chút thời gian để tự thoát (khác SIGKILL
+        # chết ngay tức khắc). Không có đệm này, bước check port ngay sau đây có
+        # thể vẫn thấy port "bận" bởi chính con của server VỪA kill (race), rồi
+        # báo nhầm nó là "process lạ" trong message trả về -- vô hại về chức
+        # năng (vẫn kill đúng, port vẫn được giải phóng) nhưng gây hiểu lầm khi
+        # đọc log/thông báo.
+    run_cwd = str(_project_dir.resolve()) if _project_dir is not None else os.getcwd()
+    _serve_log(run_cwd, f"=== serve: gọi mới === lệnh='{inner_command}' run_cwd='{run_cwd}' "
+                        f"old_cmd={old_cmd!r} _project_dir={_project_dir!r}")
+    # Log liệt kê TOÀN BỘ file ở run_cwd NGAY TRƯỚC KHI Popen chạy -- đây là
+    # bằng chứng quan trọng nhất để debug 404: nếu index.html/file mong đợi
+    # KHÔNG xuất hiện trong log này, nghĩa là file chưa từng nằm ở run_cwd
+    # tại đúng thời điểm serve khởi động (bug ở write/edit hoặc project_dir
+    # bị lệch), KHÔNG PHẢI lỗi ở chính http.server hay ở phía trình duyệt.
+    try:
+        listing = sorted(p.name + ("/" if p.is_dir() else "") for p in Path(run_cwd).iterdir())
+        _serve_log(run_cwd, f"listing run_cwd TRƯỚC Popen: {listing}")
+    except Exception as e:
+        _serve_log(run_cwd, f"LỖI liệt kê run_cwd TRƯỚC Popen: {e!r}")
+    # Check port có bị process LẠ (ngoài hệ thống serve:) chiếm sẵn không --
+    # vd user/agent từng chạy tay 1 lệnh khác (node -e ..., server cũ) rồi
+    # quên tắt, hoặc zombie sống sót qua lần app bị kill cứng trước đó. Nếu
+    # không dọn, lệnh serve mới có thể bind fail HOẶC (tệ hơn, tuỳ OS) request
+    # vẫn lọt vào process CŨ -- xem comment đầy đủ ở _serve_kill_port_owner.
+    # _serve_kill_existing() ở trên chỉ dọn process serve: CŨ do CHÍNH hệ
+    # thống này track (_serve_procs) -- không thấy được process lạ bên ngoài,
+    # nên cần bước riêng này, độc lập, chạy SAU _serve_kill_existing.
+    guessed_port = _serve_find_port(inner_command)
+    killed_owner = None
+    if guessed_port is not None:
+        killed_owner = _serve_kill_port_owner(run_cwd, guessed_port)
+        if killed_owner:
+            time.sleep(0.2)  # nhường chút thời gian để OS giải phóng hẳn port
+            # sau SIGKILL trước khi ta bind lại -- tránh race hiếm gặp EADDRINUSE
+            # dù process đã chết (TIME_WAIT thường không áp dụng cho SIGKILL
+            # tức thời, nhưng thêm 1 khoảng nhỏ vẫn an toàn hơn không có gì).
+    try:
+        proc = subprocess.Popen(
+            inner_command, shell=True, cwd=run_cwd,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,  # process group riêng -- killpg dọn sạch cả cháu
+        )
+    except Exception as e:
+        _serve_log(run_cwd, f"LỖI Popen: {e!r}")
+        return f"[serve] Không khởi động được: {e}"
+    time.sleep(0.3)  # khoảng lặng ngắn để bắt lỗi khởi động tức thì (vd port
+    # đã bị chiếm bởi tiến trình KHÁC ngoài hệ thống serve này, hoặc lệnh sai
+    # cú pháp thoát ngay) -- không phải chờ server "xong" (nó không bao giờ
+    # xong), chỉ để phát hiện sớm trường hợp chết yểu rõ ràng.
+    if proc.poll() is not None:
+        code = proc.returncode
+        _serve_log(run_cwd, f"Process THOÁT NGAY sau 0.3s, exit_code={code} -- "
+                            f"có thể lệnh sai cú pháp hoặc port bị chiếm bởi "
+                            f"process KHÁC (ngoài hệ thống serve).")
+        return (f"[serve] Process thoát ngay (exit_code={code}) -- lệnh có thể sai "
+                f"cú pháp hoặc port đã bị chương trình KHÁC (ngoài hệ thống serve) "
+                f"chiếm. Lệnh: {inner_command}")
+    _serve_procs[key] = {"proc": proc, "cmd": inner_command}
+    _serve_log(run_cwd, f"Process sống, pid={proc.pid}, pgid={os.getpgid(proc.pid)!r}")
+    replaced_note = f" (đã thay thế server cũ: {old_cmd})" if old_cmd else ""
+    killed_note = f" Đã phát hiện và dọn process lạ giữ port trước đó: {killed_owner}.\n" if killed_owner else ""
+    base_msg = (
+        f"[serve] Đang chạy nền, pid={proc.pid}{replaced_note}.\n"
+        f"Lệnh: {inner_command}\n"
+        f"Thư mục: {run_cwd}\n"
+        f"{killed_note}"
+        f"Server này sống cho tới khi bị thay thế bởi lệnh 'serve:' kế tiếp "
+        f"(cùng project) -- không cần/không thể dùng bash thường để dừng nó."
+    )
+    # Auto-detect CHỈ áp dụng cho http.server (xem comment _serve_detect_entry_file
+    # ở trên) -- lệnh khác (npm run dev, node...) không đoán được port/file thật,
+    # trả về base_msg như cũ, không đổi hành vi.
+    m_port = _HTTP_SERVER_RE.match(inner_command)
+    if not m_port:
+        _serve_log(run_cwd, "Lệnh không khớp _HTTP_SERVER_RE -- bỏ qua auto-detect, "
+                            "trả base_msg nguyên bản.")
+        return base_msg
+    port = m_port.group(1) or "8000"  # http.server mặc định port 8000 nếu không truyền
+    index_ok, suggested_file = _serve_detect_entry_file(run_cwd)
+    _serve_log(run_cwd, f"_serve_detect_entry_file -> index_ok={index_ok} "
+                        f"suggested_file={suggested_file!r} port={port}")
+    if index_ok:
+        # Có sẵn index.html -- http.server tự phục vụ đúng ở URL root, không
+        # cần cảnh báo/gợi ý gì thêm.
+        return base_msg
+    if suggested_file is not None:
+        url = f"http://localhost:{port}/{suggested_file}"
+        _serve_log(run_cwd, f"Trả URL gợi ý: {url}")
+        return (
+            f"{base_msg}\n"
+            f"URL đầy đủ (đã tự dò thấy đúng 1 file .html, không phải "
+            f"\"index.html\" nên PHẢI có tên file trong URL, root sẽ 404 hoặc "
+            f"liệt kê thư mục): {url}\n"
+            f"Báo NGUYÊN VĂN URL này cho user, không rút gọn về dạng root "
+            f"(http://localhost:{port}) -- http.server không tự suy ra file "
+            f"khi không có index.html."
+        )
+    html_files = _serve_list_html_files(run_cwd)
+    _serve_log(run_cwd, f"Không auto-pick được (mơ hồ) -- html_files={html_files}")
+    if not html_files:
+        return (
+            f"{base_msg}\n"
+            f"CẢNH BÁO: không tìm thấy file .html nào ở {run_cwd} -- nếu chưa "
+            f"ghi file trang nào, hãy ghi trước; nếu file nằm trong thư mục con, "
+            f"URL phải bao gồm cả đường dẫn con (vd http://localhost:{port}/sub/page.html)."
+        )
+    listed = ", ".join(html_files)
+    return (
+        f"{base_msg}\n"
+        f"CẢNH BÁO: có {len(html_files)} file .html ở root ({listed}) và không "
+        f"có \"index.html\" -- http.server sẽ không tự chọn đúng trang khi "
+        f"user chỉ mở URL root (http://localhost:{port}). Phải nêu RÕ tên file "
+        f"cụ thể trong URL báo cho user, vd http://localhost:{port}/{html_files[0]}."
+    )
+
 def tool_bash(command, timeout=30):
+    # Nhánh riêng "serve: ..." -- rẽ NGAY ĐẦU, trước mọi gate/logic bash
+    # thường bên dưới, vì đây là 1 cơ chế khác hẳn (Popen nền, không chờ,
+    # không timeout). Không dùng "serve:" -> rơi xuống logic gốc, không đổi
+    # gì cho các lệnh khác.
+    m = _SERVE_PREFIX_RE.match(command)
+    if m:
+        return tool_bash_serve(command[m.end():])
+
     # Chặn file inspection qua bash — AI phải dùng read/glob/grep thay thế
     if _BASH_INSPECT_RE.search(command):
         return (
