@@ -17,7 +17,7 @@
 [![Stdlib Only](https://img.shields.io/badge/dependencies-stdlib--only-brightgreen)](#requirements)
 [![License: Proprietary](https://img.shields.io/badge/license-proprietary-red)](#license)
 [![Providers](https://img.shields.io/badge/providers-12-orange)](#supported-providers)
-[![Tools](https://img.shields.io/badge/agent%20tools-21-9cf)](#agent-tools)
+[![Tools](https://img.shields.io/badge/agent%20tools-20-9cf)](#agent-tools)
 [![Made with ❤️ in Vietnam](https://img.shields.io/badge/made%20with-%E2%9D%A4%EF%B8%8F%20in%20Vietnam-da251d)](#contact)
 
 [English](#-english) · [Tiếng Việt](#-tiếng-việt)
@@ -208,7 +208,7 @@ Most CLI agents lock you into one API shape. `fw.py` internally speaks only Open
 | **Web** | `webfetch`, `websearch` |
 | **Planning** | `todowrite`, `todoread`, `question`, `verify` |
 | **Code intelligence** | `lsp` |
-| **Orchestration** | `task` (subagent dispatch), `set_tools`, `skill` |
+| **Orchestration** | `task` (subagent dispatch), `skill` |
 
 </details>
 
@@ -553,7 +553,7 @@ Phần lớn CLI agent chỉ hỗ trợ 1 dạng API duy nhất. `fw.py` nội b
 | **Web** | `webfetch`, `websearch` |
 | **Lập kế hoạch** | `todowrite`, `todoread`, `question`, `verify` |
 | **Code intelligence** | `lsp` |
-| **Điều phối** | `task` (gọi subagent), `set_tools`, `skill` |
+| **Điều phối** | `task` (gọi subagent), `skill` |
 
 </details>
 
