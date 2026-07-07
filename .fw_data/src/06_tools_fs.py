@@ -914,7 +914,7 @@ def _index_update(abs_path: str, content: str, symbols: dict):
             rel = str(Path(abs_path).relative_to(Path.cwd()))
         except ValueError:
             pass
-    sym_map = {name: s["line"] for name, s in list(symbols.items())[:40]}
+    sym_map = {name: s["line"] for name, s in symbols.items()}
     index[rel] = {
         "path": abs_path,
         "lines": len(content.splitlines()),

@@ -1770,7 +1770,7 @@ function handleEvent(msg) {
       logEl.innerHTML = "";
       closeTurnLogs();
       renderHistory(d.messages || []);
-      setBusy(false);
+      setBusy(!!d.turn_in_progress);
       setCodewebMode(d.agent);
       codewebRestoreFromSessionInit(d.codeweb_preview);
       // Session mới (hoặc /sessions đổi phiên) -> model có thể đã khác,

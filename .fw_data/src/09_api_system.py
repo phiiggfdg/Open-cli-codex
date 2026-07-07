@@ -2392,6 +2392,7 @@ def agent_turn(messages, model, api_key, conn, sid, max_steps=20, agent=AGENT_BU
     # khi agent_turn() được gọi từ nơi chưa migrate (vd tool_task() subagent).
     if state is not None:
         cli_render_reset()
+        state.turn_in_progress = True
         state.emit(EV_TURN_START)
         # Dọn cờ interrupt rác còn sót lại từ 1 lần ^C trước đó bấm lúc
         # KHÔNG có gì đang stream (xem WebInputBridge.disarm() -- nơi chính
@@ -2423,6 +2424,7 @@ def agent_turn(messages, model, api_key, conn, sid, max_steps=20, agent=AGENT_BU
             state.bus.unsubscribe(_watch_turn_end)
             if not turn_end_seen[0]:
                 state.emit(EV_TURN_END, session_in=0, session_out=0, summary_line=None)
+            state.turn_in_progress = False
         clear_current_state()
 
 
@@ -2752,7 +2754,11 @@ def _agent_turn_inner(messages, model, api_key, conn, sid, max_steps, agent, sta
                 else:
                     print(f"  {YELLOW}[dedup]{R} {DIM}Blocked duplicate: {name} {json.dumps(args)[:60]}{R}")
                 tool_results.append({"role":"tool","tool_call_id":tc.get("id",""),"content":dupe_msg})
-                tool_results_history.append({"role":"tool","tool_call_id":tc.get("id",""),"content":dupe_msg})
+                # Bản lưu history/DB không cần giữ prev_snippet 300 ký tự —
+                # giá trị của nó (nhắc model đừng lặp lại) chỉ có ý nghĩa
+                # NGAY TURN NÀY, model ở các turn sau không cần đọc lại.
+                dupe_msg_history = f"[dedup] Blocked duplicate call to `{name}` (same args, no state change since)."
+                tool_results_history.append({"role":"tool","tool_call_id":tc.get("id",""),"content":dupe_msg_history})
                 continue
             # Xác định TRƯỚC khi chạy tool: lệnh này có khả năng đổi trạng thái
             # không -- dùng cùng tiêu chí _BASH_READONLY_RE với lazy cache
@@ -2804,6 +2810,16 @@ def _agent_turn_inner(messages, model, api_key, conn, sid, max_steps, agent, sta
             message_save(conn, sid, "tool", tr)
         memory_pressure_evict()   # evict file cache nếu RAM cao
         steps += 1
+
+    if steps >= max_steps:
+        _max_step_msg = (
+            f"[max-steps] Đã dừng sau {max_steps} bước trong turn này — "
+            f"model có thể chưa hoàn thành xong việc. Gõ tiếp để tiếp tục nếu cần."
+        )
+        if state is None or not (getattr(state, "web_bridge", None) and state.web_bridge.is_armed()):
+            print(f"\n{YELLOW}{_max_step_msg}{R}")
+        else:
+            state.emit(EV_WARN, text=_max_step_msg)
 
     if total_in or total_out:
         r = conn.execute(

@@ -175,6 +175,9 @@ class SessionState:
         self.bus = EventBus()
         self.lock = threading.RLock()   # 1 turn tại 1 thời điểm cho mỗi session
         self.web_bridge = None  # gán = WebInputBridge() khi /web bật lần đầu
+        self.turn_in_progress = False  # True trong suốt agent_turn() — đọc bởi
+        # _send_session_init() (12_web.py) để báo đúng busy/idle cho client mới
+        # kết nối (vd reload trang giữa lúc agent đang chạy).
 
     def emit(self, type: str, **data):
         return self.bus.emit(type, **data)

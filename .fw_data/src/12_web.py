@@ -355,6 +355,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                         # 1 preview vừa pass). Rỗng nếu session chưa từng có
                         # preview nào pass hoặc chưa phải codeweb.
                         "codeweb_preview": codeweb_get_session_preview_state(st.sid),
+                        "turn_in_progress": bool(getattr(st, "turn_in_progress", False)),
                     },
                 })
             except Exception:
@@ -648,6 +649,9 @@ def wait_web_mode(state, host: str, port: int, color_fns=None):
                 pass
             if not state.web_bridge.is_armed():
                 print(f"\n  {DIMc}Đã quay lại CLI.{Rc}\n")
+                state.emit(EV_WARN, text=(
+                    "Đã ngắt khỏi CLI (Esc/Ctrl-C) — cần bấm /web lại ở CLI "
+                    "để gõ tiếp từ đây."))
 
     t = threading.Thread(target=_watch_esc, daemon=True)
     t.start()
