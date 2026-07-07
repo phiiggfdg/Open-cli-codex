@@ -546,9 +546,6 @@ def _check_permission(name, args, agent=None):
 
 # ── Dispatch ─────────────────────────────────────────────────────────────────
 def _dispatch_tool(name, args, model, api_key, conn, sid, state=None):
-    if name == "set_tools":
-        result = tool_set_tools(args.get("tools", []))
-        return result
     if name.startswith("mcp__"):
         # B3 FIX: trước đây return ngay tại đây, bỏ qua _check_permission()
         # hoàn toàn — /perm mcp__server_* deny/ask không có tác dụng gì dù

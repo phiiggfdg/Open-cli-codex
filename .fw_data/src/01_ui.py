@@ -5,8 +5,7 @@ Inspired by anomalyco/opencode (MIT license)
 
 Tools: bash, read, write, edit, multiedit,
        glob, grep, webfetch, websearch, todowrite, todoread, question,
-       apply_patch, task, skill, lsp, file_index, view_symbol,
-       set_tools, verify
+       apply_patch, task, skill, lsp, file_index, view_symbol, verify
 Session: SQLite, resume, compaction, token tracking, undo/redo
 Agents:  build (full), plan (read-only)
 Perms:   per-tool allow/ask/deny

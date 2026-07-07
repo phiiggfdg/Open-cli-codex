@@ -439,14 +439,6 @@ TOOLS = [
     },"required":["path","symbol"]}
   }},
   {"type":"function","function":{
-    "name":"set_tools",
-    "description":"Declare which tools you plan to focus on next. This is a planning hint only; the full tool schema remains available to preserve prompt-cache stability. Always include set_tools itself.",
-    "parameters":{"type":"object","properties":{
-      "tools":{"type":"array","items":{"type":"string"},
-               "description":"Tool names to keep active e.g. ['bash','write','set_tools']"}
-    },"required":["tools"]}
-  }},
-  {"type":"function","function":{
     "name":"file_index",
     "description":"Call at the start of coding tasks that involve reading or editing existing files. Skip for conversational input, questions about the system, or new-file-only tasks. Returns file paths + symbol names + line numbers (persists across sessions). File listed → use view_symbol directly. File not listed → grep(\"##==\") then grep symbols before any read.",
     "parameters":{"type":"object","properties":{},"required":[]}
@@ -461,9 +453,3 @@ TOOLS = [
   }},
 
 ]
-
-# Tất cả tool names (để set_tools validate)
-ALL_TOOL_NAMES = {t["function"]["name"] for t in TOOLS}
-
-# Tool focus hint only. Full TOOLS schema stays stable for prompt-cache reuse.
-_active_tools: set | None = None

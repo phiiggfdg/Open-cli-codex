@@ -2256,7 +2256,6 @@ When building or changing a UI:
 - `lsp`: local code intelligence; references scans workspace using Python AST where possible and regex fallback elsewhere.
 - `verify`: visually confirm output after edits. See "Re-read after edit = FORBIDDEN" in Execution model.
 - `skill`: load SKILL.md by name for unfamiliar domains.
-- `set_tools`: declare the tool focus for the next phase. Full tool schema remains available for cache stability.
 - `bash` fails → see Anti-loop for retry/stop logic.
 - DEPENDENCY CHECK: new import → `grep` project config first. Missing → install via bash before editing.
 
@@ -2386,7 +2385,7 @@ def _inject_git_context_once(messages: list) -> list:
 def agent_turn(messages, model, api_key, conn, sid, max_steps=20, agent=AGENT_BUILD, state=None):
     # C1 FIX: thêm _large_read_credits vào global declaration.
     # Tất cả modules exec() vào cùng một namespace → global ở đây là đúng.
-    global _current_agent, _active_tools, _todowrite_calls_this_turn, _current_sid, _large_read_credits
+    global _current_agent, _todowrite_calls_this_turn, _current_sid, _large_read_credits
     # state: SessionState | None — khi có, output đi qua state.emit(...) thay vì
     # print() trực tiếp (xem 01d_events.py). None → hành vi CLI cũ y hệt, dùng
     # khi agent_turn() được gọi từ nơi chưa migrate (vd tool_task() subagent).
@@ -2439,10 +2438,9 @@ _BASH_READONLY_RE = re.compile(
 )
 
 def _agent_turn_inner(messages, model, api_key, conn, sid, max_steps, agent, state):
-    global _current_agent, _active_tools, _todowrite_calls_this_turn, _current_sid, _large_read_credits
+    global _current_agent, _todowrite_calls_this_turn, _current_sid, _large_read_credits
     _current_agent    = agent
     _current_sid      = sid
-    _active_tools     = None   # không còn dùng cho API payload, giữ để tương thích
     _todowrite_calls_this_turn = 0  # reset hard limit mỗi turn
     _large_read_credits        = 0  # reset large read credits mỗi turn
 

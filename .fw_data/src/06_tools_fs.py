@@ -1,17 +1,3 @@
-def tool_set_tools(tools: list) -> str:
-    global _active_tools
-    valid   = [t for t in tools if t in ALL_TOOL_NAMES]
-    invalid = [t for t in tools if t not in ALL_TOOL_NAMES]
-    # Luôn giữ set_tools để AI có thể thay đổi lại
-    if "set_tools" not in valid:
-        valid.append("set_tools")
-    _active_tools = set(valid)
-    active_label = ", ".join(sorted(_active_tools))
-    msg = f"Tool focus set: {active_label} (full tool schema remains available)"
-    if invalid:
-        msg += f" (unknown: {', '.join(invalid)})"
-    return msg
-
 def get_active_tools() -> list:
     """Full tool schema is kept stable to preserve prompt-cache reuse."""
     return TOOLS

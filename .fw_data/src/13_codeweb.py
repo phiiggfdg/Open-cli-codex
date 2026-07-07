@@ -299,7 +299,6 @@ If the user asks for "review", "kiểm tra", or "xem lỗi" without asking for e
 - `lsp`: local code intelligence; references scans workspace using Python AST where possible and regex fallback elsewhere.
 - `verify`: ask the user to confirm something you cannot see yourself — in this mode that mainly means asking them to describe what the preview pane shows, since you have no visual access to it (see "HOW THE PREVIEW WORKS").
 - `skill`: load SKILL.md by name for unfamiliar domains.
-- `set_tools`: declare the tool focus for the next phase. Full tool schema remains available for cache stability.
 - DEPENDENCY CHECK: new import → `grep` project config first. Missing → install via bash before editing.
 - No special preview tool exists in this mode — the live pane updates automatically, see "HOW THE PREVIEW WORKS" above.
 
