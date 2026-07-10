@@ -68,6 +68,17 @@ _BASH_INSPECT_PATTERNS = [
     r"\b(?:bash|sh|zsh)\s+-c\b",           # bash -c "..." / sh -c "..." — chặn
                                             # toàn bộ vì nội dung bên trong quote
                                             # không kiểm tra an toàn bằng regex.
+    # FIX (bug moi phat hien): cac pattern tren chi bat cu phap text cu the
+    # (cat/head/tail/find/ls -R/bash -c), nhung KHONG bat duoc interpreter
+    # nam SAN trong allowlist (python3/node/git) dung -c/-e/-p hoac subcommand
+    # de doc file y het cat -- vi ban than lenh do da nam trong allowlist nen
+    # khong bi chan o gate allowlist, va noi dung trong dau quote thi khong
+    # regex nao parse an toan duoc. Chan luon co che "eval inline code" cua
+    # cac interpreter nay va cac lenh git doc noi dung file qua lich su.
+    r"\bpython3?\s+(-\S+\s+)*-c\b",       # python3 -c "..." / python -u -c "..."
+    r"\bnode\s+(-\S+\s+)*-[ep]\b",        # node -e "..." / node -p "..."
+    r"\bgit\s+show\b",                    # git show <ref>:<path> doc noi dung file
+    r"\bgit\s+log\s+.*-p\b",              # git log -p in full diff/noi dung file
 ]
 _BASH_INSPECT_RE = re.compile("|".join(_BASH_INSPECT_PATTERNS))
 
@@ -499,10 +510,33 @@ def tool_bash_serve(inner_command: str) -> str:
     )
 
 def tool_bash(command, timeout=30):
-    # Nhánh riêng "serve: ..." -- rẽ NGAY ĐẦU, trước mọi gate/logic bash
-    # thường bên dưới, vì đây là 1 cơ chế khác hẳn (Popen nền, không chờ,
-    # không timeout). Không dùng "serve:" -> rơi xuống logic gốc, không đổi
-    # gì cho các lệnh khác.
+    # FIX (bug moi phat hien #1 - nghiem trong): truoc day _SERVE_PREFIX_RE
+    # duoc check DAU TIEN, truoc ca deny-gate, nen "serve: rm -rf /" hay
+    # "serve: sudo reboot" chay THANG qua Popen(shell=True) khong qua bat ky
+    # policy nao (khong allowlist, khong denylist, khong inspect-block) --
+    # xac nhan bang test that. Deny-gate phai ap dung cho CA 2 nhanh (serve
+    # va bash thuong) vi no la phong thu toi thieu chong lenh pha huy ro rang
+    # (rm -rf /, sudo, chroot...), khong co ly do gi nhanh serve duoc mien.
+    # Allowlist/inspect-gate thi KHONG ap cho serve (dev server nhu "npm run
+    # dev"/"python3 -m http.server" von khong nam trong allowlist text don
+    # gian va khong phai hanh vi doc file) -- chi rieng deny-gate la bat buoc
+    # chung cho ca 2 nhanh.
+    #
+    # FIX (bug da co tu truoc, giu nguyen o day): deny-check truoc day nam
+    # BEN TRONG "if _project_dir is not None" -- nghia la neu _project_dir la
+    # None (chay ngoai sandbox), deny-gate hoan toan khong chay. Deny-gate la
+    # phong thu co ban, khong nen phu thuoc _project_dir co ton tai hay
+    # khong -- keo ra ngoai, chay vo dieu kien.
+    if _BASH_DENY_RE.search(command):
+        proj_hint = str(_project_dir.resolve()) if _project_dir is not None else os.getcwd()
+        return (f"[policy] Lệnh nguy hiểm bị chặn.\n"
+                f"Thư mục chạy dự kiến: {proj_hint}\n"
+                f"Lệnh bị từ chối: {command[:200]}")
+
+    # Nhánh riêng "serve: ..." -- rẽ SAU deny-gate (xem fix ở trên), trước
+    # allowlist/inspect-gate bên dưới, vì đây là 1 cơ chế khác hẳn (Popen nền,
+    # không chờ, không timeout). Không dùng "serve:" -> rơi xuống logic gốc,
+    # không đổi gì cho các lệnh khác.
     m = _SERVE_PREFIX_RE.match(command)
     if m:
         return tool_bash_serve(command[m.end():])
@@ -515,8 +549,10 @@ def tool_bash(command, timeout=30):
             "  • cat / head / tail / less  → read(path, offset, limit)\n"
             "  • ls -R / find .            → glob(pattern) hoặc read(dir)\n"
             "  • bash -c / sh -c           → không hỗ trợ, dùng tool trực tiếp\n"
+            "  • python3 -c / node -e / -p → không hỗ trợ eval inline, chạy file thay thế\n"
+            "  • git show / git log -p     → dùng read(path) hoặc git log không -p\n"
             "Lý do: bash file inspection lãng phí token, phá cache context,\n"
-            "và subshell/`-c` không kiểm tra an toàn được bằng policy này."
+            "và subshell/`-c`/eval-inline không kiểm tra an toàn được bằng policy này."
         )
 
 
@@ -531,12 +567,8 @@ def tool_bash(command, timeout=30):
     if _project_dir is not None:
         proj = _project_dir.resolve()
 
-        # Block obvious destructive commands as defense in depth. This is not
-        # a security boundary: an allowed interpreter can access host files.
-        if _BASH_DENY_RE.search(command):
-            return (f"[policy] Lệnh nguy hiểm bị chặn.\n"
-                    f"Thư mục chạy dự kiến: {proj}\n"
-                    f"Lệnh bị từ chối: {command[:200]}")
+        # NOTE: deny-check đã chuyển lên đầu hàm (áp dụng chung cho serve +
+        # bash thường) — không lặp lại ở đây nữa.
 
         # Chạy trong project_dir, không phải cwd tuỳ tiện
         run_cwd = str(proj)
@@ -862,12 +894,21 @@ def _index_load() -> dict:
     except Exception:
         pass
     # Migrate-on-read từ index.json cũ (chung, trước bug-fix) nếu có
+    # BUG FIX: trước dùng root = _workspace_root(), nhưng _workspace_root()
+    # rơi về Path.cwd() khi còn placeholder — cwd là thư mục CHA chứa TẤT CẢ
+    # session con (mỗi session một subdir theo sid), nên "thuộc workspace
+    # hiện tại" khi đó thực chất nghĩa là "thuộc BẤT KỲ session nào cùng cwd".
+    # Hậu quả: migrate kéo cả entry của session khác (đã từng ghi vào
+    # index.json chung trước khi có fix per-sid) vào index của session mới,
+    # rồi tool_file_index() có thể hiện thẳng ra ngoài. Giờ luôn dùng
+    # _project_dir thật của CHÍNH session này (có sẵn từ session_create,
+    # kể cả khi còn placeholder) làm mốc — không bao giờ nới lỏng ra cwd.
     if _project_dir_sid:
         legacy = _fw_data_dir() / "index.json"
         if legacy.exists():
             try:
                 legacy_index = json.loads(legacy.read_text())
-                root = _workspace_root()
+                root = _project_dir.resolve() if _project_dir is not None else _workspace_root()
                 migrated = {
                     k: v for k, v in legacy_index.items()
                     if Path(v.get("path", "")).resolve().is_relative_to(root)
@@ -922,13 +963,30 @@ def tool_file_index() -> str:
     if not index:
         return "(no files indexed yet — read a file first)"
 
-    # Lọc: chỉ hiện file trong project_dir thật (không phải placeholder cwd)
-    if _project_dir is not None and not _project_dir_is_placeholder:
+    # BUG FIX: filter cũ chỉ chạy `if not _project_dir_is_placeholder` — nghĩa
+    # là TẮT HẲN đúng lúc rủi ro cao nhất. Ở placeholder mode, _check_sandbox_read
+    # cho phép đọc BẤT KỲ path nào trên toàn filesystem (xem _check_sandbox_read),
+    # nên index lúc đó có thể chứa path/symbol của file NGOÀI project (thậm chí
+    # ngoài mọi khái niệm sandbox), hoặc entry của session khác migrate từ
+    # index.json cũ. Cũ: chỉ lọc SAU khi sandbox đã enforce — tức lúc index gần
+    # như chỉ còn chứa file hợp lệ rồi, filter thành thừa. Giờ: LUÔN lọc, và mốc
+    # "trong project" luôn là _project_dir thật (kể cả khi còn placeholder) —
+    # không bao giờ nới lỏng thành Path.cwd(), vì cwd có thể chứa nhiều
+    # session/sub-project khác nằm cạnh nhau.
+    if _project_dir is not None:
         proj = _project_dir.resolve()
-        index = {
-            k: v for k, v in index.items()
-            if Path(v["path"]).resolve().is_relative_to(proj)
-        }
+        filtered = {}
+        for k, v in index.items():
+            try:
+                if Path(v["path"]).resolve().is_relative_to(proj):
+                    filtered[k] = v
+            except Exception:
+                continue
+        index = filtered
+    else:
+        # Chưa hề có _project_dir nào được gán (state bất thường) — an toàn
+        # nhất là không hiện gì, tránh lộ index rỗng-context không rõ nguồn.
+        index = {}
 
     if not index:
         return "(no project files indexed yet)"
@@ -1132,31 +1190,34 @@ def tool_read(path, offset=1, limit=READ_DEFAULT_LIMIT, depth=4, state=None):
         all_lines = p.read_text(errors="replace").splitlines()
         total     = len(all_lines)
 
-        # Hard limit: file lớn mà không chỉ định offset → cảnh báo + cắt
-        _READ_LARGE_FILE_THRESHOLD = 80  # lines
+        # BUG FIX (đã verify bằng test thật): thứ tự cũ chạy nhánh "large-file"
+        # TRƯỚC 2 gate limit>150/limit>135. Nhánh large-file kích hoạt bất cứ
+        # khi nào offset==1 và limit>=total (đúng lúc model đọc hết file lớn —
+        # chính là trường hợp 2 gate kia được sinh ra để bắt), và nó âm thầm
+        # ghi đè limit=80 TRƯỚC KHI 2 gate kịp thấy giá trị limit thật model
+        # truyền vào. Hệ quả: hard-block (>150) và verify-ask (>135) chết hẳn
+        # bất cứ khi nào offset==1 — tức đường gọi tự nhiên nhất. Test xác nhận
+        # chỉ cần đổi offset=1→2 (cùng limit, cùng file) là gate hoạt động lại
+        # đúng ngay, chứng minh đây là bug thứ tự chứ không phải bug logic gate.
+        # Fix: đánh giá 2 gate TRƯỚC, trên limit GỐC model truyền vào (không
+        # phụ thuộc offset/total) — đây là ý muốn tường minh của model, luôn
+        # phải qua gate. Nhánh large-file chỉ còn xử lý phần CÒN LẠI: limit đã
+        # qua gate (tức ≤150) nhưng vẫn đọc-hết-file (offset=1, limit>=total)
+        # thì mới cảnh báo + cắt xuống threshold để tiết kiệm token.
+        orig_limit = int(limit)
         warn = ""
-        if total > _READ_LARGE_FILE_THRESHOLD and int(offset) == 1 and int(limit) >= total:
-            warn = (
-                f"[policy] File '{path}' có {total} dòng. "
-                f"Đọc toàn bộ file lãng phí token.\n"
-                f"Hãy dùng grep/view_symbol để tìm đúng vị trí trước, "
-                f"rồi read với offset+limit hẹp.\n"
-                f"Ví dụ: grep('tên_hàm') → read(path, offset=N-5, limit=30)\n"
-                f"Hiển thị {_READ_LARGE_FILE_THRESHOLD} dòng đầu (tổng {total} dòng):\n"
-            )
-            limit = _READ_LARGE_FILE_THRESHOLD  # cắt xuống còn threshold
 
         # Hard block: AI tự ghi limit > 150 mà không qua verify gate
-        if int(limit) > 150:
+        if orig_limit > 150:
             return (
-                f"[policy] limit={limit} quá lớn (tối đa 150).\n"
+                f"[policy] limit={orig_limit} quá lớn (tối đa 150).\n"
                 f"Dùng grep/view_symbol để tìm chính xác vị trí, "
                 f"rồi read với limit ≤ 150 quanh dòng đó.\n"
                 f"Ví dụ: grep('keyword') → read(path, offset=N-5, limit=60)"
             )
 
         # Verify gate: limit > 135 → hỏi user (trừ khi còn credit)
-        if int(limit) > 135:
+        if orig_limit > 135:
             global _large_read_credits
             if _large_read_credits > 0:
                 _large_read_credits -= 1
@@ -1202,6 +1263,25 @@ def tool_read(path, offset=1, limit=READ_DEFAULT_LIMIT, depth=4, state=None):
                         f"rồi read với limit ≤ 135 quanh đúng đoạn cần.\n"
                         f"Ví dụ: grep('keyword') → read(path, offset=N-5, limit=60)"
                     )
+
+        # Large-file soft warning: chỉ áp dụng SAU khi limit đã qua gate ở trên
+        # (tức limit hiện tại ≤135, hoặc =500 nếu user/credit đã cho phép rõ
+        # ràng). Nếu limit hiện tại vẫn >= total và offset=1 → đúng là đọc hết
+        # file lớn không cần thiết, cắt xuống threshold để tiết kiệm token.
+        # Không áp dụng khi limit=500 (đã được user cho phép tường minh ở gate
+        # trên — không nên lại âm thầm cắt xuống 80 sau khi vừa hỏi và được y).
+        _READ_LARGE_FILE_THRESHOLD = 80  # lines
+        if (total > _READ_LARGE_FILE_THRESHOLD and int(offset) == 1
+                and int(limit) >= total and int(limit) != 500):
+            warn = (
+                f"[policy] File '{path}' có {total} dòng. "
+                f"Đọc toàn bộ file lãng phí token.\n"
+                f"Hãy dùng grep/view_symbol để tìm đúng vị trí trước, "
+                f"rồi read với offset+limit hẹp.\n"
+                f"Ví dụ: grep('tên_hàm') → read(path, offset=N-5, limit=30)\n"
+                f"Hiển thị {_READ_LARGE_FILE_THRESHOLD} dòng đầu (tổng {total} dòng):\n"
+            )
+            limit = _READ_LARGE_FILE_THRESHOLD
 
         start     = max(0, int(offset) - 1)
         end       = start + int(limit)
@@ -1316,14 +1396,22 @@ _COMPACTION_MARKER_ERROR = (
 def tool_write(path, content, conn=None, sid=None):
     if _contains_compaction_marker(content):
         return _COMPACTION_MARKER_ERROR
-    p = _resolve_to_sandbox(path)
-    # Giới hạn kích thước hợp lý — chặn model runaway ghi file khổng lồ
-    # trên Termux (dung lượng hạn chế). 10MB là dư cho bất kỳ source file thật nào.
+    # BUG FIX (đã verify bằng test thật): trước đây _resolve_to_sandbox(path)
+    # chạy TRƯỚC check size-limit. _resolve_to_sandbox() gọi _ensure_project_dir()
+    # bên trong, có side-effect VĨNH VIỄN: flip _project_dir_is_placeholder
+    # True→False (khóa sandbox lại, mất quyền đọc project có sẵn ở cwd —
+    # xem _check_sandbox_read/tool_read). Test tái hiện: gọi tool_write với
+    # content 11MB (vượt limit 10MB, request chắc chắn KHÔNG ghi được file
+    # nào) vẫn khiến sandbox bị enforce ngay, và tool_read một file project
+    # có sẵn (đọc được trước đó) bị chặn ngay sau — dù không có gì được ghi.
+    # Fix: check size-limit trên `content` trước, không cần biết path resolve
+    # tới đâu. Chỉ resolve sandbox khi request có khả năng thực sự ghi file.
     _WRITE_SIZE_LIMIT = 10 * 1024 * 1024
     if len(content.encode("utf-8", errors="replace")) > _WRITE_SIZE_LIMIT:
         return (f"[error] content too large ({len(content):,} chars). "
                 f"Limit is {_WRITE_SIZE_LIMIT:,} bytes. "
                 f"If this is intentional, split into multiple files or use extract/apply_patch.")
+    p = _resolve_to_sandbox(path)
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         # Exclusive create ("x" mode) — loại race condition TOCTOU giữa check
@@ -1364,10 +1452,34 @@ def tool_extract(src, start, end, dst, mode="move", conn=None, sid=None):
     append vào dst (tạo mới nếu chưa có). mode='move' (default) xoá vùng đó
     khỏi src; mode='copy' giữ src nguyên. Không qua model — tránh việc AI
     đọc rồi gõ lại nội dung khi tách/refactor file."""
-    sp = _resolve_to_sandbox(src)
-    dp = _resolve_to_sandbox(dst)
+    # BUG FIX A (nghiêm trọng — sandbox read bypass, đã verify bằng test thật):
+    # _resolve_to_sandbox() chỉ rewrite path cho việc GHI, không hề chặn ĐỌC.
+    # tool_extract đọc thẳng sp.read_text() mà trước đây không qua
+    # _check_sandbox_read() như tool_read bắt buộc phải qua — nghĩa là khi
+    # sandbox đã enforce, agent có thể dùng extract để đọc trộm .fw_data,
+    # fw.py, hoặc bất kỳ file ngoài project nào (thứ tool_read chặn tuyệt
+    # đối) bằng cách "extract" nó ra dst rồi đọc dst. Fix: áp đúng pattern
+    # tool_read dùng — auto-redirect relative path hợp lệ vào sandbox TRƯỚC,
+    # rồi mới check quyền đọc trên path đã redirect, trước khi resolve/ghi
+    # bất cứ gì. Tự làm redirect ở đây (không gọi thẳng _resolve_to_sandbox
+    # cho src) để tránh side-effect enforce sandbox sớm khi path thật ra
+    # không đọc được (giữ đúng tinh thần fix ở tool_write).
+    src_check = src
+    if _project_dir is not None and not _project_dir_is_placeholder:
+        _p = Path(src).expanduser()
+        try:
+            _p.resolve().relative_to(_project_dir.resolve())
+        except ValueError:
+            _candidate = _project_dir / Path(src).expanduser()
+            if _candidate.exists():
+                src_check = str(_candidate)
+    err = _check_sandbox_read(src_check)
+    if err:
+        return err
+    sp = Path(src_check).expanduser()
     if not sp.exists():
         return f"[not found: {sp}]"
+    dp = _resolve_to_sandbox(dst)
     try:
         src_lines = sp.read_text().splitlines(keepends=True)
         n = len(src_lines)
@@ -1383,6 +1495,29 @@ def tool_extract(src, start, end, dst, mode="move", conn=None, sid=None):
             dst_after = dst_before + "\n" + chunk_text
         else:
             dst_after = (dst_before or "") + chunk_text
+
+        # BUG FIX C: thiếu size-limit trên dst — cùng chuẩn với tool_write
+        # (10MB), tránh dst phình vô hạn qua nhiều lần extract liên tiếp.
+        _EXTRACT_SIZE_LIMIT = 10 * 1024 * 1024
+        if len(dst_after.encode("utf-8", errors="replace")) > _EXTRACT_SIZE_LIMIT:
+            return (f"[error] resulting {dp} would be too large "
+                    f"({len(dst_after):,} chars). Limit is {_EXTRACT_SIZE_LIMIT:,} bytes.")
+
+        # BUG FIX B (TOCTOU khi move — cùng loại bug đã fix ở tool_edit):
+        # trước đây mode="move" ghi đè sp.write_text() không hề kiểm tra
+        # file có bị sửa từ bên ngoài kể từ lần đọc gần nhất. Nếu process
+        # khác sửa src giữa lúc agent đọc và lúc extract move, phần sửa đó
+        # bị ghi đè mất trắng không cảnh báo. Check TRƯỚC khi ghi bất cứ gì
+        # (kể cả dst) để giữ toàn bộ thao tác atomic-đúng-nghĩa khi fail.
+        if mode == "move":
+            resolved_src = str(sp.resolve())
+            last_read = _file_read_time.get(resolved_src, 0)
+            mtime = sp.stat().st_mtime
+            if mtime > last_read + 1:
+                return (f"[error] File '{src}' has been modified since it was last read "
+                        f"(mtime={mtime:.0f}, last_read={last_read:.0f}). "
+                        f"Read it again before extracting with mode='move'.")
+
         dp.write_text(dst_after)
         _cache_put(str(dp), dst_after, _current_sid)
         _file_read_time[str(dp.resolve())] = time.time()
@@ -1428,6 +1563,13 @@ def tool_edit(path, old_str, new_str, conn=None, sid=None):
                     f"(mtime={mtime:.0f}, last_read={last_read:.0f}). "
                     f"Use the read tool to reload it before editing.")
         text  = p.read_text()
+        if old_str == "":
+            # str.count("") trả len(text)+1 (>=1 luôn), nên count==0/count>1
+            # không bắt được case này. File rỗng đặc biệt nguy hiểm: count==1
+            # lọt qua cả 2 check, khiến new_str bị ghi thẳng vào dù không có
+            # gì để "replace". Chặn hẳn ở đây thay vì dựa vào side-effect của count.
+            return ("[error: old_str cannot be empty] There is nothing to match against. "
+                    "Use the `write` tool to create or populate a file instead of `edit`.")
         count = text.count(old_str)
         if count == 0:
             # C-fix: thông báo cụ thể hơn để model tự sửa nhanh, không đoán mù.
@@ -1481,29 +1623,83 @@ def tool_edit(path, old_str, new_str, conn=None, sid=None):
         return f"[error: {e}]"
 
 def tool_multiedit(path, edits, conn=None, sid=None):
-    """Apply multiple str-replace edits to a single file sequentially."""
+    """Apply multiple str-replace edits to a single file, all-or-nothing.
+
+    Truoc day ham nay goi tool_edit() tuan tu - moi edit tu ghi xuong dia
+    ngay lap tuc. Neu edit thu N (N>1) fail, cac edit 1..N-1 da ghi that
+    xuong file roi va KHONG duoc rollback, khien file ket o trang thai nua
+    voi khong giong ban goc cung khong giong ket qua mong muon - trong khi
+    thong bao loi khien model tuong "chua co gi thay doi". Ngoai ra moi edit
+    con tu day 1 snapshot rieng vao _undo_stack, nen 1 lan goi multiedit tao
+    ra N undo-step roi rac thay vi 1 - undo() mot lan chi lui duoc buoc cuoi.
+    Fix: ap toan bo edit len mot buffer trong RAM truoc; chi khi TAT CA edit
+    hop le moi ghi xuong dia mot lan va tao dung mot undo-snapshot duy nhat.
+    """
     if _contains_compaction_marker(*[
         v for e in (edits or []) for v in (e.get("old_str"), e.get("new_str"))
     ]):
         return _COMPACTION_MARKER_ERROR
     p = _resolve_to_sandbox(path)
     if not p.exists(): return f"[not found: {p}]"
-    results = []
-    for i, edit in enumerate(edits):
-        old_str = edit.get("old_str", "")
-        new_str = edit.get("new_str", "")
-        res = tool_edit(str(p), old_str, new_str, conn, sid)
-        results.append(f"[edit {i+1}] {res}")
-        if res.startswith("[error"):
-            results.append(f"[multiedit stopped at edit {i+1} due to error]")
-            break
-    # Snap tổng hợp sau tất cả edits — AI verify file còn nguyên cấu trúc
-    if p.exists():
-        final_lines = p.read_text().splitlines()
-        snap = _edit_sanity_snap(final_lines, max(0, len(final_lines) // 2))
+    if not edits: return "[error: no edits provided]"
+    try:
+        resolved = str(p.resolve())
+        last_read = _file_read_time.get(resolved, 0)
+        mtime = p.stat().st_mtime
+        if mtime > last_read + 1:
+            return (f"[error] File \'{path}\' has been modified since it was last read "
+                    f"(mtime={mtime:.0f}, last_read={last_read:.0f}). "
+                    f"Use the read tool to reload it before editing.")
+
+        before = p.read_text()
+        buf = before
+        results = []
+        for i, edit in enumerate(edits):
+            old_str = edit.get("old_str", "")
+            new_str = edit.get("new_str", "")
+            if old_str == "":
+                results.append(f"[edit {i+1}] [error: old_str cannot be empty]")
+                results.append(f"[multiedit aborted at edit {i+1} - no changes written]")
+                return "\n".join(results)
+            count = buf.count(old_str)
+            if count == 0:
+                snippet = old_str.strip()
+                snippet = snippet[:80] + ("..." if len(snippet) > 80 else "")
+                results.append(
+                    f"[edit {i+1}] [error: old_str not found] Text not found "
+                    f"(searching against the file state *after* the previous "
+                    f"edits in this same multiedit call, if any).\n"
+                    f"old_str you sent (truncated): {snippet!r}"
+                )
+                results.append(f"[multiedit aborted at edit {i+1} - no changes written]")
+                return "\n".join(results)
+            if count > 1:
+                results.append(f"[edit {i+1}] [error: found {count} times - must be unique]")
+                results.append(f"[multiedit aborted at edit {i+1} - no changes written]")
+                return "\n".join(results)
+            buf = buf.replace(old_str, new_str, 1)
+            results.append(f"[edit {i+1}] ok")
+
+        # Tat ca edit hop le - commit mot lan duy nhat.
+        after = buf
+        p.write_text(after)
+        _file_read_time[resolved] = time.time()
+        _recent_writes.add(resolved)
+        _cache_put(str(p), after, _current_sid)
+        if conn and sid:
+            _undo_stack.append(snapshot_save(
+                conn, sid, resolved, before, after))
+            _redo_stack.clear()
+
+        final_lines = after.splitlines()
+        total = len(final_lines)
+        results.append(f"Applied {len(edits)} edits to {path} ({total} lines total)")
+        snap = _edit_sanity_snap(final_lines, max(0, total // 2))
         if snap:
             results.append(snap)
-    return "\n".join(results)
+        return "\n".join(results)
+    except Exception as e:
+        return f"[error: {e}]"
 
 
 def _anchor_map(lines: list[str], focus_line: int | None = None) -> str:

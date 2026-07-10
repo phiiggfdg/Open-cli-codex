@@ -324,7 +324,7 @@ TOOLS = [
   }},
   {"type":"function","function":{
     "name":"multiedit",
-    "description":"Multiple targeted replacements in one file, one call. Use when changing 2-5 known locations. Each old_str must be unique.",
+    "description":"Multiple targeted replacements in one file, one call. Use when changing 2-5 known locations. Each old_str must be unique. Applied atomically: edits run in order against the file state as it stands after the previous edits in this call, and if ANY edit fails, NONE of them are written - the file is left completely unchanged and you must fix the failing edit and retry the whole call.",
     "parameters":{"type":"object","properties":{
       "path":  {"type":"string"},
       "edits": {"type":"array","description":"List of edits to apply in order","items":{
@@ -353,11 +353,19 @@ TOOLS = [
   }},
   {"type":"function","function":{
     "name":"grep",
-    "description":"Search regex in files. Returns file:line:content.",
+    "description":"Search regex in files. Returns file:line:content. Extended regex syntax (\\d, \\w, (a|b), {2,4}, + ?) all supported.",
     "parameters":{"type":"object","properties":{
-      "pattern":{"type":"string","description":"Regex pattern"},
-      "path":   {"type":"string","description":"File or directory (default: cwd)"},
-      "glob":   {"type":"string","description":"Only files matching this glob e.g. '*.py'"}
+      "pattern":     {"type":"string","description":"Regex pattern (or literal string if fixed_string=true)"},
+      "path":        {"type":"string","description":"File or directory (default: cwd)"},
+      "glob":        {"type":"string","description":"Only files matching this glob e.g. '*.py'"},
+      "ignore_case": {"type":"boolean","description":"Case-insensitive match (like -i)"},
+      "fixed_string":{"type":"boolean","description":"Treat pattern as literal text, not regex (like -F). Use when pattern has unescaped ., (, [, + etc. that should match literally."},
+      "invert":      {"type":"boolean","description":"Return lines that do NOT match (like -v)"},
+      "word":        {"type":"boolean","description":"Match whole words only (like -w), avoids matching inside longer identifiers"},
+      "context":     {"type":"integer","description":"Include N lines of context before/after each match (like -C N)"},
+      "max_count":   {"type":"integer","description":"Stop after N matches per file (like -m N), use for broad/common patterns to avoid huge output"},
+      "files_only":  {"type":"boolean","description":"Only list file paths that contain a match, not the matching lines (like -l)"},
+      "multiline":   {"type":"boolean","description":"Let pattern span multiple lines, e.g. to match a whole block like 'class Foo {...}'. Slower, use only when a single-line grep can't express the match."}
     },"required":["pattern"]}
   }},
   {"type":"function","function":{

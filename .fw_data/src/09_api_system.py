@@ -2260,7 +2260,7 @@ When building or changing a UI:
 - DEPENDENCY CHECK: new import → `grep` project config first. Missing → install via bash before editing.
 
 # Misc
-- Broad grep → `grep -m 50`. No large log reads.
+- Broad grep (common pattern, many expected hits) → set `max_count` (e.g. 50) to cap output. No large log reads.
 - Simplest solution that works — no overengineering.
 
 OS: {os_name}"""
@@ -2438,11 +2438,19 @@ _BASH_READONLY_RE = re.compile(
 )
 
 def _agent_turn_inner(messages, model, api_key, conn, sid, max_steps, agent, state):
-    global _current_agent, _todowrite_calls_this_turn, _current_sid, _large_read_credits
+    global _current_agent, _todowrite_calls_this_turn, _current_sid, _large_read_credits, _task_depth
     _current_agent    = agent
     _current_sid      = sid
     _todowrite_calls_this_turn = 0  # reset hard limit mỗi turn
     _large_read_credits        = 0  # reset large read credits mỗi turn
+    # BUG FIX (đi kèm fix depth-limit của tool_task, 08_undo_dispatch.py):
+    # _task_depth luôn được tool_task tự giảm lại đúng trong finally, nên về
+    # lý thuyết không cần reset ở đây. Nhưng phòng trường hợp bất thường (vd
+    # process bị kill/crash cứng giữa chừng 1 turn trước đó mà không kịp chạy
+    # hết finally — dù hiếm, an toàn hơn vẫn nên reset về 0 ở đầu mỗi turn
+    # MỚI, để 1 lỗi ở turn trước không kẹt sai depth cho các turn sau, làm
+    # subagent hợp lệ bị từ chối oan vì depth "ảo" còn sót lại).
+    _task_depth = 0
 
     # Inject AGENTS.md 1 lần vào đầu conversation (không lặp mỗi turn)
     messages = _inject_agents_md_once(messages)

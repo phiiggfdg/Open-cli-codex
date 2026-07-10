@@ -192,7 +192,29 @@ def tool_glob(pattern, cwd=None):
             return f"[error: {e} | fd also failed: {fd_error}]"
         return f"[error: {e}]"
 
-def tool_grep(pattern, path=None, glob=None):
+def tool_grep(pattern, path=None, glob=None, ignore_case=False, fixed_string=False,
+              invert=False, word=False, context=0, max_count=None, files_only=False,
+              multiline=False):
+    """
+    Search regex (or literal string) in files.
+
+    Tham số bổ sung so với bản gốc (đều optional, default giữ nguyên hành vi cũ):
+      ignore_case  -> -i          : không phân biệt hoa/thường
+      fixed_string -> -F          : coi pattern là chuỗi literal, không phải regex
+                                     (tránh lỗi khi pattern chứa . ( ) [ ] + ? mà
+                                     người dùng KHÔNG có ý định dùng làm regex)
+      invert       -> -v          : trả về các dòng KHÔNG khớp pattern
+      word         -> -w          : chỉ match nguyên từ (word boundary)
+      context      -> -C N        : kèm N dòng trước/sau mỗi match (0 = tắt)
+      max_count    -> -m N        : giới hạn số match mỗi file (tránh output khổng lồ)
+      files_only   -> -l          : chỉ liệt kê đường dẫn file có match, không in nội dung
+      multiline    -> pattern trải nhiều dòng (vd tìm cả một block "class Foo {...}")
+                      rg: --multiline --multiline-dotall
+                      grep fallback: -Pzo (best-effort, cần GNU grep có PCRE)
+
+    Các tham số này CỘNG DỒN — có thể kết hợp tự do, vd:
+      ignore_case=True + word=True + context=2  ~=  grep -iwC2
+    """
     base = _sandbox_resolve_read(path or str(Path.cwd()))
     err = _check_sandbox_read(base)
     if err: return err
@@ -206,6 +228,14 @@ def tool_grep(pattern, path=None, glob=None):
                    "--glob", f"!{FW_DATA_NAME}/**",   # ẩn .fw_data
                    "--glob", "!fw.py"]                 # ẩn fw.py
             if glob: cmd += ["--glob", glob]
+            if ignore_case:  cmd += ["-i"]        # ghi đè --smart-case khi user chủ động yêu cầu
+            if fixed_string: cmd += ["-F"]
+            if invert:       cmd += ["-v"]
+            if word:         cmd += ["-w"]
+            if files_only:   cmd += ["-l"]
+            if context and context > 0: cmd += ["-C", str(context)]
+            if max_count:    cmd += ["-m", str(max_count)]
+            if multiline:    cmd += ["--multiline", "--multiline-dotall"]
             cmd += [pattern, base]
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
             # rg exit code: 0 = có match, 1 = không match (hợp lệ), 2+ = lỗi thật
@@ -217,16 +247,64 @@ def tool_grep(pattern, path=None, glob=None):
             rg_errors.append(f"rg {type(e).__name__}: {e}")
 
     # Fallback to grep
+    # -E: extended regex — bắt buộc để pattern kiểu \w+ (a|b) {2,4} chạy đúng
+    # thay vì rơi vào BRE (Basic Regex) mặc định của grep, nơi các ký tự này
+    # phải escape thủ công và khiến "grep phức tạp" gãy âm thầm hoặc lỗi.
     try:
-        cmd = ["grep", "-rn", "--color=never",
-               f"--exclude-dir={FW_DATA_NAME}",       # ẩn .fw_data
-               "--exclude=fw.py"]                       # ẩn fw.py
-        if glob: cmd += [f"--include={glob}"]
+        if multiline:
+            # BUG FIX: trước đây nhánh này chỉ áp dụng glob/ignore_case rồi
+            # ÂM THẦM BỎ QUA invert/word/files_only/context/max_count — model
+            # gọi grep(..., multiline=True, files_only=True) sẽ tưởng đang lọc
+            # theo file nhưng thực ra nhận về full match content, không có
+            # cảnh báo gì. -z (NUL-separated) khiến các flag này hoặc không
+            # tương thích hoặc đổi hẳn ý nghĩa (vd -v theo "record" NUL chứ
+            # không theo dòng) nên KHÔNG an toàn để tự động dịch — báo lỗi rõ
+            # ràng để người gọi biết mà tách request thay vì nhận kết quả sai.
+            unsupported = []
+            if invert:     unsupported.append("invert")
+            if word:       unsupported.append("word")
+            if files_only: unsupported.append("files_only")
+            if context:    unsupported.append("context")
+            if max_count:  unsupported.append("max_count")
+            if unsupported:
+                return (f"[error: multiline=True cannot be combined with "
+                         f"{', '.join(unsupported)} in this environment (no ripgrep "
+                         f"available, and GNU grep's multiline mode doesn't support "
+                         f"these safely). Run two separate grep calls instead: one "
+                         f"with multiline=True for the block match, one without it "
+                         f"for {', '.join(unsupported)}.]")
+            # GNU grep không có chế độ multiline thật; -Pzo là cách xấp xỉ tốt
+            # nhất mà không cần thêm dependency. Best-effort, không đảm bảo
+            # định dạng output giống hệt chế độ dòng thường.
+            cmd = ["grep", "-rPzo", f"--exclude-dir={FW_DATA_NAME}", "--exclude=fw.py"]
+            if glob: cmd += [f"--include={glob}"]
+            if ignore_case: cmd += ["-i"]
+            # (?s) bật DOTALL cho PCRE: bắt buộc để "." trong pattern match
+            # được cả ký tự newline — thiếu nó thì multiline=True sẽ không
+            # bao giờ khớp qua nhiều dòng dù đã dùng -z (NUL-separated input).
+            pattern = f"(?s){pattern}"
+        else:
+            # -E và -F là hai matcher xung đột (grep từ chối chạy nếu cả hai
+            # cùng có mặt) — chỉ thêm -E khi KHÔNG dùng fixed_string.
+            cmd = ["grep", "-rn", "--color=never",
+                   f"--exclude-dir={FW_DATA_NAME}",       # ẩn .fw_data
+                   "--exclude=fw.py"]                       # ẩn fw.py
+            cmd += ["-F"] if fixed_string else ["-E"]
+            if glob: cmd += [f"--include={glob}"]
+            if ignore_case:  cmd += ["-i"]
+            if invert:       cmd += ["-v"]
+            if word:         cmd += ["-w"]
+            if files_only:   cmd += ["-l"]
+            if context and context > 0: cmd += ["-C", str(context)]
+            if max_count:    cmd += ["-m", str(max_count)]
         cmd += [pattern, base]
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
         # grep exit code: 0 = match, 1 = không match (hợp lệ), 2+ = lỗi thật
         if r.returncode in (0, 1):
-            return r.stdout.strip() or "(no matches)"
+            out = r.stdout.strip()
+            if multiline:
+                out = out.replace("\x00", "\n---\n")
+            return out or "(no matches)"
         err_msg = f"grep exit {r.returncode}: {r.stderr.strip()[:300]}"
         if rg_errors:
             err_msg = f"[error: {err_msg} | rg also failed: {'; '.join(rg_errors)}]"
@@ -326,17 +404,59 @@ def tool_view_symbol(path, symbol):
             end_line = i
             i += 1
     else:
-        # Brace-based: đếm { }
+        # BUG FIX (đã verify bằng test thật với JS/Go): đếm brace thô không
+        # phân biệt string/comment khiến { } giả bên trong "..." hoặc //...
+        # làm depth không bao giờ về 0 đúng lúc → end_line bị kéo dài mất
+        # kiểm soát, có thể nuốt luôn symbol kế tiếp trong file (đã tái hiện:
+        # comment chứa "{" khiến view_symbol('foo') trả về cả block 'bar()'
+        # theo sau). Fix: thêm state machine tối giản nhận biết string (single/
+        # double/backtick quote, có xử lý escape \) và comment (// và /* */)
+        # trước khi đếm brace — không phải parser đầy đủ, nhưng đủ loại bỏ
+        # phần lớn false-positive thực tế mà không cần thêm dependency ngoài
+        # stdlib.
         depth = 0
         found_open = False
+        in_string = None   # None hoặc ký tự quote đang mở ('"', "'", "`")
+        in_block_comment = False
         i = start_line
         while i < len(lines) and i < start_line + 300:
-            for ch in lines[i]:
+            line = lines[i]
+            j = 0
+            n = len(line)
+            while j < n:
+                ch = line[j]
+                if in_block_comment:
+                    if ch == "*" and j + 1 < n and line[j+1] == "/":
+                        in_block_comment = False
+                        j += 2
+                        continue
+                    j += 1
+                    continue
+                if in_string is not None:
+                    if ch == "\\":
+                        j += 2  # bỏ qua ký tự escape kế tiếp (\" \\ v.v.)
+                        continue
+                    if ch == in_string:
+                        in_string = None
+                    j += 1
+                    continue
+                # Không ở trong string/comment — check bắt đầu string/comment mới
+                if ch in ("'", '"', "`"):
+                    in_string = ch
+                    j += 1
+                    continue
+                if ch == "/" and j + 1 < n and line[j+1] == "/":
+                    break  # phần còn lại của dòng là line-comment, bỏ qua
+                if ch == "/" and j + 1 < n and line[j+1] == "*":
+                    in_block_comment = True
+                    j += 2
+                    continue
                 if ch == "{":
                     depth += 1
                     found_open = True
                 elif ch == "}":
                     depth -= 1
+                j += 1
             end_line = i
             if found_open and depth <= 0:
                 break
@@ -380,15 +500,101 @@ _WEBFETCH_STRIP_TAGS = (
 _WEBFETCH_MAIN_TAGS = ("main", "article")
 
 def tool_webfetch(url):
+    # Redirect handler THỦ CÔNG thay vì để urllib tự follow redirect.
+    #
+    # Lý do không dùng urllib.request.urlopen() mặc định: nó tự theo dõi URL
+    # đã thấy trong CHÍNH NÓ, và khi phát hiện lặp lại thì raise thẳng lỗi
+    # "infinite loop" — không cho biết chain redirect thực sự đi qua đâu,
+    # và (quan trọng hơn) không có cách nào can thiệp giữa chừng (vd giữ
+    # cookie, đổi header) trước khi nó quyết định bỏ cuộc.
+    #
+    # Tự viết vòng lặp ở đây cho phép:
+    #   1. Track chính xác chain A → B → C → ... để log/báo lỗi rõ ràng.
+    #   2. Gắn cookiejar CÙNG LOGIC, không phải một lớp "retry" tách rời sau
+    #      khi đã fail — cookie được cập nhật liên tục qua từng bước redirect
+    #      TRƯỚC KHI có cơ hội quay lại URL cũ, nên nếu cookie thực sự phá
+    #      được loop, ta sẽ thấy nó tự thoát trước khi kịp lặp — không phải
+    #      "thử may rủi một lần cuối" sau khi urllib đã báo lỗi.
+    #   3. Không tự lừa dối theo 2 hướng đối lập:
+    #      - Không kết luận "loop thật" chỉ vì thấy 1 URL lặp lại lần 2 —
+    #        cookie mới nhận được ở bước redirect trước đó CÓ THỂ đổi kết
+    #        quả, nên URL được phép ghé lại một lần để kiểm chứng điều đó.
+    #      - Không "thử liều" vô hạn — nếu ghé lại URL này mà tập cookie
+    #        hiện có giống hệt lần ghé trước (tức server không set thêm gì
+    #        mới để đổi kết quả), hoặc URL đã bị ghé từ 2 lần trở lên, đó
+    #        LÀ vòng lặp thật và ta dừng ngay, không fetch thêm lần nào nữa.
+    cj = http.cookiejar.CookieJar()
+    headers = {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+    MAX_REDIRECTS = 10
+
+    def _fetch_no_redirect(u):
+        """Mở URL với opener KHÔNG auto-follow redirect (chặn bằng handler
+        rỗng), trả về (status, response_hoặc_None, headers, error_body)."""
+        class _NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, *a, **kw):
+                return None  # chặn urllib tự nhảy — mình tự xử lý bên ngoài
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(cj), _NoRedirect())
+        req = urllib.request.Request(u, headers=headers)
+        try:
+            resp = opener.open(req, timeout=15)
+            return resp.status, resp, resp.headers, None
+        except urllib.error.HTTPError as e:
+            # Với redirect handler bị chặn, 30x cũng đi vào đây dưới dạng
+            # HTTPError (vì opener không tự resolve được) — đọc header/status
+            # trực tiếp từ exception thay vì coi là lỗi thật.
+            return e.code, None, e.headers, e
+
+    chain = []  # để báo lỗi rõ ràng: A -> B -> C -> A
+    visit_count = {}   # url -> số lần đã ghé, để phân biệt loop thật vs "cần ghé lại nhờ cookie mới"
+    cookie_snapshot_at_visit = {}  # url -> tập cookie tại lần ghé gần nhất
+    current = url
+    resp = None
     try:
-        req = urllib.request.Request(url, headers={
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                          "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept-Language": "en-US,en;q=0.9",
-        })
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            ctype = resp.headers.get("Content-Type", "")
-            raw_bytes = resp.read()
+        for _ in range(MAX_REDIRECTS):
+            n = visit_count.get(current, 0)
+            cookies_now = frozenset((c.name, c.value) for c in cj)
+
+            if n >= 1:
+                # Đã từng ghé URL này. Cho ghé lại LẦN 2 vì có thể cookie mới
+                # (set ở bước redirect trước) sẽ đổi kết quả — đây chính là
+                # trường hợp "cookie phá được loop" cần test kỹ.
+                # Nhưng nếu cookie KHÔNG đổi gì so với lần ghé trước mà vẫn
+                # quay lại đúng URL này lần nữa → chắc chắn là loop thật,
+                # không phải "chưa đủ thông tin", nên dừng ngay tại đây.
+                if n >= 2 or cookie_snapshot_at_visit.get(current) == cookies_now:
+                    chain.append(current)
+                    raise RuntimeError("redirect loop: " + " -> ".join(chain))
+
+            visit_count[current] = n + 1
+            cookie_snapshot_at_visit[current] = cookies_now
+            chain.append(current)
+
+            status, resp, resp_headers, err = _fetch_no_redirect(current)
+
+            if status in (301, 302, 303, 307, 308):
+                loc = resp_headers.get("Location") if resp_headers else None
+                if not loc:
+                    raise urllib.error.HTTPError(current, status, "redirect with no Location header", resp_headers, None)
+                current = urllib.parse.urljoin(current, loc)
+                continue
+
+            if status and 200 <= status < 300:
+                ctype = resp_headers.get("Content-Type", "") if resp_headers else ""
+                raw_bytes = resp.read()
+                break
+
+            # Lỗi thật (4xx/5xx) — không phải redirect, ném lên như HTTPError bình thường.
+            if err is not None:
+                raise err
+            raise RuntimeError(f"unexpected status {status} with no response body")
+        else:
+            raise RuntimeError("redirect loop: too many redirects (" + " -> ".join(chain) + " -> ...)")
 
         # Không phải HTML/text (pdf, image, binary...) — báo rõ thay vì trả rác nhị phân.
         if ctype and not any(t in ctype for t in ("text/html", "text/plain", "application/xhtml", "xml")):
@@ -432,6 +638,12 @@ def tool_webfetch(url):
         if len(raw) > LIMIT:
             raw = raw[:LIMIT] + f"\n\n... [truncated, {len(raw) - LIMIT} more chars — refine query or fetch specific section]"
         return raw
+    except RuntimeError as e:
+        if "redirect loop" in str(e):
+            return (f"[error: {e} — this is a genuine redirect loop the server keeps making "
+                     f"(not something cookies/headers here could fix). Try a different URL for "
+                     f"this page, e.g. search for it and use the search result link.]")
+        return f"[error: {e}]"
     except urllib.error.HTTPError as e:
         return f"[error: HTTP {e.code} {e.reason}]"
     except urllib.error.URLError as e:
@@ -439,10 +651,37 @@ def tool_webfetch(url):
     except Exception as e:
         return f"[error: {e}]"
 
+
+
 def tool_websearch(query, num=5):
     """SearXNG HTML scrape (multi-instance fallback) — fallback to DuckDuckGo HTML scrape."""
     import urllib.parse
     errors = []  # thu thập lỗi từng nhánh để debug khi cả 2 fail
+
+    # BUG FIX (nhẹ, off-by-one): trước đây `int(num)` được gọi rải rác ở 6 nơi
+    # khác nhau trong hàm (`len(results) >= int(num)`), mỗi lần convert lại từ
+    # đầu — không có 1 điểm chuẩn hóa duy nhất. Hệ quả xác nhận bằng test
+    # thật: check `len(results) >= int(num)` chạy SAU khi đã append kết quả
+    # vào `results`, nên khi `num=0` (hoặc âm), vòng lặp vẫn append 1 kết quả
+    # trước khi kiểm tra điều kiện dừng — `len(results) >= 0` đúng ngay ở kết
+    # quả ĐẦU TIÊN đã có, trả về 1 kết quả thay vì đúng 0 như tham số yêu cầu.
+    # Không phải lỗ hổng bảo mật (không đọc/ghi file, chỉ ảnh hưởng số lượng
+    # kết quả trả về), nhưng là behavior sai so với tham số. Input `num` sai
+    # type hoàn toàn (chuỗi không phải số, None) không crash — bị nuốt bởi
+    # `except Exception` broad-catch trong từng vòng lặp instance, âm thầm
+    # rơi về "(no results)" khiến model không biết `num` bị bỏ qua vì sao.
+    #
+    # Fix: chuẩn hóa `num` một lần duy nhất tại đây — ép về int an toàn (mặc
+    # định 5 nếu không convert được), clamp tối thiểu 1 (loại bỏ hẳn trường
+    # hợp num<=0 gây off-by-one), và giới hạn tối đa hợp lý (20) để tránh
+    # việc model truyền số quá lớn khiến vòng lặp regex quét toàn bộ HTML dài
+    # không cần thiết. Toàn bộ 6 chỗ dùng `int(num)` bên dưới đổi sang dùng
+    # biến `num` đã chuẩn hóa này (nay là `len(results) >= num`).
+    try:
+        num = int(num)
+    except (TypeError, ValueError):
+        num = 5
+    num = max(1, min(num, 20))
 
     # ── Nhánh 1: SearXNG public instances — scrape HTML ──────────────────────
     # JSON API bị tắt trên hầu hết public instance nên scrape HTML.
@@ -492,7 +731,7 @@ def tool_websearch(query, num=5):
                     seen_urls.add(url_r)
                     results.append(f"**{title}**\n{url_r}\n{snippet}" if snippet
                                    else f"**{title}**\n{url_r}")
-                if len(results) >= int(num):
+                if len(results) >= num:
                     break
 
             # Fallback pattern nếu markup khác: tìm link h3 trực tiếp
@@ -506,7 +745,7 @@ def tool_websearch(query, num=5):
                     if url_r not in seen_urls and title and len(title) > 5:
                         seen_urls.add(url_r)
                         results.append(f"**{title}**\n{url_r}")
-                    if len(results) >= int(num):
+                    if len(results) >= num:
                         break
 
             if results:
@@ -551,7 +790,7 @@ def tool_websearch(query, num=5):
             if url_r not in seen_urls and url_r.startswith("http"):
                 seen_urls.add(url_r)
                 results.append(f"**{title}**\n{url_r}\n{snippet}")
-            if len(results) >= int(num):
+            if len(results) >= num:
                 break
 
         # Pattern B: markup mới — block result giới hạn 2000 chars tránh greedy
@@ -568,7 +807,7 @@ def tool_websearch(query, num=5):
                 if url_r not in seen_urls and title:
                     seen_urls.add(url_r)
                     results.append(f"**{title}**\n{url_r}\n{snippet}")
-                if len(results) >= int(num):
+                if len(results) >= num:
                     break
 
         # Pattern C: uddg= redirect links — robust nhất khi markup thay đổi
@@ -596,7 +835,7 @@ def tool_websearch(query, num=5):
                 if url_r not in seen_urls and not _is_junk_result(url_r):
                     seen_urls.add(url_r)
                     results.append(f"**{title}**\n{url_r}")
-                if len(results) >= int(num):
+                if len(results) >= num:
                     break
             # fallback: chỉ URL nếu vẫn không có title
             if not results:
@@ -605,7 +844,7 @@ def tool_websearch(query, num=5):
                     if url_r not in seen_urls and not _is_junk_result(url_r):
                         seen_urls.add(url_r)
                         results.append(url_r)
-                    if len(results) >= int(num):
+                    if len(results) >= num:
                         break
 
         if results:
@@ -639,6 +878,54 @@ def _todos_init(conn, sid):
 
 def tool_todowrite(todos):
     global _todos, _todowrite_calls_this_turn
+    # BUG FIX (nghiêm trọng): trước đây hàm này KHÔNG validate schema/type của
+    # `todos` (dữ liệu từ model, chưa đáng tin) TRƯỚC KHI dùng — side-effect
+    # (_todos = todos đè global; todos_save() ghi thẳng xuống DB;
+    # _todowrite_calls_this_turn += 1 tiêu hạn mức 1 lần/turn) đều chạy TRƯỚC
+    # vòng lặp build `lines` hiển thị, nơi crash thật xảy ra nếu 1 item thiếu
+    # field hoặc `todos` sai type. Xác nhận bằng test thật (không suy đoán):
+    #   - Item thiếu 'id'/'content'/'status'/'priority' → KeyError. Exception
+    #     này bị _dispatch_tool's `except KeyError` bắt, nhưng trả về thông
+    #     báo GÂY HIỂU LẦM ("missing required arg 'id' for tool 'todowrite'")
+    #     như thể tham số cấp cao thiếu — trong khi thực ra `todos` đã nhận đủ
+    #     và ĐÃ ghi xuống DB một bản ghi partial với ID tự sinh không phải cái
+    #     model định đặt. Hạn mức turn cũng đã bị tiêu, agent kẹt không sửa
+    #     lại được trong suốt phần còn lại của turn.
+    #   - `todos` sai type hoàn toàn (string, None, list chứa non-dict item)
+    #     → AttributeError/TypeError — KHÔNG bị bắt ở BẤT KỲ tầng nào trong
+    #     toàn bộ pipeline (_dispatch_tool chỉ bắt KeyError; run_tool không
+    #     bọc gì; agent_turn chỉ bắt KeyboardInterrupt; main()/fw.py không có
+    #     try/except tổng ở entry point) — exception lan tới tận main(),
+    #     LÀM SẬP TOÀN BỘ TIẾN TRÌNH, ảnh hưởng mọi session khác đang chạy
+    #     chung process (agent_turn chạy trên main thread chung dù WS server
+    #     có thread serve riêng — xem 12_web.py).
+    #
+    # Fix: validate TOÀN BỘ schema trước khi có bất kỳ side-effect nào (không
+    # đè _todos, không ghi DB, không tăng hạn mức) — nếu invalid, trả lỗi rõ
+    # ràng ngay, để model tự sửa mà KHÔNG mất hạn mức 1 lần/turn và KHÔNG có
+    # dữ liệu lỗi/partial nào bị ghi xuống DB.
+    if not isinstance(todos, list):
+        return (f"[error: 'todos' must be a list of todo items, got {type(todos).__name__}. "
+                f"No changes made — todo list and turn quota unaffected.]")
+    _REQUIRED_FIELDS = ("id", "content", "status", "priority")
+    _VALID_STATUS   = ("pending", "in_progress", "completed")
+    _VALID_PRIORITY = ("high", "medium", "low")
+    for i, t in enumerate(todos):
+        if not isinstance(t, dict):
+            return (f"[error: todos[{i}] must be an object with fields "
+                    f"{_REQUIRED_FIELDS}, got {type(t).__name__}. No changes made.]")
+        missing = [f for f in _REQUIRED_FIELDS if f not in t]
+        if missing:
+            return (f"[error: todos[{i}] missing required field(s): {missing}. "
+                    f"Each todo item needs {_REQUIRED_FIELDS}. No changes made — "
+                    f"todo list and turn quota unaffected.]")
+        if t["status"] not in _VALID_STATUS:
+            return (f"[error: todos[{i}]['status'] = {t['status']!r} is invalid. "
+                    f"Must be one of {_VALID_STATUS}. No changes made.]")
+        if t["priority"] not in _VALID_PRIORITY:
+            return (f"[error: todos[{i}]['priority'] = {t['priority']!r} is invalid. "
+                    f"Must be one of {_VALID_PRIORITY}. No changes made.]")
+
     if _todowrite_calls_this_turn >= 1:
         return "todowrite skipped (limit 1/turn reached — batch updates at major milestones only)"
     _todowrite_calls_this_turn += 1
@@ -687,17 +974,49 @@ def tool_question(question, options=None, state=None):
     ngoài luồng agent, hiếm) -> giữ nguyên input() cũ.
     """
     if state is not None:
-        if options and isinstance(options, list):
-            options = [o.strip() for o in options if isinstance(o, str) and o.strip()]
-        if options:
-            ans = state.ask(
-                prompt=question,
-                kind="choice",
-                default=options[0] if options else None,
-                extra={"options": options},
-            )
-        else:
-            ans = state.ask(prompt=question, kind="text", default=None)
+        # BUG FIX: nhánh này gọi state.ask(...) mà KHÔNG có try/except nào
+        # bao quanh (khác hẳn nhánh CLI bên dưới, có bọc
+        # `except (EOFError, KeyboardInterrupt)`), và KHÔNG truyền timeout —
+        # PendingAsk.wait(timeout=None) (01d_events.py) block VÔ THỜI HẠN
+        # nếu không ai .resolve(). make_web_ask_handler chỉ tự resolve
+        # default khi send_json() fail NGAY LÚC GỬI câu hỏi; nếu gửi thành
+        # công rồi user ĐÓNG TAB TRƯỚC KHI trả lời, không có cơ chế nào tự
+        # resolve pending đó — _unsubscribe_from() (12_web.py, chạy trong
+        # finally của WS handler khi đóng connection) chỉ gỡ handler khỏi
+        # bus cho các lần ask() SAU NÀY, không giải phóng pending.wait() đang
+        # treo NGAY LÚC ĐÓ. Nếu đúng lúc web đang armed (khóa CLI,
+        # cli_ask_handler tự return sớm nhường quyền), không còn ai có thể
+        # resolve → agent_turn treo vĩnh viễn, giữ luôn state.lock của session
+        # (chỉ 1 turn/session tại 1 thời điểm) — session đó không xử lý được
+        # message mới nào nữa cho tới khi restart process. Xác nhận qua đọc
+        # trace đầy đủ 4 lớp (tool_question → state.ask → EventBus.ask →
+        # PendingAsk.wait), chưa dựng WS thật để đo trực tiếp (cần mô phỏng
+        # WS server/client thật) nhưng logic đã đủ rõ ràng qua trace.
+        #
+        # Fix: timeout an toàn RẤT DÀI (không phá UX chờ trả lời thật — user
+        # thường cần thời gian suy nghĩ) nhưng KHÔNG VÔ HẠN, để 1 tab bị đóng
+        # dở không kẹt cứng session mãi mãi; PendingAsk.wait(timeout) tự trả
+        # về `default` khi hết giờ (xem 01d_events.py, không raise gì) nên
+        # agent_turn được giải phóng thay vì treo. Bọc thêm try/except đối
+        # xứng với nhánh CLI, phòng trường hợp state.ask() raise bất thường
+        # (vd lỗi nội bộ EventBus) — không để 1 lỗi hỏi-đáp làm sập cả turn.
+        _ASK_TIMEOUT_SECONDS = 1800  # 30 phút — đủ dài cho người thật suy nghĩ, không vô hạn
+        try:
+            if options and isinstance(options, list):
+                options = [o.strip() for o in options if isinstance(o, str) and o.strip()]
+            if options:
+                ans = state.ask(
+                    prompt=question,
+                    kind="choice",
+                    default=options[0] if options else None,
+                    timeout=_ASK_TIMEOUT_SECONDS,
+                    extra={"options": options},
+                )
+            else:
+                ans = state.ask(prompt=question, kind="text", default=None,
+                                 timeout=_ASK_TIMEOUT_SECONDS)
+        except Exception as e:
+            return f"[question error: {e} — treated as no answer]"
         ans = (ans or "").strip()
         return ans if ans else "(no answer)"
 
@@ -745,7 +1064,12 @@ def tool_skill(name):
             # thật: tool_skill("../../../secret_skill_test") đọc được file
             # ngoài SKILLS_DIRS. Giờ chặn bằng cách kiểm tra path đã resolve
             # còn nằm trong skills_dir hay không, cùng pattern _inside_base()
-            # đã dùng ở tool_glob.
+            # đã dùng ở tool_glob. Verify lại (phiên rà sau): guard này chặn
+            # đúng cả traversal trực tiếp lẫn symlink trỏ ra ngoài skills_dir
+            # (test thật: symlink trong skills_dir trỏ ra thư mục/file ngoài
+            # đều bị .resolve().relative_to() loại đúng, không đọc được nội
+            # dung) — comment gốc mô tả đúng thực tế, đã verify không phải
+            # bug giả.
             try:
                 p.resolve().relative_to(skills_dir_resolved)
             except ValueError:
@@ -753,15 +1077,40 @@ def tool_skill(name):
             if p.exists() and p.is_file():
                 try:
                     content = p.read_text()
-                    print(f"  {DIM}[skill] Loaded: {p}{R}")
+                    # BUG FIX: cùng bug-class đã fix ở tool_todowrite/
+                    # tool_question/tool_verify (print() trần, tách biệt
+                    # hoàn toàn khỏi EventBus) nhưng bị bỏ sót ở tool_skill —
+                    # dòng "Loaded: ..." chỉ hiện trên CLI thật, không bao
+                    # giờ tới web UI. Dùng current_state()/emit cùng pattern.
+                    _txt = f"  {DIM}[skill] Loaded: {p}{R}"
+                    _st = current_state()
+                    if _st is not None:
+                        _st.emit(EV_INFO, text=_txt, raw=True)
+                    else:
+                        print(_txt)
                     return content
                 except Exception as e:
                     return f"[error reading skill: {e}]"
     # List available skills
+    # BUG FIX: nhánh liệt kê này trước đây KHÔNG áp cùng guard traversal như
+    # nhánh đọc nội dung ở trên — sd.rglob("*.md") liệt kê TẤT CẢ file .md
+    # tìm thấy, kể cả khi đó là 1 symlink trỏ RA NGOÀI skills_dir. Test tái
+    # hiện thật: tạo symlink "evil_link2.md" trong skills_dir trỏ tới file bí
+    # mật ngoài skills_dir → dù KHÔNG đọc được NỘI DUNG (guard ở nhánh đọc
+    # vẫn chặn đúng), TÊN "evil_link2" vẫn xuất hiện trong gợi ý
+    # "Available: ..." — rò rỉ thông tin nhỏ (biết tên 1 symlink tồn tại,
+    # không phải nội dung bí mật). Fix: áp cùng guard traversal khi liệt kê,
+    # bỏ qua file nào resolve ra ngoài skills_dir_resolved, nhất quán với
+    # nhánh đọc nội dung.
     available = []
     for sd in SKILLS_DIRS:
         if sd.exists():
+            sd_resolved = sd.resolve()
             for f in sd.rglob("*.md"):
+                try:
+                    f.resolve().relative_to(sd_resolved)
+                except ValueError:
+                    continue  # symlink/entry trỏ ra ngoài skills_dir — không liệt kê tên
                 # Skill dạng thư mục (name/SKILL.md) → hiện tên thư mục, không phải "SKILL"
                 available.append(f.parent.name if f.stem.upper() == "SKILL" else f.stem)
     hint = f"Available: {', '.join(available)}" if available else f"No skills found in {SKILLS_DIRS}"
@@ -801,8 +1150,40 @@ def tool_verify(path: str, reason: str = "") -> str:
         except (EOFError, KeyboardInterrupt):
             return "verification skipped"
     if ans in ("y", "yes"):
-        # Resolve qua sandbox giống mọi tool khác (write/edit/read/extract...)
-        p = _resolve_to_sandbox(path)
+        # BUG FIX: trước đây gọi thẳng `p = _resolve_to_sandbox(path)` — hàm
+        # này gọi _ensure_project_dir() bên trong, có side-effect VĨNH VIỄN
+        # flip _project_dir_is_placeholder: True→False, VÔ ĐIỀU KIỆN, bất kể
+        # sau đó có đọc được gì hay không. Test tái hiện thật: agent đang ở
+        # placeholder mode, đọc thành công 1 file NGOÀI project (kịch bản tự
+        # nhiên: user bảo agent làm việc trên project có sẵn ở path khác).
+        # Chỉ cần gọi tool_verify() trên 1 path KHÔNG LIÊN QUAN và KHÔNG TỒN
+        # TẠI (vd gõ nhầm tên khi verify build artifact) — verify thất bại
+        # hoàn toàn ("[verify] not found: ...") nhưng sandbox đã bị enforce
+        # ngay từ dòng resolve, khiến agent MẤT VĨNH VIỄN quyền đọc file
+        # ngoài project đã đọc được trước đó, dù chưa có gì thay đổi trên đĩa
+        # và verify chẳng thành công gì cả. Đây đúng cùng root cause với bug
+        # đã fix ở tool_write (phiên 3) nhưng bị bỏ sót ở tool_verify.
+        #
+        # Fix: verify là thao tác THUẦN ĐỌC, không bao giờ cần kích hoạt
+        # enforce sandbox — copy đúng pattern auto-redirect của tool_read:
+        # chỉ redirect vào sandbox khi sandbox ĐÃ enforce từ trước (không tự
+        # kích hoạt lần đầu), và chỉ khi path redirect thực sự tồn tại ở đó.
+        # Sau đó luôn qua _check_sandbox_read() (không có side-effect) để
+        # chặn đọc ngoài sandbox khi đã enforce — đúng gate mà tool_read bắt
+        # buộc phải qua, tool_verify trước đây hoàn toàn bỏ qua gate này.
+        vpath = path
+        if _project_dir is not None and not _project_dir_is_placeholder:
+            resolved_p = Path(vpath).expanduser()
+            try:
+                resolved_p.resolve().relative_to(_project_dir.resolve())
+            except ValueError:
+                sandbox_p = _resolve_to_sandbox(vpath)
+                if sandbox_p.exists():
+                    vpath = str(sandbox_p)
+        err = _check_sandbox_read(vpath)
+        if err:
+            return err
+        p = Path(vpath).expanduser()
         if p.is_dir():
             return tool_read(str(p), depth=2)
         elif p.is_file():
@@ -1006,7 +1387,14 @@ def tool_lsp(operation, file=None, line=None, character=None, query=None):
         # Grep fallback across project (cũng dùng khi không truyền file).
         # Thử cả "def name" (function/method) lẫn "class name" — trước đây
         # chỉ thử "def" nên không tìm được class definition qua fallback.
-        search_root = Path(file).parent.name if file else "."
+        # BUG FIX (đã verify bằng test thật): trước đây dùng
+        # Path(file).parent.name — chỉ lấy BASENAME của thư mục cha (vd "src"),
+        # không phải path đầy đủ (vd "/project/src"). Khi truyền vào tool_grep
+        # như search root, nó bị resolve theo cwd hiện tại chứ không phải thư
+        # mục cha thật của file — nếu không có thư mục cùng tên ở cwd thì grep
+        # fail/không tìm thấy gì, còn nếu tình cờ có thư mục trùng tên khác thì
+        # tìm nhầm chỗ hoàn toàn. Fix: dùng str(Path(file).parent) (full path).
+        search_root = str(Path(file).parent) if file else "."
         result = tool_grep(f"def {name}", search_root or ".")
         if "(no matches)" in result:
             result = tool_grep(f"class {name}", search_root or ".")

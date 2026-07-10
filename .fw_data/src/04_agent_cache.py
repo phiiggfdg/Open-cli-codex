@@ -384,7 +384,17 @@ def _cache_invalidate(path: str):
     """
     Xoá cache khi file bị xoá hoặc external-modified.
     Hash check: đọc content thật → so hash — chính xác hơn mtime trên Termux/Android.
-    Fallback về mtime nếu file lớn (tránh đọc file MB chỉ để check).
+
+    BUG FIX (đã verify bằng test thật, không phải lý thuyết): bản cũ có
+    "fast path" skip hash check nếu real_mtime <= cached_mtime + 1, với lý do
+    tránh đọc file không cần thiết. Nhưng điều này tạo ra cửa sổ race 1 GIÂY
+    TRÊN MỌI FILESYSTEM (không riêng Android FAT32) — nếu process khác/user
+    tự sửa file trong vòng 1s sau khi agent write/edit, mtime mới vẫn nằm
+    trong ngưỡng "chưa đổi" nên hash check bị bỏ qua hoàn toàn, và tool_read
+    sau đó im lặng trả về NỘI DUNG CŨ từ cache dù disk đã khác. Test tái hiện
+    được cả khi KHÔNG ép mtime giả tạo, chỉ cần ghi đè file cùng giây.
+    Fix: bỏ fast-path, luôn hash-check. Chi phí chấp nhận được vì _content_hash
+    đã tự sample 4KB đầu+cuối cho file >50KB, không đọc toàn bộ file lớn.
     """
     key = str(Path(path).expanduser().resolve())
     if key not in _file_cache:
@@ -396,28 +406,26 @@ def _cache_invalidate(path: str):
         return
     try:
         cached_hash  = _file_cache[key].get("hash", "")
-        cached_mtime = _file_cache[key]["mtime"]
         real_mtime   = p.stat().st_mtime
 
-        # Fast path: mtime chưa đổi → skip hash (tránh đọc file không cần thiết)
-        if real_mtime <= cached_mtime + 1:
+        if not cached_hash:
+            # Không có hash để so (cache cũ từ trước khi có field này) —
+            # fallback về mtime, an toàn hơn hash rỗng.
+            cached_mtime = _file_cache[key]["mtime"]
+            if real_mtime > cached_mtime + 1:
+                _cache_log("-", key, "mtime changed, no hash to verify")
+                _file_cache.pop(key, None)
             return
 
-        # mtime đổi → kiểm tra hash để phân biệt:
-        # (a) agent tự ghi (mtime mới nhưng hash vẫn đúng) → giữ cache
-        # (b) external edit (hash khác) → drop cache
-        if cached_hash:
-            # Sample hash handle được cả file lớn — không cần giới hạn size
-            real_content = p.read_text(errors="replace")
-            real_hash    = _content_hash(real_content)
-            if real_hash == cached_hash:
-                # Hash khớp — chỉ mtime drift (Android FAT32 resolution thấp)
-                _file_cache[key]["mtime"] = real_mtime  # sync lại mtime
-                return
-            _cache_log("-", key, f"external edit detected (hash {cached_hash} → {real_hash})")
-        else:
-            _cache_log("-", key, "mtime changed, no hash")
+        real_content = p.read_text(errors="replace")
+        real_hash    = _content_hash(real_content)
+        if real_hash == cached_hash:
+            # Hash khớp — nội dung thật không đổi, chỉ mtime có thể drift
+            # (Android FAT32 resolution thấp, hoặc agent tự write lại y hệt).
+            _file_cache[key]["mtime"] = real_mtime
+            return
 
+        _cache_log("-", key, f"external edit detected (hash {cached_hash} → {real_hash})")
         _file_cache.pop(key, None)
 
     except Exception as e:

@@ -121,6 +121,19 @@ def tool_apply_patch(path, patch, conn=None, sid=None):
                 return f"Patch applied to {path}\n" + _patch_snippet(after, patch)
             # patch binary fail (thường do context lệch nhẹ) — không bỏ cuộc
             # ngay, thử fallback manual parser bên dưới trước khi báo lỗi.
+            # `patch` ghi từng hunk xuống đĩa ngay khi apply, không transaction.
+            # Nếu hunk sau FAILED, file trên đĩa có thể đã bị sửa dở dang bởi
+            # các hunk trước dù cả lệnh coi là fail. Phải restore về `before`
+            # ngay ở đây để fallback (và nhánh lỗi cuối) luôn xuất phát từ
+            # trạng thái gốc sạch — giữ tính all-or-nothing của apply_patch.
+            if p.read_text() != before:
+                p.write_text(before)
+            rej_path = p.with_name(p.name + ".rej")
+            if rej_path.exists():
+                try:
+                    rej_path.unlink()
+                except OSError:
+                    pass
             patch_errors.append(f"system patch: {result.stderr.strip()[:300]}")
 
         # Fallback: manual hunk parser (string-replace theo nội dung hunk,
@@ -172,22 +185,60 @@ def tool_apply_patch(path, patch, conn=None, sid=None):
         return f"[error: {e}]"
 
 
+_task_depth: int = 0       # số tầng subagent đang lồng nhau (0 = main agent, chưa vào subagent nào)
+_TASK_MAX_DEPTH = 2        # tối đa 2 tầng lồng nhau: subagent cấp 1, và subagent-của-subagent cấp 2
+
 def tool_task(description, tools=None, model=None, api_key=None, conn=None, sid=None, state=None):
     """
     Subagent: chạy một mini agentic loop độc lập.
     Kết quả trả về là text output của subagent.
     """
+    global _task_depth
+    # BUG FIX (nghiêm trọng — unbounded recursive subagent spawning):
+    # `allowed.discard("task")` (fix cũ, giữ nguyên bên dưới) chỉ ẩn schema
+    # "task" khỏi tools list gửi lên API cho subagent — đây là biện pháp
+    # "gợi ý mềm" ở tầng REQUEST, không phải rào chắn ở tầng THỰC THI. Xác
+    # nhận bằng test mô phỏng thật: nếu 1 tool_call tên "task" đến được
+    # _dispatch_tool() bằng bất kỳ cách nào khác — quan trọng nhất là model
+    # HALLUCINATE 1 tool_call ngoài schema đã cho (hiện tượng có thật với
+    # LLM, nhất là context dài/model yếu) — tool_task() vẫn chạy đệ quy
+    # KHÔNG GIỚI HẠN số tầng, mỗi tầng tự giới hạn 10 steps riêng nhưng
+    # không giới hạn được SỐ TẦNG lồng nhau. Grep xác nhận toàn bộ 17 module
+    # không có bất kỳ biến depth-tracking nào (task_depth/_task_nesting/...).
+    # Permission mặc định "task": PERM_ALLOW nên cũng không có lớp chặn nào
+    # khác bù đắp — worst case: bùng nổ API call theo cấp số nhân, giới hạn
+    # duy nhất còn lại là timeout/rate-limit từ bên ngoài (API provider),
+    # không phải cơ chế nội tại của chương trình.
+    #
+    # Fix: rào chắn CỨNG ngay tại tầng thực thi (tool_task tự đếm chính nó),
+    # không phụ thuộc việc ẩn schema — nên chặn được cả đường hallucination.
+    # _task_depth là global dùng chung cho mọi cấp lồng nhau trong CÙNG 1
+    # agent_turn (namespace chung, xem kiến trúc exec() 1 chỗ ở fw.py) —
+    # tăng ngay khi vào hàm, LUÔN giảm lại trong finally (kể cả exception)
+    # để không "rò rỉ" depth qua các lần gọi task không lồng nhau sau đó.
+    if _task_depth >= _TASK_MAX_DEPTH:
+        return (f"[task denied: subagent nesting depth limit ({_TASK_MAX_DEPTH}) reached — "
+                f"a subagent cannot spawn another nested subagent beyond this depth. "
+                f"This is a hard safety limit, not a hint the model can negotiate around.")
+    _task_depth += 1
+    try:
+        return _tool_task_inner(description, tools, model, api_key, conn, sid, state)
+    finally:
+        _task_depth -= 1
+
+
+def _tool_task_inner(description, tools=None, model=None, api_key=None, conn=None, sid=None, state=None):
     _DEFAULT_SUB_TOOLS = {"bash","read","write","edit","glob","grep","webfetch","websearch","todoread"}
     allowed = set(tools) if tools else _DEFAULT_SUB_TOOLS
     # FIX: "task" không bao giờ được phép trong tool set của subagent, kể cả
     # nếu model chủ động truyền tools=["task", ...]. Trước đây không có check
     # này — xác nhận bằng chạy code thật: allowed=set(["task","bash"]) khiến
     # sub_tools chứa thẳng schema "task", cho phép subagent tự gọi lại
-    # tool_task() qua _dispatch_tool() bên dưới. Không có giới hạn depth nào
-    # khác trong toàn bộ codebase (đã grep xác nhận), nên đây là đệ quy không
-    # giới hạn: subagent cấp 1 spawn subagent cấp 2 spawn cấp 3... mỗi cấp tối
-    # đa 10 steps, worst case bùng nổ số lượng API call theo cấp số nhân
-    # trước khi bị chặn bởi bất kỳ cơ chế nào khác (timeout/token/rate-limit).
+    # tool_task() qua _dispatch_tool() bên dưới. Đây vẫn là lớp phòng thủ hợp
+    # lệ (giảm khả năng model CHỦ ĐỘNG chọn gọi lại "task"), nhưng KHÔNG còn
+    # là lớp chặn DUY NHẤT nữa — xem depth-limit cứng ở tool_task() phía trên,
+    # vốn chặn được cả trường hợp hallucination ngoài schema mà cách ẩn
+    # schema này không thể chặn.
     allowed.discard("task")
     sub_tools = [t for t in get_active_tools() if t["function"]["name"] in allowed]
 
@@ -567,7 +618,11 @@ def _dispatch_tool(name, args, model, api_key, conn, sid, state=None):
         "edit":        lambda a: tool_edit(a["path"], a["old_str"], a["new_str"], conn, sid),
         "multiedit":   lambda a: tool_multiedit(a["path"], a["edits"], conn, sid),
         "glob":        lambda a: tool_glob(a["pattern"], a.get("cwd")),
-        "grep":        lambda a: tool_grep(a["pattern"], a.get("path"), a.get("glob")),
+        "grep":        lambda a: tool_grep(a["pattern"], a.get("path"), a.get("glob"),
+                                           a.get("ignore_case", False), a.get("fixed_string", False),
+                                           a.get("invert", False), a.get("word", False),
+                                           a.get("context", 0), a.get("max_count"),
+                                           a.get("files_only", False), a.get("multiline", False)),
         "webfetch":    lambda a: tool_webfetch(a["url"]),
         "websearch":   lambda a: tool_websearch(a["query"], a.get("num",5)),
         "todowrite":   lambda a: tool_todowrite(a["todos"]),
