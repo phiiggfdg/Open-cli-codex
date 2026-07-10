@@ -324,6 +324,24 @@ def cli_ask_handler(pending: PendingAsk):
             ans = input(f"  {CYAN}Allow? [y/N/a(ll)]: {R}").strip().lower()
         elif pending.kind == "confirm":
             ans = input(f"  {CYAN}{pending.prompt}{R}").strip().lower()
+        elif pending.kind == "choice":
+            # BUG FIX: nhánh này trước đây rơi vào `else` cuối, chỉ in
+            # pending.prompt rồi input() tự do — KHÔNG hiển thị
+            # pending.extra["options"] (vd tool_question có options list).
+            # Hậu quả: user thấy câu hỏi nhưng không biết gõ số nào để
+            # chọn, không rõ cách trả lời -- đúng hiện tượng "có option
+            # nhưng vẫn không hiện" đã gặp thật. Sửa: in danh sách options
+            # đánh số, cho phép gõ số (map ra option đó) HOẶC gõ thẳng text
+            # option / free text (fallback), giữ tương thích ngược.
+            print(f"  {CYAN}{pending.prompt}{R}")
+            options = pending.extra.get("options") or []
+            for i, opt in enumerate(options, 1):
+                print(f"    {DIM}{i}.{R} {opt}")
+            raw = input(f"  {CYAN}Chọn số hoặc gõ trực tiếp: {R}").strip()
+            if raw.isdigit() and 1 <= int(raw) <= len(options):
+                ans = options[int(raw) - 1]
+            else:
+                ans = raw
         else:
             ans = input(f"{CYAN}{pending.prompt}{R}").strip()
     except (EOFError, KeyboardInterrupt):

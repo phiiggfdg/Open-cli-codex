@@ -2254,7 +2254,7 @@ When building or changing a UI:
 - `task`: isolated subagent for long parallel work. Has its OWN context. Send: [description + file paths + output format]. Never use for files main agent is editing.
 - `lsp`: local code intelligence; references scans workspace using Python AST where possible and regex fallback elsewhere.
 - `verify`: visually confirm output after edits, or when there's a concrete reason to doubt actual file state. See "Full re-read after edit = still forbidden for confirmation purposes" in Execution model.
-- `skill`: load SKILL.md by name for unfamiliar domains.
+- `skill`: load SKILL.md by name for unfamiliar domains. Available: `spec-driven` — use it before broad/ambiguous-scope edits (see AGENTS.md).
 - `bash` fails → see Anti-loop for retry/stop logic.
 - DEPENDENCY CHECK: new import → `grep` project config first to see if it's already available. Missing → prefer a no-new-dependency solution if reasonable; if a new package is truly needed, state the package + why existing options are insufficient + what manifest/lockfile it touches, then `question` before installing. Do not auto-install.
 
