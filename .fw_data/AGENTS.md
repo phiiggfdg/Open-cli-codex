@@ -15,7 +15,7 @@ Tự hỏi: "Senior engineer có nói cái này overcomplicated không?" Nếu c
 
 - Sửa đúng file theo module map — không đặt logic vào sai layer.
 - Biến global dùng chung → khai báo ở module phù hợp nhất, không tạo bản sao.
-- Thêm feature mới → hỏi trước nếu ảnh hưởng >2 module.
+- Thêm feature mới → hỏi trước nếu ảnh hưởng nhiều module, hoặc chạm vào phần nhạy cảm (auth, payment, migration, config production, CI/CD) dù chỉ 1 module — số module chỉ là tín hiệu tham khảo, không phải ngưỡng quyết định.
 - Task lớn hoặc mơ hồ về cách làm/phạm vi → `skill("spec-driven")` trước khi sửa code diện rộng.
 
 ## Môi trường: Termux / Android
