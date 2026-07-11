@@ -79,29 +79,113 @@ def _pool_config_key(prov_key: str | None = None) -> str:
 
 def _pool_load(prov_key: str | None = None) -> list[dict]:
     """
-    Load pool của 1 provider. Nếu chưa có pool nhưng có key đơn legacy,
-    tự tạo pool 1 phần tử từ key đó (migrate ngầm, không ghi file cho tới
-    khi thật sự cần — tránh side-effect khi chỉ đọc).
-    """
-    prov_key = prov_key or _active_provider
-    prov = PROVIDERS[prov_key]
+    Load pool THẬT của 1 provider (chỉ field `<config_key>_pool`).
+
+    KHÔNG còn tự migrate/gộp key đơn ở đây nữa (khác bản trước) — key đơn
+    giờ được gộp riêng ở tầng _pool_load_with_single(), CHỈ dùng cho mục
+    đích CHỌN/XOAY key khi gọi API. Hàm _pool_load() này vẫn là "sự thật"
+    cho add/remove/list (pool_add_key, pool_remove_key, pool_list,
+    /listkeys...) — những chỗ đó phải phản ánh ĐÚNG những gì user đã
+    /addkey, không được lẫn key đơn vào (nếu lẫn, /listkeys sẽ hiện ra 1
+    key mà user chưa từng /addkey, gây hiểu lầm y hệt lỗi migrate-ngầm cũ
+    đã sửa trước đây — xem lịch sử BUG ĐÃ SỬA bản trước).
+
+    Field pool là "sự thật" ổn định: nếu đã tồn tại (kể cả rỗng `[]` sau
+    /rmkey xoá hết) thì trả về nguyên trạng — không suy luận thêm gì. Nếu
+    field chưa từng tồn tại, trả về [] (không migrate ngầm; việc dùng key
+    đơn khi pool trống được xử lý riêng ở _pool_load_with_single)."""
     cfg = load_config()
     pool = cfg.get(_pool_config_key(prov_key))
-    if pool:
+    if pool is not None:
         return pool
-    # Chưa có pool → thử migrate từ key đơn (env hoặc config)
-    legacy = cfg.get(prov["config_key"], "").strip()
-    if not legacy:
-        legacy = os.environ.get(prov["env_key"], "").strip()
-    if legacy:
-        return [{"key": legacy, "fail_count": 0, "cooldown_until": 0.0, "last_used": 0.0}]
     return []
+
+
+def _pool_load_with_single(prov_key: str | None = None) -> list[dict]:
+    """
+    Danh sách key THỰC SỰ tham gia xoay vòng lúc gọi API: pool thật
+    (_pool_load) + key đơn (nếu có set và chưa trùng key nào trong pool),
+    gắn state cooldown riêng của key đơn (_single_key_state_*).
+
+    Entry của key đơn được đánh dấu thêm "_is_single": True để caller biết
+    đường ghi state trở lại đúng chỗ — xem _pool_save_entry_state().
+
+    Nếu key đơn trùng giá trị với 1 entry đã có trong pool thật, KHÔNG
+    thêm trùng — entry pool thật đó đã đại diện đủ (tránh xuất hiện 2 lần
+    trong vòng xoay, tránh double-count free_count/total khi log)."""
+    prov_key = prov_key or _active_provider
+    pool = list(_pool_load(prov_key))  # copy — không sửa nhầm bản gốc
+    single_val = _single_key_value(prov_key)
+    if single_val and not any(e["key"] == single_val for e in pool):
+        st = _single_key_state_load(prov_key)
+        pool.append({
+            "key": single_val,
+            "fail_count": st.get("fail_count", 0),
+            "cooldown_until": st.get("cooldown_until", 0.0),
+            "last_used": st.get("last_used", 0.0),
+            "_is_single": True,
+        })
+    return pool
+
+
+def _pool_save_entry_state(entry: dict, prov_key: str | None = None):
+    """Ghi lại state (fail_count/cooldown_until/last_used) của 1 entry vào
+    ĐÚNG chỗ lưu trữ: field pool nếu là entry pool thật, field state riêng
+    nếu entry đó là key đơn (_is_single). Dùng ở mọi nơi cần persist thay
+    đổi sau khi tính bằng _pool_load_with_single(), để không bao giờ vô
+    tình ghi key đơn lẫn vào field pool."""
+    prov_key = prov_key or _active_provider
+    if entry.get("_is_single"):
+        _single_key_state_save({
+            "fail_count": entry.get("fail_count", 0),
+            "cooldown_until": entry.get("cooldown_until", 0.0),
+            "last_used": entry.get("last_used", 0.0),
+        }, prov_key)
+        return
+    pool = _pool_load(prov_key)
+    for e in pool:
+        if e["key"] == entry["key"]:
+            e["fail_count"] = entry.get("fail_count", 0)
+            e["cooldown_until"] = entry.get("cooldown_until", 0.0)
+            e["last_used"] = entry.get("last_used", 0.0)
+            break
+    _pool_save(prov_key, pool)
 
 
 def _pool_save(prov_key: str, pool: list[dict]):
     cfg = load_config()
     cfg[_pool_config_key(prov_key)] = pool
     save_config(cfg)
+
+
+def _single_key_state_field(prov_key: str | None = None) -> str:
+    """Field trong config.json lưu {fail_count, cooldown_until, last_used}
+    riêng cho KEY ĐƠN, tách khỏi giá trị key đơn thật.
+    Không được trộn state này vào field pool — xem comment tại nơi dùng."""
+    prov = PROVIDERS[prov_key] if prov_key else _prov()
+    return prov["config_key"] + "_single_state"
+
+
+def _single_key_state_load(prov_key: str | None = None) -> dict:
+    cfg = load_config()
+    st = cfg.get(_single_key_state_field(prov_key))
+    if isinstance(st, dict):
+        return st
+    return {"fail_count": 0, "cooldown_until": 0.0, "last_used": 0.0}
+
+
+def _single_key_state_save(state: dict, prov_key: str | None = None):
+    cfg = load_config()
+    cfg[_single_key_state_field(prov_key)] = state
+    save_config(cfg)
+
+
+def _single_key_value(prov_key: str | None = None) -> str:
+    """Giá trị key đơn hiện tại (field config_key), rỗng nếu chưa set."""
+    prov_key = prov_key or _active_provider
+    prov = PROVIDERS[prov_key]
+    cfg = load_config()
+    return cfg.get(prov["config_key"], "").strip()
 
 
 def _pool_strategy(prov_key: str | None = None) -> str:
@@ -127,10 +211,13 @@ def pool_get_current(prov_key: str | None = None) -> str | None:
     Trả về key nên dùng NGAY LÚC NÀY theo strategy đã chọn, ưu tiên key
     không cooldown. Dùng khi bắt đầu 1 request mới (không phải khi retry
     429 giữa chừng — retry dùng pool_rotate_after_429 bên dưới).
-    """
+
+    Danh sách xét gồm CẢ key đơn (nếu có set) gộp cùng pool thật — xem
+    _pool_load_with_single(). Key đơn giờ tham gia xoay vòng y hệt 1 key
+    pool, không còn là lớp fallback tách biệt."""
     with _pool_lock:
         prov_key = prov_key or _active_provider
-        pool = _pool_load(prov_key)
+        pool = _pool_load_with_single(prov_key)
         if not pool:
             return None
         avail = _pool_available(pool)
@@ -149,21 +236,21 @@ def pool_get_current(prov_key: str | None = None) -> str | None:
 
 
 def pool_mark_success(current_key: str, prov_key: str | None = None):
-    """Gọi API thành công → giảm fail_count (decay), cập nhật last_used."""
+    """Gọi API thành công → giảm fail_count (decay), cập nhật last_used.
+    Xét cả key đơn (qua _pool_load_with_single) — nếu current_key chính là
+    key đơn, ghi state trở lại field state riêng (_pool_save_entry_state),
+    không lẫn vào field pool."""
     with _pool_lock:
         prov_key = prov_key or _active_provider
-        pool = _pool_load(prov_key)
+        pool = _pool_load_with_single(prov_key)
         if not pool:
             return
-        changed = False
         for e in pool:
             if e["key"] == current_key:
                 e["fail_count"] = max(0, e.get("fail_count", 0) - 1)
                 e["last_used"]  = time.time()
-                changed = True
+                _pool_save_entry_state(e, prov_key)
                 break
-        if changed:
-            _pool_save(prov_key, pool)
 
 
 def pool_rotate_after_429(current_key: str, retry_after: float | None,
@@ -202,9 +289,8 @@ def pool_rotate_after_429(current_key: str, retry_after: float | None,
 def pool_rotate_after_429_verbose(current_key: str, retry_after: float | None,
                                    prov_key: str | None = None) -> dict:
     """
-    Bản chi tiết của pool_rotate_after_429 — dùng riêng cho mục đích LOG,
-    không đổi hành vi xoay key (vẫn gọi đúng logic cooldown/chọn key như
-    bản gốc). Trả về dict đủ thông tin để in log rõ ràng:
+    Bản chi tiết dùng THẬT trong luồng gọi API (_call_simple, call_api_stream
+    ở 09_api_system.py) để xoay key sau 429 + log rõ ràng. Trả về:
 
         {
             "rotated": bool,              # có xoay được sang key khác không
@@ -214,27 +300,28 @@ def pool_rotate_after_429_verbose(current_key: str, retry_after: float | None,
             "new_index": int | None,      # số thứ tự key mới
             "new_mask": str | None,       # key mới, đã che
             "free_count": int,            # số key đang rảnh SAU khi xoay (không tính key vừa 429)
-            "total": int,                 # tổng số key trong pool
+            "total": int,                 # tổng số key trong danh sách xoay (pool thật + key đơn nếu có)
             "soonest_index": int | None,  # nếu hết key rảnh: key nào hết cooldown sớm nhất
             "soonest_mask": str | None,
             "soonest_wait": float | None, # còn bao nhiêu giây nữa key đó rảnh
+            "exhausted": bool,            # True = MỌI key (kể cả key đơn) đều đang
+                                           #        cooldown → caller phải BÁO LỖI NGAY,
+                                           #        không sleep-and-retry nữa.
         }
 
-    Không dùng hàm này để lấy key thật cho request — vẫn gọi
-    pool_rotate_after_429() như cũ cho việc đó, hàm này chỉ để log.
+    RULE MỚI (khác bản trước): danh sách xét = pool thật + key đơn gộp
+    chung (_pool_load_with_single) — key đơn giờ là 1 thành viên xoay vòng
+    bình thường, không còn là lớp fallback riêng. Khi hết key rảnh HOÀN
+    TOÀN (không còn ai, kể cả key đơn, chưa hết cooldown) → "exhausted":
+    True, KHÔNG còn trả soonest_wait để sleep chờ nữa — caller phải dừng
+    và báo lỗi thẳng cho người dùng thay vì tự chờ.
 
-    Gọi 2 hàm liên tiếp (hoặc gọi lại chính hàm này 2 lần) cho CÙNG
-    current_key là AN TOÀN và THẬT SỰ idempotent (đã verify bằng test):
-    dùng chung _mark_429() để nhận biết lần gọi thứ 2 là lặp lại của cùng
-    1 sự kiện 429 vừa xử lý (dựa vào cooldown_until vừa đặt còn rất mới) —
-    khi đó KHÔNG cộng thêm fail_count, không rút ngắn lại cooldown, chỉ trả
-    lại đúng thông tin key mới/soonest đã chọn từ lần đầu. fail_count chỉ
-    tăng thêm khi đây thực sự là 1 lần 429 MỚI (cooldown cũ đã gần hết hạn
-    hoặc chưa từng đặt).
+    Gọi 2 lần liên tiếp cho CÙNG current_key vẫn idempotent (dùng chung
+    _mark_429() dedupe như trước) — không cộng dồn fail_count.
     """
     with _pool_lock:
         prov_key = prov_key or _active_provider
-        pool = _pool_load(prov_key)
+        pool = _pool_load_with_single(prov_key)
         total = len(pool)
 
         old_index = None
@@ -249,23 +336,36 @@ def pool_rotate_after_429_verbose(current_key: str, retry_after: float | None,
             "new_key": None, "new_index": None, "new_mask": None,
             "free_count": 0, "total": total,
             "soonest_index": None, "soonest_mask": None, "soonest_wait": None,
+            "exhausted": False,
         }
 
         now = time.time()
-        if total <= 1:
-            if pool:
-                _mark_429(pool[0], now, retry_after)
-                _pool_save(prov_key, pool)
-                result["soonest_index"] = 1
-                result["soonest_mask"] = _pool_mask(pool[0]["key"])
-                result["soonest_wait"] = max(0.0, pool[0].get("cooldown_until", 0) - now)
+
+        if total == 0:
+            # Không còn key nào (kể cả key đơn) — không thể xảy ra thực tế
+            # (nếu 429 nghĩa là vừa gọi API bằng 1 key nào đó), nhưng phòng
+            # thủ: coi như hết sạch, báo lỗi thay vì crash ở bước sau.
+            result["exhausted"] = True
+            return result
+
+        if total == 1:
+            # Chỉ có đúng 1 key trong toàn bộ danh sách xoay (pool thật +
+            # key đơn) — đánh cooldown cho nó, rồi hết sạch luôn vì không
+            # còn ai khác để chờ hay xoay sang.
+            only = pool[0]
+            _mark_429(only, now, retry_after)
+            _pool_save_entry_state(only, prov_key)
+            result["soonest_index"] = 1
+            result["soonest_mask"] = _pool_mask(only["key"])
+            result["soonest_wait"] = max(0.0, only.get("cooldown_until", 0) - now)
+            result["exhausted"] = True
             return result
 
         for e in pool:
             if e["key"] == current_key:
                 _mark_429(e, now, retry_after)
+                _pool_save_entry_state(e, prov_key)
                 break
-        _pool_save(prov_key, pool)
 
         others = [e for e in pool if e["key"] != current_key]
         free = [e for e in others if e.get("cooldown_until", 0) <= now]
@@ -280,13 +380,17 @@ def pool_rotate_after_429_verbose(current_key: str, retry_after: float | None,
             result["new_index"] = next(
                 i for i, e in enumerate(pool, start=1) if e["key"] == chosen["key"])
         else:
-            # Hết key rảnh — tìm key nào hết cooldown sớm nhất (kể cả key
-            # vừa 429, vì có thể retry_after của nó ngắn hơn key khác).
+            # Hết key rảnh — KỂ CẢ key đơn (nếu có trong pool) đều đang
+            # cooldown. Đây là "exhausted": mọi thành viên xoay vòng đều
+            # bị limit cùng lúc → không còn gì để sleep-chờ-rồi-thử-key-
+            # khác, báo lỗi ngay theo đúng rule mới thay vì trả soonest_wait
+            # để caller tự sleep như hành vi cũ.
             soonest = min(pool, key=lambda e: e.get("cooldown_until", 0))
             result["soonest_index"] = next(
                 i for i, e in enumerate(pool, start=1) if e["key"] == soonest["key"])
             result["soonest_mask"] = _pool_mask(soonest["key"])
             result["soonest_wait"] = max(0.0, soonest.get("cooldown_until", 0) - now)
+            result["exhausted"] = True
 
         return result
 
@@ -304,7 +408,13 @@ def pool_add_key(key: str, prov_key: str | None = None) -> int:
 
 
 def pool_remove_key(index: int, prov_key: str | None = None) -> str | None:
-    """Xoá key theo index (1-based, khớp thứ tự hiển thị /listkeys). Trả về key đã xoá."""
+    """Xoá key theo index (1-based, khớp thứ tự hiển thị /listkeys). Trả về key đã xoá.
+
+    LƯU Ý (kiến trúc mới): index ở đây CHỈ đánh theo pool THẬT (field
+    `<config_key>_pool`), giống hệt /listkeys hiển thị — không đụng tới
+    key đơn (field config_key), vì key đơn không còn được migrate/lẫn vào
+    field pool nữa (xem _pool_load). Muốn xoá key đơn, dùng /deletekey
+    riêng — /rmkey chỉ thao tác trên pool thật."""
     with _pool_lock:
         prov_key = prov_key or _active_provider
         pool = _pool_load(prov_key)
@@ -327,7 +437,9 @@ def pool_set_strategy(strategy: str, prov_key: str | None = None) -> bool:
 
 
 def pool_list(prov_key: str | None = None) -> list[dict]:
-    """Trả về pool kèm trạng thái cooldown đã tính sẵn (giây còn lại, >0 nghĩa là đang bận)."""
+    """Trả về pool THẬT kèm trạng thái cooldown đã tính sẵn (giây còn lại,
+    >0 nghĩa là đang bận). KHÔNG gồm key đơn — dùng pool_list_with_single()
+    nếu cần hiển thị cả key đơn (vd /listkeys)."""
     with _pool_lock:
         prov_key = prov_key or _active_provider
         now = time.time()
@@ -335,4 +447,19 @@ def pool_list(prov_key: str | None = None) -> list[dict]:
         for e in _pool_load(prov_key):
             remain = max(0.0, e.get("cooldown_until", 0) - now)
             out.append({**e, "cooldown_remaining": remain})
+        return out
+
+
+def pool_list_with_single(prov_key: str | None = None) -> list[dict]:
+    """Như pool_list(), nhưng gồm cả key đơn (nếu có set) — mỗi entry kèm
+    "_is_single": bool để caller (vd /listkeys) hiển thị rõ nguồn gốc,
+    tránh tình trạng key đơn đang tham gia xoay vòng thật sự mà người dùng
+    không biết vì /listkeys cũ chỉ đọc pool thật."""
+    with _pool_lock:
+        prov_key = prov_key or _active_provider
+        now = time.time()
+        out = []
+        for e in _pool_load_with_single(prov_key):
+            remain = max(0.0, e.get("cooldown_until", 0) - now)
+            out.append({**e, "cooldown_remaining": remain, "_is_single": e.get("_is_single", False)})
         return out

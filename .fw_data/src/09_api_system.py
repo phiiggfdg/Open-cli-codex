@@ -134,8 +134,18 @@ def get_api_key():
         except (EOFError, KeyboardInterrupt):
             save_yn = "y"
         if save_yn not in ("n", "no"):
-            cfg[p["config_key"]] = key
-            save_config(cfg)
+            # FIX (đồng bộ key): dùng _pool_lock + load_config() LẠI ngay
+            # trong lock thay vì tái dùng biến `cfg` đã load ở đầu hàm (dòng
+            # ~43) — giữa lúc đó và lúc người dùng gõ xong key (chờ input,
+            # có thể vài giây) 1 thread khác (vd _auto_rename_session) có
+            # thể đã load-sửa-save config.json cho field khác (pool, v.v).
+            # Nếu ghi thẳng bằng `cfg` cũ, save_config() sẽ ghi đè TOÀN FILE
+            # bằng bản cfg cũ đó, xoá mất thay đổi của thread kia (lost
+            # update) — đã verify race này bằng test thực nghiệm.
+            with _pool_lock:
+                cfg = load_config()
+                cfg[p["config_key"]] = key
+                save_config(cfg)
             print(f"{GREEN}✓ Đã lưu → {CONFIG_PATH}{R}")
         # Custom provider + vừa xác định auth_mode (bearer) qua fallback ở
         # trên → lưu lại vào custom_providers để lần load sau (qua
@@ -766,33 +776,24 @@ def _call_simple(messages, model, api_key, retry_max=None, silent=False,
                                   flush=True)
                         api_key = rot["new_key"]
                         continue
-                    # rot["soonest_wait"] luôn có giá trị hợp lệ ở đây (set ở
-                    # cả nhánh total<=1 và nhánh hết-key-rảnh trong verbose) —
-                    # dùng nó thay _RETRY_DELAYS[attempt] cố định để chờ đúng
-                    # bằng thời gian key thật sự cần để rảnh. Không nối thêm
-                    # "or _RETRY_DELAYS[attempt]" ở cuối: soonest_wait có thể
-                    # hợp lệ bằng 0.0 (key vừa hết cooldown đúng lúc check),
-                    # và 0.0 is falsy nên 1 chuỗi "or" 3 vế sẽ nhảy nhầm sang
-                    # delay cố định thay vì chờ 0s.
-                    wait = retry_after or rot["soonest_wait"]
-                    if not silent:
-                        if rot["total"] <= 1:
-                            print(f"\n{YELLOW}  ⚠ Key {rot['old_mask']} hết quota (429), "
-                                  f"không có key dự phòng → chờ {wait:.0f}s...{R}", flush=True)
-                        else:
-                            print(f"\n{YELLOW}  ⚠ Full {rot['total']}/{rot['total']} key đều "
-                                  f"đang bị limit — key gần rảnh nhất là Key #{rot['soonest_index']} "
-                                  f"({rot['soonest_mask']}, còn {rot['soonest_wait']:.0f}s) → "
-                                  f"chờ {wait:.0f}s rồi thử lại...{R}", flush=True)
-                    if check_cancel:
-                        if _cancel_bg.wait(wait):
-                            return {"text": "[cancelled]", "tool_calls": []}
-                    else:
-                        __import__("time").sleep(wait)
-                    # Sau khi sleep, key đầu tiên bị cooldown có thể đã hết
-                    # hạn — hỏi lại pool thay vì giữ cứng key vừa 429.
-                    api_key = pool_get_current() or api_key
-                    continue
+                    # RULE MỚI: rot["exhausted"] == True nghĩa là MỌI key
+                    # trong danh sách xoay (pool thật + key đơn gộp chung,
+                    # xem 11_key_pool.py) đều đang cooldown 429 cùng lúc —
+                    # không còn sleep-and-retry chờ hồi phục nữa như hành vi
+                    # cũ. Dừng ngay, báo lỗi rõ cho người dùng.
+                    if rot["exhausted"]:
+                        if not silent:
+                            if rot["total"] <= 1:
+                                _msg = (f"\n{RED}  ✗ Key {rot['old_mask']} hết quota (429), "
+                                        f"không có key dự phòng nào khác.{R}")
+                            else:
+                                _msg = (f"\n{RED}  ✗ Toàn bộ {rot['total']}/{rot['total']} key "
+                                        f"(gồm cả key đơn nếu có) đều đang bị limit — key gần "
+                                        f"rảnh nhất là Key #{rot['soonest_index']} "
+                                        f"({rot['soonest_mask']}, còn {rot['soonest_wait']:.0f}s).{R}")
+                            print(_msg, flush=True)
+                        return {"text": "[error: tất cả key đều đang bị rate-limit (429), "
+                                         "không còn key dự phòng]", "tool_calls": []}
                 if e.code in _RETRY_CODES:
                     wait = _parse_retry_after(e) or _RETRY_DELAYS[attempt]
                     if not silent:
@@ -1058,11 +1059,17 @@ def _thinking_support_get(model: str):
     return val  # None nếu key chưa tồn tại
 
 def _thinking_support_set(model: str, supported: bool):
-    cfg = load_config()
-    table = cfg.get("thinking_support", {})
-    table[_thinking_key(model)] = supported
-    cfg["thinking_support"] = table
-    save_config(cfg)
+    # FIX (đồng bộ key): cùng pattern với _vision_support_set — ghi field
+    # này share chung config.json với pool key (thread nền _auto_rename_
+    # session có thể đang ghi pool cùng lúc). Bọc _pool_lock để tránh lost
+    # update / crash JSONDecodeError khi save_config() (ghi đè toàn file,
+    # không atomic) đụng độ giữa 2 thread.
+    with _pool_lock:
+        cfg = load_config()
+        table = cfg.get("thinking_support", {})
+        table[_thinking_key(model)] = supported
+        cfg["thinking_support"] = table
+        save_config(cfg)
 
 # Cache riêng: model CÓ support thinking (xác nhận ở _thinking_support_*
 # bên trên) NHƯNG gửi {"type": "disabled"} có thực sự tắt được không.
@@ -1094,12 +1101,16 @@ def _thinking_disable_already_probed(model: str) -> bool:
 
 def _thinking_disable_mark_probed(model: str):
     """Đánh dấu đã probe cho cặp (provider, model) này — chỉ probe (và in
-    cảnh báo nếu cần) 1 lần mỗi cặp, không lặp lại mỗi lần gõ /mode off."""
-    cfg = load_config()
-    table = cfg.get("thinking_disable_warned", {})
-    table[_thinking_disable_key(model)] = True
-    cfg["thinking_disable_warned"] = table
-    save_config(cfg)
+    cảnh báo nếu cần) 1 lần mỗi cặp, không lặp lại mỗi lần gõ /mode off.
+
+    FIX (đồng bộ key): bọc _pool_lock — cùng lý do với _thinking_support_set
+    ở trên (share config.json với pool, thread nền có thể ghi cùng lúc)."""
+    with _pool_lock:
+        cfg = load_config()
+        table = cfg.get("thinking_disable_warned", {})
+        table[_thinking_disable_key(model)] = True
+        cfg["thinking_disable_warned"] = table
+        save_config(cfg)
 
 # ── Vision support cache (chỉ dùng qua /web — xem 12_web.py) ────────────────
 # KHÔNG probe chủ động (khác _probe_thinking_support): chỉ ghi nhận kết quả
@@ -1860,33 +1871,31 @@ def call_api_stream(messages, model, api_key, tool_choice="auto", session_id=Non
                     if state: state.emit(EV_WARN, text=_txt, raw=True)
                     else: print(_txt, flush=True)
                     api_key = rot["new_key"]
+                    spinner = Spinner(f"Retry {attempt+1}")
+                    spinner.start()
+                    spinner_ref[0] = spinner
+                    continue
+                # RULE MỚI: rot["exhausted"] == True nghĩa là MỌI key trong
+                # danh sách xoay (pool thật + key đơn gộp chung, xem
+                # 11_key_pool.py) đều đang cooldown 429 cùng lúc — không
+                # còn sleep-and-retry chờ hồi phục như hành vi cũ nữa. Dừng
+                # NGAY, báo lỗi rõ, không mở thêm attempt nào.
+                if rot["total"] <= 1:
+                    _txt = (f"\n{RED}  ✗ Key {rot['old_mask']} hết quota (429), không có "
+                          f"key dự phòng nào khác.{R}")
                 else:
-                    # rot["soonest_wait"] luôn có giá trị hợp lệ ở đây (xem
-                    # giải thích tương tự ở _call_simple) — dùng nó thay
-                    # _RETRY_DELAYS[attempt] cố định. Không nối thêm
-                    # "or _RETRY_DELAYS[attempt]": soonest_wait có thể hợp lệ
-                    # bằng 0.0, và 0.0 is falsy nên chuỗi "or" 3 vế sẽ nhảy
-                    # nhầm sang delay cố định thay vì chờ 0s.
-                    wait = retry_after or rot["soonest_wait"]
-                    if rot["total"] <= 1:
-                        _txt = (f"\n{YELLOW}  ⚠ Key {rot['old_mask']} hết quota (429), không có "
-                              f"key dự phòng → chờ {wait:.0f}s...{R}")
-                    else:
-                        _txt = (f"\n{YELLOW}  ⚠ Full {rot['total']}/{rot['total']} key đều đang bị "
-                              f"limit — key gần rảnh nhất là Key #{rot['soonest_index']} "
-                              f"({rot['soonest_mask']}, còn {rot['soonest_wait']:.0f}s) → "
-                              f"chờ {wait:.0f}s rồi thử lại...{R}")
-                    if state: state.emit(EV_WARN, text=_txt, raw=True)
-                    else: print(_txt, flush=True)
-                    __import__("time").sleep(wait)
-                    # Sau khi sleep, key đầu tiên bị cooldown (vd A trong A→B→C)
-                    # có thể đã hết hạn — hỏi lại pool thay vì cố định dùng
-                    # đúng key vừa 429 (C), tránh bỏ qua key đã rảnh.
-                    api_key = pool_get_current() or api_key
-                spinner = Spinner(f"Retry {attempt+1}")
-                spinner.start()
-                spinner_ref[0] = spinner
-                continue
+                    _txt = (f"\n{RED}  ✗ Toàn bộ {rot['total']}/{rot['total']} key (gồm cả "
+                          f"key đơn nếu có) đều đang bị limit — key gần rảnh nhất là "
+                          f"Key #{rot['soonest_index']} ({rot['soonest_mask']}, còn "
+                          f"{rot['soonest_wait']:.0f}s).{R}")
+                # spinner đã .stop() ở đầu khối except này (dòng phía trên),
+                # không cần gọi lại.
+                if state: state.emit(EV_ERROR, text=_txt, raw=True)
+                else: print(_txt, flush=True)
+                return {"text": "", "tool_calls": [], "usage": {}, "truncated": False,
+                        "reasoning": "", "thinking": "", "thinking_signature": "",
+                        "redacted_thinking_data": "",
+                        "key_pool_exhausted": True}
 
             if e.code in _RETRY_CODES and attempt < _RETRY_MAX - 1:
                 wait = _parse_retry_after(e) or _RETRY_DELAYS[attempt]

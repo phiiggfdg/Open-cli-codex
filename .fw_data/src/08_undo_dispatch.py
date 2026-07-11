@@ -322,6 +322,23 @@ Be concise. Current directory: {os.getcwd()}"""
         # C32 FIX: handle aws_bedrock Converse format (nhánh 1)
         # C3X FIX: handle format_anthropic tool_calls (nhánh 2) — trước chỉ parse text, bỏ tool_use
         # C3Y FIX: handle openai_responses (nhánh 3) — bug thật, xem chi tiết trong comment trên
+        # C3Z FIX (đồng bộ key pool): trước đây nhánh 429 chỉ sleep-and-retry
+        # với CÙNG 1 api_key cố định suốt cả subagent — khác hẳn _call_simple
+        # và call_api_stream (09_api_system.py), 2 nơi ĐÃ tích hợp key pool
+        # (xoay sang key khác thay vì chờ nếu có key rảnh). Hệ quả thật: nếu
+        # key A vừa 429 ở lượt gọi model chính (đã cooldown trong pool), bước
+        # kế mô hình gọi tool "task" (subagent) vẫn dùng đúng key A đó — xác
+        # nhận bằng đọc source (_tool_task_inner không hề gọi pool_get_current/
+        # pool_rotate_after_429_verbose/pool_mark_success). Sửa: dùng ĐÚNG
+        # pattern đã có ở call_api_stream — nonlocal api_key (biến closure từ
+        # tham số _tool_task_inner, gán lại trong nested function bắt buộc
+        # cần nonlocal, không thì chỉ đổi được biến cục bộ của _sub_urlopen
+        # và mất ngay khi hàm return) + pool_get_current() ưu tiên đầu mỗi
+        # lần gọi (không chỉ 1 lần đầu _tool_task_inner, vì _sub_urlopen được
+        # gọi lại nhiều lần qua các step) + pool_rotate_after_429_verbose khi
+        # 429 + pool_mark_success khi thành công.
+        nonlocal api_key
+        api_key = pool_get_current() or api_key
         _RETRY_CODES_SUB = {429, 500, 502, 503, 504}
         _RETRY_DELAYS_SUB = [2, 5, 10]
         for attempt in range(3):
@@ -334,6 +351,7 @@ Be concise. Current directory: {os.getcwd()}"""
                     resp_cm = urllib.request.urlopen(req, timeout=timeout)
                 with resp_cm as resp:
                     body = json.loads(resp.read())
+                    pool_mark_success(api_key)  # key này ổn → giảm fail_count (decay)
 
                     # Nhánh 1: AWS Bedrock — Converse API format
                     if _active_provider == "aws_bedrock":
@@ -384,6 +402,42 @@ Be concise. Current directory: {os.getcwd()}"""
                     msg = body["choices"][0]["message"]
                     return msg.get("content", "") or "", msg.get("tool_calls") or []
             except urllib.error.HTTPError as e:
+                # 429: lỗi CỦA KEY này (quota/rate) — ưu tiên đổi sang key
+                # khác trong pool trước (không sleep nếu có key rảnh), ĐÚNG
+                # pattern call_api_stream (09_api_system.py). 5xx: lỗi
+                # SERVER, đổi key vô ích → giữ hành vi cũ (sleep-and-retry
+                # cùng key).
+                if e.code == 429 and attempt < 2:
+                    retry_after = _parse_retry_after(e)
+                    rot = pool_rotate_after_429_verbose(api_key, retry_after)
+                    if rot["rotated"]:
+                        _msg = (f"  {YELLOW}[subagent] Key #{rot['old_index']} ({rot['old_mask']}) "
+                                f"hết quota (429) → chuyển Key #{rot['new_index']} "
+                                f"({rot['new_mask']}), còn {rot['free_count']}/"
+                                f"{rot['total']-1} key khác đang rảnh. Thử lại ngay...{R}")
+                        if state is not None:
+                            state.emit(EV_INFO, text=_msg, raw=True)
+                        else:
+                            print(_msg, flush=True)
+                        api_key = rot["new_key"]
+                    else:
+                        wait = retry_after or rot["soonest_wait"]
+                        if rot["total"] <= 1:
+                            _msg = (f"  {YELLOW}[subagent] Key {rot['old_mask']} hết quota (429), "
+                                    f"không có key dự phòng → chờ {wait:.0f}s...{R}")
+                        else:
+                            _msg = (f"  {YELLOW}[subagent] Full {rot['total']}/{rot['total']} key "
+                                    f"đều đang bị limit — key gần rảnh nhất còn {rot['soonest_wait']:.0f}s "
+                                    f"→ chờ {wait:.0f}s rồi thử lại...{R}")
+                        if state is not None:
+                            state.emit(EV_INFO, text=_msg, raw=True)
+                        else:
+                            print(_msg, flush=True)
+                        import time as _t
+                        _t.sleep(wait)
+                        # Sau sleep, hỏi lại pool — key khác có thể đã hết cooldown.
+                        api_key = pool_get_current() or api_key
+                    continue
                 if e.code in _RETRY_CODES_SUB and attempt < 2:
                     import time as _t
                     wait = _RETRY_DELAYS_SUB[attempt]

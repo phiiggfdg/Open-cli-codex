@@ -622,11 +622,20 @@ def _load_custom_providers() -> dict:
         return {}
 
 def _save_custom_providers(custom: dict):
-    """Ghi custom providers vào config.json."""
+    """Ghi custom providers vào config.json.
+
+    FIX (đồng bộ key): bọc _pool_lock (định nghĩa ở 11_key_pool.py, load
+    SAU module này trong fw.py — an toàn vì hàm chỉ đọc global đó lúc được
+    GỌI ở runtime, không phải lúc module này được exec, đúng nguyên tắc
+    namespace dùng chung đã ghi trong fw.py:_MODULES). Field custom_providers
+    thường bị ghi ngay sau /setkey lưu key (get_api_key() gọi hàm này khi
+    vừa xác định anthropic_auth_mode cho custom provider) — share config.json
+    với pool key, cần cùng 1 lock để tránh lost update."""
     try:
-        cfg = load_config()
-        cfg["custom_providers"] = custom
-        save_config(cfg)
+        with _pool_lock:
+            cfg = load_config()
+            cfg["custom_providers"] = custom
+            save_config(cfg)
     except Exception:
         pass
 

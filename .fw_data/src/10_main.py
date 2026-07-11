@@ -1129,7 +1129,12 @@ def main():
             else: print(_txt)
             continue
 
-        if user.lower().startswith("/delete"):
+        # BUG FIX: "/deletekey" cũng khớp startswith("/delete") nên bị nhánh
+        # này nuốt mất trước khi chạy tới đúng chỗ xử lý "/deletekey" ở dưới
+        # (dòng ~1322) — gõ "/deletekey 1" bị hiểu nhầm thành "/delete 1"
+        # (xoá session id=1), báo "Không tìm thấy session: 1" dù ý người
+        # dùng là xoá key thứ 1 trong pool. Loại trừ tường minh ở đây.
+        if user.lower().startswith("/delete") and not user.lower().startswith("/deletekey"):
             parts = user.split()
             cmd   = parts[0].lower()
 
@@ -1305,27 +1310,57 @@ def main():
                     new_key = input(f"{CYAN}API key mới: {R}").strip()
                 except (EOFError, KeyboardInterrupt):
                     print(); continue
+            # FIX (đồng bộ key): `cfg` load ở đầu block (dòng ~1292) có thể
+            # đã CŨ tại đây — giữa lúc đó và lúc người dùng gõ xong key
+            # (state.ask()/input() chờ vô thời hạn) thread nền (vd _auto_
+            # rename_session) có thể đã load-sửa-save config.json cho field
+            # khác (pool). Ghi thẳng bằng `cfg` cũ sẽ xoá mất thay đổi đó
+            # (lost update) — đã verify bằng test thực nghiệm. Bọc _pool_lock
+            # + load_config() LẠI ngay trước khi set/pop field rồi save.
+            with _pool_lock:
+                cfg = load_config()
+                if new_key:
+                    cfg[ck] = new_key
+                    save_config(cfg)
+                else:
+                    cfg.pop(ck, None)
+                    save_config(cfg)
             if new_key:
-                cfg[ck] = new_key
                 api_key = new_key
                 if state is not None: state.api_key = api_key
-                save_config(cfg)
                 _txt = f"{GREEN}✓ Đã lưu key mới.{R}\n"
             else:
-                cfg.pop(ck, None)
-                save_config(cfg)
                 _txt = f"{YELLOW}✓ Đã xoá key đã lưu. Dùng env {_prov()['env_key']}.{R}\n"
             if state: state.emit(EV_INFO, text=_txt, raw=True)
             else: print(_txt)
             continue
 
+        # /deletekey <n>: dễ gõ nhầm với /rmkey <n> (2 lệnh khác nhau —
+        # /deletekey xoá key đơn lưu qua /setkey, /rmkey xoá theo index
+        # trong pool). Không tham số nào được /deletekey đọc, nên trước đây
+        # gõ "/deletekey 1" chỉ khớp startswith("/delete") ở trên rồi thôi —
+        # giờ báo rõ để không rơi tự do thành tin nhắn gửi lên AI.
+        if user.lower().startswith("/deletekey ") and user.lower() != "/deletekey":
+            _txt = (f"{YELLOW}\"/deletekey\" không nhận tham số (xoá key đơn đang lưu). "
+                     f"Muốn xoá key theo số thứ tự trong pool → dùng {CYAN}/rmkey <số>{YELLOW} "
+                     f"(xem số qua {CYAN}/listkeys{YELLOW}).{R}\n")
+            if state: state.emit(EV_INFO, text=_txt, raw=True)
+            else: print(_txt)
+            continue
+
         if user.lower() == "/deletekey":
-            cfg = load_config()
-            ck  = _prov()["config_key"]
-            cur = cfg.get(ck, "")
+            # FIX (đồng bộ key): bọc _pool_lock quanh toàn bộ read-modify-
+            # write — không chờ input giữa chừng như /setkey nên cửa sổ
+            # race hẹp hơn, nhưng vẫn có thể trùng với thread nền đang ghi
+            # pool đúng lúc lệnh này chạy. Cùng nguyên tắc, cùng lock.
+            with _pool_lock:
+                cfg = load_config()
+                ck  = _prov()["config_key"]
+                cur = cfg.get(ck, "")
+                if cur:
+                    cfg.pop(ck, None)
+                    save_config(cfg)
             if cur:
-                cfg.pop(ck, None)
-                save_config(cfg)
                 api_key = os.environ.get(_prov()["env_key"], "")
                 if state is not None: state.api_key = api_key
                 env_note = (f" Key env đang có sẵn."
