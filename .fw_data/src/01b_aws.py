@@ -527,7 +527,7 @@ class _FakeSSEResponse:
         self._raw = raw_resp
         self._buf = b""
         self._lines = []   # hàng đợi các dòng SSE đã dịch, chờ trả ra
-        self._tool_block_idx = {}   # contentBlockIndex(Bedrock) -> tc index OpenAI
+        self._tool_block_idx = {}   # Bedrock index -> {tc_idx, id, name}
         self._next_tc_idx = 0
         self._done = False
 
@@ -641,7 +641,13 @@ def _convert_event(event_type: str, payload: dict, tool_block_idx: dict,
         start = payload.get("start", {})
         if "toolUse" in start:
             tu = start["toolUse"]
-            if idx in tool_block_idx and _cache_debug:
+            existing = tool_block_idx.get(idx)
+            tool_id = tu.get("toolUseId", "")
+            tool_name = tu.get("name", "")
+            if (existing is not None and existing["id"] == tool_id
+                    and existing["name"] == tool_name):
+                return out
+            if existing is not None and _cache_debug:
                 # FIX (bug #4): contentBlockStart lặp lại cùng index — vi
                 # phạm Converse Stream spec (mỗi index chỉ start 1 lần).
                 # Trước đây ghi đè vô điều kiện làm "mồ côi" tool_call cũ.
@@ -650,11 +656,13 @@ def _convert_event(event_type: str, payload: dict, tool_block_idx: dict,
                            "contentBlockStart lặp lại — tool_call cũ bị ghi đè")
             tc_idx = state._next_tc_idx
             state._next_tc_idx += 1
-            tool_block_idx[idx] = tc_idx
+            tool_block_idx[idx] = {
+                "tc_idx": tc_idx, "id": tool_id, "name": tool_name,
+            }
             out.append({"choices": [{"delta": {"tool_calls": [{
                 "index": tc_idx,
-                "id": tu.get("toolUseId", ""),
-                "function": {"name": tu.get("name", ""), "arguments": ""},
+                "id": tool_id,
+                "function": {"name": tool_name, "arguments": ""},
             }]}}]})
 
     elif event_type == "contentBlockDelta":
@@ -671,7 +679,8 @@ def _convert_event(event_type: str, payload: dict, tool_block_idx: dict,
                 # hành vi mặc định) nhưng log khi debug bật.
                 _cache_log("?", f"bedrock-stream idx={idx}",
                            "contentBlockDelta toolUse orphan (không có contentBlockStart)")
-            tc_idx = tool_block_idx.get(idx, 0)
+            block = tool_block_idx.get(idx)
+            tc_idx = block["tc_idx"] if block is not None else 0
             partial = delta["toolUse"].get("input", "")
             out.append({"choices": [{"delta": {"tool_calls": [{
                 "index": tc_idx,

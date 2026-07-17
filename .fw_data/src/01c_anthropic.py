@@ -433,7 +433,15 @@ class _AnthropicSSEResponse:
             block = ev.get("content_block", {})
             btype = block.get("type", "")
             if btype == "tool_use":
-                if idx in self._tool_blocks:
+                existing = self._tool_blocks.get(idx)
+                block_id = block.get("id", "")
+                block_name = block.get("name", "")
+                if (existing is not None and existing["id"] == block_id
+                        and existing["name"] == block_name):
+                    # Exact duplicate start của cùng tool call: bỏ event rác.
+                    # Hai call hợp lệ có ID/index khác nên không bị lọc.
+                    return
+                if existing is not None:
                     # FIX (bug #4): content_block_start lặp lại cùng index —
                     # vi phạm spec Anthropic (mỗi index chỉ start 1 lần),
                     # nhưng có tiền lệ thật với gateway third-party lệch
@@ -450,14 +458,14 @@ class _AnthropicSSEResponse:
                 self._next_tc_idx += 1
                 self._tool_blocks[idx] = {
                     "tc_idx": tc_idx,
-                    "id":     block.get("id", ""),
-                    "name":   block.get("name", ""),
+                    "id":     block_id,
+                    "name":   block_name,
                 }
                 self._emit({"choices": [{"delta": {"tool_calls": [{
                     "index":    tc_idx,
-                    "id":       block.get("id", ""),
+                    "id":       block_id,
                     "type":     "function",
-                    "function": {"name": block.get("name", ""), "arguments": ""},
+                    "function": {"name": block_name, "arguments": ""},
                 }]}}]})
             elif btype == "redacted_thinking":
                 # KHÁC thinking thường: redacted_thinking không stream qua

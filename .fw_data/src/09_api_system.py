@@ -813,9 +813,25 @@ def _call_simple(messages, model, api_key, retry_max=None, silent=False,
     return {"text": "[error: max retries exceeded]", "tool_calls": []}
 
 
+def _resolve_streamed_tool_name(parts: list[str], valid_names: set[str]) -> str:
+    """Ghép tên tool mà không làm hỏng tên hợp lệ trong schema."""
+    parts = [part for part in parts if part]
+    joined = "".join(parts)
+    if not parts or not valid_names or joined in valid_names:
+        return joined
+
+    # Một số OpenAI-compatible gateway gửi lại full name, hoặc gửi dạng
+    # cumulative ("file_" rồi "file_index"). Chỉ sửa khi phần cuối là tên
+    # có thật trong schema và mọi phần trước đều là prefix/full-name của nó.
+    last = parts[-1]
+    if last in valid_names and all(last.startswith(part) for part in parts):
+        return last
+    return joined
+
+
 def _stream_response(resp, text_parts, tc_raw, usage_out, spinner_ref, reasoning_parts=None,
                       thinking_parts=None, thinking_sig=None, redacted_parts=None,
-                      fix_dup_tool_index=False, state=None):
+                      handle_gemini_metadata=False, valid_tool_names=None, state=None):
     """
     Đọc SSE stream từ resp, fill vào text_parts / tc_raw / usage_out (dict).
     Trả về finish_reason (str | None).
@@ -840,17 +856,9 @@ def _stream_response(resp, text_parts, tc_raw, usage_out, spinner_ref, reasoning
         lưu lại nguyên văn (không sửa) để replay đúng ở turn sau có
         tool_calls — Anthropic/Bedrock coi sửa đổi field này là lỗi 400.
         Không in ra màn hình (nội dung đã mã hoá, không đọc được).
-    fix_dup_tool_index: bool — mặc định False (hành vi y hệt code cũ, áp
-        dụng cho mọi provider chuẩn OpenAI streaming: tên tool stream rời
-        ký tự nhưng CÙNG 1 tool_call thì luôn cùng 1 index → nối chuỗi là
-        đúng). CHỈ bật True cho provider Gemini (OpenAI-compat endpoint
-        của Google) — quan sát thực tế: Gemini có thể trả nhiều tool_call
-        KHÁC NHAU nhưng gắn cùng index=0, khiến nối chuỗi gộp nhầm nhiều
-        tên tool lại (vd "bash"+"edit"+"grep" → "basheditgrep" → lỗi
-        unknown tool → HTTP 400 INVALID_ARGUMENT ở turn sau). Khi bật,
-        nếu 1 index đã có name xong và delta mới tới có id khác hẳn id
-        đang lưu, coi đó là tool_call MỚI bị Gemini gắn nhầm index →
-        cấp 1 index giả mới (không đụng tới các provider khác).
+    handle_gemini_metadata: chỉ bật cho Gemini để giữ thought_signature
+        riêng của Google. Việc tách call khác ID và resolve tên bị stream
+        lặp áp dụng cho mọi OpenAI-compatible provider.
     """
     finish_reason = None
     first_token   = True
@@ -944,23 +952,24 @@ def _stream_response(resp, text_parts, tc_raw, usage_out, spinner_ref, reasoning
             for tc in delta.get("tool_calls") or []:
                 idx = tc.get("index", 0)
                 tc_id = tc.get("id")
-                if fix_dup_tool_index:
-                    # Gemini-only: phát hiện idx bị tái sử dụng cho 1
-                    # tool_call KHÁC (id mới khác hẳn id đang lưu, trong
-                    # khi index cũ đã có name xong) → cấp index giả mới
-                    # thay vì nối chuỗi đè lên tool cũ.
-                    existing = tc_raw.get(idx)
-                    if (existing is not None and existing["function"]["name"]
-                            and tc_id and existing["id"] and tc_id != existing["id"]):
-                        idx = f"gemini_dup_{idx}_{tc_id}"
+                # Bất kỳ OpenAI-compatible gateway nào cũng có thể tái dùng
+                # index=0 cho nhiều call. ID khác nhau luôn là hai call thật;
+                # tách theo ID để không gộp nhầm, kể cả khi cùng gọi một tool.
+                existing = tc_raw.get(idx)
+                if (existing is not None and tc_id and existing["id"]
+                        and tc_id != existing["id"]):
+                    idx = f"dup_{idx}_{tc_id}"
                 if idx not in tc_raw:
                     tc_raw[idx] = {"id": "", "type": "function",
-                                   "function": {"name": "", "arguments": ""}}
+                                   "function": {"name": "", "arguments": ""},
+                                   "_name_parts": []}
                 if tc.get("id"): tc_raw[idx]["id"] = tc["id"]
                 fn = tc.get("function", {})
-                if fn.get("name"):      tc_raw[idx]["function"]["name"]      += fn["name"]
+                if fn.get("name"):
+                    tc_raw[idx]["_name_parts"].append(fn["name"])
+                    tc_raw[idx]["function"]["name"] += fn["name"]
                 if fn.get("arguments"): tc_raw[idx]["function"]["arguments"] += fn["arguments"]
-                if fix_dup_tool_index:
+                if handle_gemini_metadata:
                     # Gemini-only: thought_signature bắt buộc phải replay lại
                     # nguyên văn ở turn sau khi message có tool_calls, nếu
                     # không API trả 400 "missing thought_signature in
@@ -980,6 +989,10 @@ def _stream_response(resp, text_parts, tc_raw, usage_out, spinner_ref, reasoning
                         tc_raw[idx]["_thought_signature"] = _sig
         except (json.JSONDecodeError, KeyError, IndexError):
             continue
+    valid_tool_names = set(valid_tool_names or ())
+    for tc in tc_raw.values():
+        tc["function"]["name"] = _resolve_streamed_tool_name(
+            tc.pop("_name_parts", []), valid_tool_names)
     return finish_reason
 
 
@@ -1791,7 +1804,12 @@ def call_api_stream(messages, model, api_key, tool_choice="auto", session_id=Non
                     reasoning_parts=reasoning_parts,
                     thinking_parts=thinking_parts, thinking_sig=thinking_sig,
                     redacted_parts=redacted_parts,
-                    fix_dup_tool_index=(_active_provider == "gemini"),
+                    handle_gemini_metadata=(_active_provider == "gemini"),
+                    valid_tool_names={
+                        tool.get("function", {}).get("name", "")
+                        for tool in api_tools
+                        if tool.get("type") == "function"
+                    },
                     state=state)
             _rate_limit_mark()
             pool_mark_success(api_key)  # key này ổn → giảm fail_count (decay)
@@ -2708,7 +2726,7 @@ def _agent_turn_inner(messages, model, api_key, conn, sid, max_steps, agent, sta
                 # thật. Luôn strip field tạm "_thought_signature" khỏi MỌI
                 # tool_call trong tcs (kể cả khi không phải Gemini) để không
                 # rò rỉ field lạ vào payload của provider khác — dù trên
-                # thực tế field này chỉ được set khi fix_dup_tool_index=True
+                # thực tế field này chỉ được set khi handle_gemini_metadata=True
                 # (tức đã là Gemini) nên các provider khác không bao giờ có
                 # field này để mà strip, đây chỉ là phòng hờ thêm 1 lớp an
                 # toàn, không đổi hành vi của OpenAI mặc định/Anthropic/
