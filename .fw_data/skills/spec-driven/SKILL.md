@@ -28,6 +28,10 @@ Không cần bộ test hình thức — chỉ cần 1 câu trả lời được:
 để biết tính năng này hoạt động đúng như mong đợi?" Nếu không trả lời được câu này,
 có thể mục tiêu ở bước 1 vẫn còn mơ hồ.
 
+Khi cách verify cần Bash, chọn một command có trong mục `Bash tool` của
+`AGENTS.md`. Không ghép nhiều command vào một lần gọi; nếu thao tác không
+nằm trong allowlist, dùng tool chuyên dụng hoặc nói rõ blocker thay vì tìm cách lách.
+
 ---
 
 ## Khi nào bỏ qua bước này
