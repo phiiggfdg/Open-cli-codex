@@ -9,8 +9,6 @@ def get_active_tools() -> list:
 
 # Các pattern bash nguy hiểm có thể escape sandbox
 _BASH_DENY_PATTERNS = [
-    r"\bcd\s+/",           # cd /... (absolute)
-    r"\bcd\s+\.\.",        # cd ..
     r"\bsudo\b",
     r"\bsu\s",
     r"\bchroot\b",
@@ -26,72 +24,157 @@ _BASH_DENY_RE = re.compile("|".join(_BASH_DENY_PATTERNS))
 
 
 # ── Bash safety gates ───────────────────────────────────────────────────────
-# Bash is arbitrary code execution, not a filesystem sandbox. Build mode asks
-# for explicit permission; plan mode denies it completely.
-# Có 2 lớp permission độc lập:
-#   Lớp 1 — _check_permission() trong 08_undo_dispatch.py: hỏi "Allow? [y/N/a]"
-#            /perm bash allow chỉ ảnh hưởng lớp này (bỏ câu hỏi confirm).
-#   Lớp 2 — allowlist dưới đây (_BASH_ALLOW_RE): chặn
-#            lệnh không nằm trong danh sách (git/pytest/python/node/npm/make).
-#            /perm bash allow KHÔNG tắt lớp này — 2 lớp hoàn toàn độc lập.
-#   FIX (bug #1): trước đây allowlist chỉ check LỆNH ĐẦU TIÊN của session —
-#            sau khi 1 lệnh khớp allowlist chạy qua, cờ "_BASH_CONFIRMED" được
-#            set True vĩnh viễn và mọi lệnh sau đó (kể cả "rm -rf foo") bỏ qua
-#            hoàn toàn allowlist. Giờ allowlist được check ở MỌI lệnh — không
-#            còn cờ "đã confirm" nào tắt gate này nữa.
-_BASH_ALLOWLIST = [
-    r"^git\b",
-    r"^pytest\b",
-    r"^python(3)?\b",
-    r"^node\b",
-    r"^npm\b",
-    r"^pnpm\b",
-    r"^yarn\b",
-    r"^make\b",
-]
-_BASH_ALLOW_RE = re.compile("|".join(_BASH_ALLOWLIST), re.IGNORECASE)
+# Bash is arbitrary code execution, not an OS sandbox. Permission and command
+# validation are independent: /perm bash allow skips the prompt, never this gate.
+# One tool call may contain exactly one command. Rejecting shell composition
+# keeps the allowlist meaningful instead of merely checking the first command.
+_BASH_ALLOWED_COMMANDS = {
+    # Project/status inspection
+    "pwd", "ls", "rg", "grep", "wc", "file", "stat", "tree", "which",
+    "basename", "dirname", "date", "uname", "whoami", "echo", "printf",
+    # Version control, tests, runtimes, package/build tools
+    "git", "pytest", "python", "python3", "node", "npm", "pnpm", "yarn",
+    "make", "pip", "pip3", "ruff", "mypy", "eslint", "tsc",
+}
+_BASH_SERVE_COMMANDS = {"python", "python3", "node", "npm", "pnpm", "yarn"}
 
-# Pattern chặn file inspection qua bash — AI phải dùng read/glob/grep thay thế
-# head/tail chỉ block khi đứng đầu lệnh (không phải sau pipe)
-# FIX (bug #2): trước đây các pattern chỉ bắt khi cat/less/head/tail/find
-#            đứng ngay sau ^ / && / ; — dễ bypass bằng subshell "(cat f)"
-#            hoặc "bash -c 'cat f'" / "sh -c 'cat f'". Giờ thêm "(" làm
-#            boundary hợp lệ, và chặn riêng cú pháp "bash -c"/"sh -c"/"zsh -c"
-#            vì nội dung trong dấu quote không thể parse an toàn bằng regex.
-_BASH_INSPECT_PATTERNS = [
-    r"(?:^|&&|;|\()\s*cat\s+\S",           # cat <file> hoặc (cat <file>)
-    r"(?:^|&&|;|\()\s*less\s+\S",          # less <file> hoặc (less <file>)
-    r"(?:^|&&|;|\()\s*head\s+",            # head ... ở đầu lệnh / trong subshell
-    r"(?:^|&&|;|\()\s*tail\s+",            # tail ... ở đầu lệnh / trong subshell
-    r"(?:^|&&|;|\||\()\s*ls\s+-[a-zA-Z]*R",# ls -R, ls -lR ở bất kỳ đâu
-    r"(?:^|&&|;|\()\s*find\s+[./]",        # find . / find ./dir
-    r"\b(?:bash|sh|zsh)\s+-c\b",           # bash -c "..." / sh -c "..." — chặn
-                                            # toàn bộ vì nội dung bên trong quote
-                                            # không kiểm tra an toàn bằng regex.
-    # FIX (bug moi phat hien): cac pattern tren chi bat cu phap text cu the
-    # (cat/head/tail/find/ls -R/bash -c), nhung KHONG bat duoc interpreter
-    # nam SAN trong allowlist (python3/node/git) dung -c/-e/-p hoac subcommand
-    # de doc file y het cat -- vi ban than lenh do da nam trong allowlist nen
-    # khong bi chan o gate allowlist, va noi dung trong dau quote thi khong
-    # regex nao parse an toan duoc. Chan luon co che "eval inline code" cua
-    # cac interpreter nay va cac lenh git doc noi dung file qua lich su.
-    r"\bpython3?\s+(-\S+\s+)*-c\b",       # python3 -c "..." / python -u -c "..."
-    r"\bnode\s+(-\S+\s+)*-[ep]\b",        # node -e "..." / node -p "..."
-    r"\bgit\s+show\b",                    # git show <ref>:<path> doc noi dung file
-    r"\bgit\s+log\s+.*-p\b",              # git log -p in full diff/noi dung file
-]
-_BASH_INSPECT_RE = re.compile("|".join(_BASH_INSPECT_PATTERNS))
+# No chaining, pipes, redirects, subshells, command substitution, variable
+# expansion, or multiline shell. Quoted/escaped punctuation remains ordinary
+# argv text, which keeps regex patterns such as 'foo|bar$' usable with rg/grep.
+def _bash_has_unquoted_shell_control(command: str) -> bool:
+    quote = None
+    escaped = False
+    for char in command:
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if quote is not None:
+            if char == quote:
+                quote = None
+            continue
+        if char in ("'", '"'):
+            quote = char
+        elif char in ";&|<>`$()!\n\r":
+            return True
+    return False
+
+
+def _bash_command_name(token: str) -> str:
+    name = Path(token).name.lower()
+    if re.fullmatch(r"python3(?:\.\d+)?", name):
+        return "python3"
+    if re.fullmatch(r"pip3(?:\.\d+)?", name):
+        return "pip3"
+    return name
+
+
+def _bash_path_is_inside_project(raw: str) -> bool:
+    """Reject explicit paths that resolve outside project_dir.
+
+    This is a path guard, not a sandbox: an allowed Python/Node script still has
+    the permissions of this process and must itself be trusted.
+    """
+    if _project_dir is None:
+        return not raw.startswith(("/", "~", ".."))
+    value = raw.split("=", 1)[-1] if "=" in raw else raw
+    if "://" in value or not value:
+        return True
+    looks_like_path = value.startswith(("/", "~", ".")) or "/" in value
+    if not looks_like_path:
+        return True
+    try:
+        proj = _project_dir.resolve()
+        expanded = Path(value).expanduser()
+        resolved = expanded.resolve() if expanded.is_absolute() else (proj / expanded).resolve()
+        resolved.relative_to(proj)
+        return True
+    except Exception:
+        return False
+
+
+def _validate_bash_command(command: str, for_serve: bool = False):
+    """Return (allowed, reason, argv) for one non-composed shell command."""
+    command = (command or "").strip()
+    if not command:
+        return False, "Lệnh trống.", []
+    if _bash_has_unquoted_shell_control(command):
+        return False, (
+            "Không hỗ trợ nối lệnh, pipe, redirect, subshell, biến shell hoặc "
+            "lệnh nhiều dòng. Mỗi lần gọi bash chỉ chạy một command."
+        ), []
+    try:
+        argv = shlex.split(command, posix=True)
+    except ValueError as e:
+        return False, f"Cú pháp quote không hợp lệ: {e}", []
+    if not argv:
+        return False, "Lệnh trống.", []
+
+    name = _bash_command_name(argv[0])
+    allowed = _BASH_SERVE_COMMANDS if for_serve else _BASH_ALLOWED_COMMANDS
+    if "/" in argv[0] or "\\" in argv[0]:
+        return False, "Phải gọi command bằng tên trong PATH, không gọi executable qua path.", argv
+    if name not in allowed:
+        return False, f"Command '{name}' không nằm trong allowlist.", argv
+
+    if name in ("python", "python3") and "-c" in argv[1:]:
+        return False, "python -c bị chặn; hãy viết file .py trong project rồi chạy file đó.", argv
+    if name == "node" and any(a in ("-e", "--eval", "-p", "--print") for a in argv[1:]):
+        return False, "node eval/print inline bị chặn; hãy chạy file .js trong project.", argv
+
+    if name == "git":
+        lower = [a.lower() for a in argv[1:]]
+        if "push" in lower:
+            return False, "git push là thay đổi remote và không được chạy qua Bash tool.", argv
+        if "clean" in lower or ("reset" in lower and "--hard" in lower):
+            return False, "git clean và git reset --hard bị chặn vì khó khôi phục.", argv
+    if name in ("npm", "pnpm", "yarn") and "publish" in [a.lower() for a in argv[1:]]:
+        return False, "Publish package là thay đổi remote và bị chặn.", argv
+
+    lower = [a.lower() for a in argv[1:]]
+    is_pip_install = name in ("pip", "pip3") and "install" in lower
+    is_python_pip_install = (
+        name in ("python", "python3") and lower[:2] == ["-m", "pip"]
+        and "install" in lower
+    )
+    if (is_pip_install or is_python_pip_install) and "--break-system-packages" not in argv[1:]:
+        return False, "Termux yêu cầu pip install kèm --break-system-packages.", argv
+
+    if name == "ls" and any(a == "--recursive" or (a.startswith("-") and "R" in a[1:]) for a in argv[1:]):
+        return False, "ls recursive bị chặn; dùng glob với pattern hẹp.", argv
+
+    for arg in argv[1:]:
+        if arg.startswith("-C") and len(arg) > 2 and not _bash_path_is_inside_project(arg[2:]):
+            return False, f"Path nằm ngoài project bị chặn: {arg[2:]}", argv
+        if arg.startswith("-") and "=" not in arg:
+            continue
+        if not _bash_path_is_inside_project(arg):
+            return False, f"Path nằm ngoài project bị chặn: {arg}", argv
+
+    if for_serve:
+        valid_server = (
+            (name in ("python", "python3") and lower[:2] == ["-m", "http.server"])
+            or (name == "node" and bool(argv[1:]) and not argv[1].startswith("-"))
+            or (name == "npm" and lower[:1] in (["start"], ["run"]))
+            or (name in ("pnpm", "yarn") and bool(lower)
+                and lower[0] in ("run", "start", "dev", "serve", "preview"))
+        )
+        if not valid_server:
+            return False, (
+                "serve: chỉ cho phép python -m http.server, node <file>, npm run/start, "
+                "hoặc pnpm/yarn run|start|dev|serve|preview."
+            ), argv
+    return True, "", argv
 
 # ── Nhánh riêng: "serve:" — chạy 1 process SỐNG MÃI (preview dev server) ────
 # Lý do cần tách hẳn khỏi logic bash thường (không chung code path, không
 # đụng allowlist/deny/timeout cũ ở dưới): subprocess.run(...) mặc định CHỜ
 # process kết thúc. Với 1 lệnh cố ý chạy mãi mãi (http.server, node listen,
 # npm run dev...), nó KHÔNG BAO GIỜ tự thoát -- tool_bash cũ luôn timeout sau
-# N giây, và tệ hơn: shell=True tạo ra shell (con) -> lệnh thật (cháu), khi
-# TimeoutExpired chỉ kill được shell (con), process thật (cháu) SỐNG SÓT làm
-# zombie giữ nguyên cổng mãi mãi -- xác nhận bằng thực nghiệm (pgrep vẫn thấy
-# process sau khi TimeoutExpired). Mỗi lần agent thử lại -> thêm 1 zombie mới,
-# không dọn cái cũ, cổng dần bị chiếm hết không rõ lý do.
+# N giây. Nhánh serve dùng Popen + process group riêng để server có thể
+# sống nền và được dọn trọn group khi thay thế, không tích luỹ process giữ cổng.
 #
 # Cú pháp: "serve: <lệnh thật>", ví dụ "serve: python3 -m http.server 8080".
 # Không dùng cú pháp này -> rơi xuống nhánh bash thường bên dưới, KHÔNG đổi
@@ -380,7 +463,7 @@ def _serve_kill_port_owner(run_cwd: str, port: int) -> str | None:
         _serve_log(run_cwd, f"LỖI dò process giữ port {port}: {e!r}")
     return None
 
-def tool_bash_serve(inner_command: str) -> str:
+def tool_bash_serve(inner_command: str, argv: list[str]) -> str:
     """Nhánh 'serve:' của tool_bash -- xem comment khối phía trên. Tách hàm
     riêng để code path hoàn toàn độc lập, dễ đọc, không lẫn vào nhánh bash
     thường (không share biến/state nào ngoài _project_dir đọc-only)."""
@@ -391,10 +474,8 @@ def tool_bash_serve(inner_command: str) -> str:
     old_cmd = _serve_kill_existing(key)
     if old_cmd:
         time.sleep(0.15)  # đệm nhỏ: os.killpg gửi SIGTERM cho cả process group,
-        # nhưng proc.wait() ở _serve_kill_existing chỉ đảm bảo process CHA (shell,
-        # do shell=True) đã chết -- process CON thật (vd http.server) nhận SIGTERM
-        # cùng lúc nhưng có thể cần thêm chút thời gian để tự thoát (khác SIGKILL
-        # chết ngay tức khắc). Không có đệm này, bước check port ngay sau đây có
+        # nhưng process con trong group có thể cần thêm chút thời gian để tự thoát.
+        # Không có đệm này, bước check port ngay sau đây có
         # thể vẫn thấy port "bận" bởi chính con của server VỪA kill (race), rồi
         # báo nhầm nó là "process lạ" trong message trả về -- vô hại về chức
         # năng (vẫn kill đúng, port vẫn được giải phóng) nhưng gây hiểu lầm khi
@@ -431,7 +512,7 @@ def tool_bash_serve(inner_command: str) -> str:
             # tức thời, nhưng thêm 1 khoảng nhỏ vẫn an toàn hơn không có gì).
     try:
         proc = subprocess.Popen(
-            inner_command, shell=True, cwd=run_cwd,
+            argv, shell=False, cwd=run_cwd,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             stdin=subprocess.DEVNULL,
             start_new_session=True,  # process group riêng -- killpg dọn sạch cả cháu
@@ -510,59 +591,31 @@ def tool_bash_serve(inner_command: str) -> str:
     )
 
 def tool_bash(command, timeout=30):
-    # FIX (bug moi phat hien #1 - nghiem trong): truoc day _SERVE_PREFIX_RE
-    # duoc check DAU TIEN, truoc ca deny-gate, nen "serve: rm -rf /" hay
-    # "serve: sudo reboot" chay THANG qua Popen(shell=True) khong qua bat ky
-    # policy nao (khong allowlist, khong denylist, khong inspect-block) --
-    # xac nhan bang test that. Deny-gate phai ap dung cho CA 2 nhanh (serve
-    # va bash thuong) vi no la phong thu toi thieu chong lenh pha huy ro rang
-    # (rm -rf /, sudo, chroot...), khong co ly do gi nhanh serve duoc mien.
-    # Allowlist/inspect-gate thi KHONG ap cho serve (dev server nhu "npm run
-    # dev"/"python3 -m http.server" von khong nam trong allowlist text don
-    # gian va khong phai hanh vi doc file) -- chi rieng deny-gate la bat buoc
-    # chung cho ca 2 nhanh.
-    #
-    # FIX (bug da co tu truoc, giu nguyen o day): deny-check truoc day nam
-    # BEN TRONG "if _project_dir is not None" -- nghia la neu _project_dir la
-    # None (chay ngoai sandbox), deny-gate hoan toan khong chay. Deny-gate la
-    # phong thu co ban, khong nen phu thuoc _project_dir co ton tai hay
-    # khong -- keo ra ngoai, chay vo dieu kien.
+    # Fast deny catches obviously dangerous text for both normal and serve mode;
+    # the structured validator below enforces the complete command policy.
     if _BASH_DENY_RE.search(command):
         proj_hint = str(_project_dir.resolve()) if _project_dir is not None else os.getcwd()
         return (f"[policy] Lệnh nguy hiểm bị chặn.\n"
                 f"Thư mục chạy dự kiến: {proj_hint}\n"
                 f"Lệnh bị từ chối: {command[:200]}")
 
-    # Nhánh riêng "serve: ..." -- rẽ SAU deny-gate (xem fix ở trên), trước
-    # allowlist/inspect-gate bên dưới, vì đây là 1 cơ chế khác hẳn (Popen nền,
-    # không chờ, không timeout). Không dùng "serve:" -> rơi xuống logic gốc,
-    # không đổi gì cho các lệnh khác.
+    # Nhánh serve dùng Popen nền nhưng vẫn phải qua validator. Trước đây
+    # nhánh này bỏ qua allowlist, khiến "serve: <lệnh bất kỳ>" trở thành
+    # đường chạy shell tự do dù process có thoát ngay sau đó.
     m = _SERVE_PREFIX_RE.match(command)
     if m:
-        return tool_bash_serve(command[m.end():])
+        inner = command[m.end():]
+        allowed, reason, serve_argv = _validate_bash_command(inner, for_serve=True)
+        if not allowed:
+            return f"[policy] serve command blocked.\nLý do: {reason}"
+        return tool_bash_serve(inner, serve_argv)
 
-    # Chặn file inspection qua bash — AI phải dùng read/glob/grep thay thế
-    if _BASH_INSPECT_RE.search(command):
-        return (
-            "[policy] Không được dùng bash để đọc/liệt kê file.\n"
-            "Dùng các tool chuyên dụng thay thế:\n"
-            "  • cat / head / tail / less  → read(path, offset, limit)\n"
-            "  • ls -R / find .            → glob(pattern) hoặc read(dir)\n"
-            "  • bash -c / sh -c           → không hỗ trợ, dùng tool trực tiếp\n"
-            "  • python3 -c / node -e / -p → không hỗ trợ eval inline, chạy file thay thế\n"
-            "  • git show / git log -p     → dùng read(path) hoặc git log không -p\n"
-            "Lý do: bash file inspection lãng phí token, phá cache context,\n"
-            "và subshell/`-c`/eval-inline không kiểm tra an toàn được bằng policy này."
-        )
-
-
-
-    # ── Allowlist gate (minimal) — áp dụng cho MỌI lệnh, không chỉ lệnh đầu ──
-    if not _BASH_ALLOW_RE.search(command.strip()):
+    allowed, reason, argv = _validate_bash_command(command)
+    if not allowed:
         return (
             "[policy] bash command blocked by allowlist.\n"
-            "Hãy dùng lệnh trong allowlist (git/pytest/python/node/npm/make) hoặc\n"
-            "đổi strategy (tools read/write/edit/apply_patch)."
+            f"Lý do: {reason}\n"
+            "Dùng tool read/write/edit/delete/glob/grep khi command không được phép."
         )
     if _project_dir is not None:
         proj = _project_dir.resolve()
@@ -570,17 +623,14 @@ def tool_bash(command, timeout=30):
         # NOTE: deny-check đã chuyển lên đầu hàm (áp dụng chung cho serve +
         # bash thường) — không lặp lại ở đây nữa.
 
-        # Chạy trong project_dir, không phải cwd tuỳ tiện
+        # Chạy trong project_dir, không phải cwd tuỳ tiện.
         run_cwd = str(proj)
-        # Inject cd để chắc chắn shell bắt đầu đúng chỗ
-        wrapped = f"cd {shlex.quote(run_cwd)} && {command}"
     else:
         run_cwd = os.getcwd()
-        wrapped = command
 
     started = time.time()
     try:
-        r = subprocess.run(wrapped, shell=True, capture_output=True,
+        r = subprocess.run(argv, shell=False, capture_output=True,
                            text=True, timeout=int(timeout), cwd=run_cwd)
         elapsed = time.time() - started
         return _format_bash_result(command, r.returncode, r.stdout, r.stderr,
@@ -707,13 +757,79 @@ def _head_tail(text: str, max_chars: int, label="tool output") -> str:
     cut  = len(text) - max_chars
     return f"{head}\n\n... [{cut:,} chars omitted from middle of {label}] ...\n\n{tail}"
 
-def _prune_tool_results(messages: list) -> list:
+def _history_tool_call_key(name: str, args: dict) -> tuple | None:
+    """Canonical key for history dedup.
+
+    Dedup must describe the complete query, not merely the target path. Reads
+    at different offsets, grep calls with different patterns, and different
+    symbols in one file are distinct evidence and must remain distinct.
+    """
+    if name not in {"read", "grep", "glob", "view_symbol"}:
+        return None
+    try:
+        normalized = dict(args)
+        if name == "read":
+            normalized.setdefault("offset", 1)
+            normalized.setdefault("limit", READ_DEFAULT_LIMIT)
+            normalized.setdefault("depth", 4)
+        elif name == "glob":
+            normalized["cwd"] = normalized.get("cwd") or ""
+        elif name == "grep":
+            defaults = {
+                "path": None, "glob": None, "ignore_case": False,
+                "fixed_string": False, "invert": False, "word": False,
+                "context": 0, "max_count": None, "files_only": False,
+                "multiline": False,
+            }
+            for field, value in defaults.items():
+                normalized.setdefault(field, value)
+        canonical = json.dumps(normalized, sort_keys=True, separators=(",", ":"),
+                               ensure_ascii=False)
+    except (TypeError, ValueError):
+        return None
+    return name, canonical
+
+
+def _compact_heavy_tool_call(tc: dict) -> dict:
+    """Strip generated file content from an old tool call, preserving metadata."""
+    name = tc.get("function", {}).get("name", "")
+    if name not in {"write", "multiedit", "apply_patch", "edit"}:
+        return tc
+    try:
+        args = json.loads(tc["function"]["arguments"])
+        changed = False
+        placeholder = _HISTORY_COMPACTED_MARKER
+        for field in ("content", "patch", "new_str"):
+            if field in args:
+                args[field] = placeholder
+                changed = True
+        for edit_item in args.get("edits", []):
+            if "new_str" in edit_item:
+                edit_item["new_str"] = placeholder
+                changed = True
+        if changed:
+            return {
+                **tc,
+                "function": {
+                    **tc["function"],
+                    "arguments": json.dumps(args, ensure_ascii=False),
+                },
+            }
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        pass
+    return tc
+
+
+def _prune_tool_results(messages: list, keep_full_turns: int | None = None) -> list:
     """
     Giảm token tool_result trong context:
-    1. Stub các tool_result cũ hơn TOOL_KEEP_FULL_TURNS
-    2. Dedup read/glob/grep: nếu cùng file bị read nhiều lần,
-       chỉ giữ lần gần nhất đầy đủ, các lần cũ hơn → stub
+    1. Stub các tool_result cũ hơn keep_full_turns
+    2. Dedup exact read/glob/grep/view_symbol calls; distinct ranges, patterns
+       and symbols are never merged merely because they share a path.
     """
+    if keep_full_turns is None:
+        keep_full_turns = TOOL_KEEP_FULL_TURNS
+    keep_full_turns = max(0, int(keep_full_turns))
     # ── Bước 1: xác định groups (assistant+tool_calls → tool_results) ─────────
     groups = []
     i = 0
@@ -730,20 +846,19 @@ def _prune_tool_results(messages: list) -> list:
             i += 1
 
     # Stub các group cũ
-    old_groups = groups[:-TOOL_KEEP_FULL_TURNS] if len(groups) > TOOL_KEEP_FULL_TURNS else []
+    if keep_full_turns == 0:
+        old_groups = groups
+    else:
+        old_groups = groups[:-keep_full_turns] if len(groups) > keep_full_turns else []
     stub_indices = set()
     for start, end in old_groups:
         for idx in range(start, end + 1):
             stub_indices.add(idx)
 
-    # ── Bước 2: dedup read/glob/grep theo file path ───────────────────────────
-    # Map tool_call_id → tool_name cho các assistant messages
-    # FIX (bug #4): tool "glob" dùng tham số "pattern"/"cwd", KHÔNG có "path"
-    # (xem schema trong 05_session_db.py). Code cũ chỉ đọc args.get("path", "")
-    # nên với "glob" key dedup luôn là "" → "not path" = True → toàn bộ kết quả
-    # glob bị skip khỏi dedup, dù "glob" có mặt trong DEDUPABLE bên dưới (dead
-    # code). Giờ xây dựng key riêng cho từng tool: glob dùng "cwd|pattern".
-    tc_id_to_name: dict[str, str] = {}
+    # ── Bước 2: dedup exact read/glob/grep/view_symbol calls ─────────────────
+    # Map tool_call_id → canonical full-query key. Using only path here loses
+    # evidence from a different read range, grep pattern or symbol.
+    tc_id_to_key: dict[str, tuple] = {}
     for m in messages:
         if m.get("role") == "assistant" and m.get("tool_calls"):
             for tc in m["tool_calls"]:
@@ -753,32 +868,21 @@ def _prune_tool_results(messages: list) -> list:
                     args = json.loads(args_raw)
                 except Exception:
                     args = {}
-                if name == "glob":
-                    # glob không có "path" — dùng cwd+pattern làm key dedup
-                    cwd = args.get("cwd", "")
-                    pattern = args.get("pattern", "")
-                    path = f"{cwd}|{pattern}" if pattern else ""
-                else:
-                    path = args.get("path", "")
-                tc_id_to_name[tc.get("id", "")] = (name, path)
+                key = _history_tool_call_key(name, args)
+                if key is not None:
+                    tc_id_to_key[tc.get("id", "")] = key
 
-    # Tìm các tool_result là read/grep/glob cùng path — chỉ giữ lần cuối
-    DEDUPABLE = {"read", "grep", "glob", "view_symbol"}
-    # Duyệt ngược: lần đầu gặp (= lần mới nhất) → giữ, sau đó → stub
-    seen_file_tool: set[tuple] = set()  # (tool_name, path)
+    # Duyệt ngược: exact call mới nhất giữ đầy đủ, bản exact cũ hơn → stub.
+    seen_file_tool: set[tuple] = set()
     dedup_stub: set[int] = set()
     for idx in range(len(messages) - 1, -1, -1):
         m = messages[idx]
         if m.get("role") != "tool":
             continue
         tc_id = m.get("tool_call_id", "")
-        info = tc_id_to_name.get(tc_id)
-        if not info:
+        key = tc_id_to_key.get(tc_id)
+        if key is None:
             continue
-        name, path = info
-        if name not in DEDUPABLE or not path:
-            continue
-        key = (name, path)
         if key in seen_file_tool:
             dedup_stub.add(idx)
         else:
@@ -803,7 +907,6 @@ def _prune_tool_results(messages: list) -> list:
     # write/multiedit/apply_patch/edit lưu full content trong arguments →
     # nằm mãi trong history nếu không strip → phình token mỗi step.
     # Chỉ strip các turn cũ (ngoài TOOL_KEEP_FULL_TURNS gần nhất).
-    STRIP_TOOLS = {"write", "multiedit", "apply_patch", "edit"}
     # Tìm index của assistant message thuộc các group cũ
     old_assistant_indices: set[int] = set()
     for start, end in old_groups:
@@ -815,34 +918,8 @@ def _prune_tool_results(messages: list) -> list:
     stripped_result = []
     for idx, m in enumerate(result):
         if idx in old_assistant_indices and m.get("role") == "assistant" and m.get("tool_calls"):
-            new_tcs = []
-            changed = False
-            for tc in m["tool_calls"]:
-                name = tc.get("function", {}).get("name", "")
-                if name in STRIP_TOOLS:
-                    try:
-                        args = json.loads(tc["function"]["arguments"])
-                        placeholder = _HISTORY_COMPACTED_MARKER
-                        if "content" in args:
-                            args["content"] = placeholder
-                            changed = True
-                        if "patch" in args:
-                            args["patch"] = placeholder
-                            changed = True
-                        if "new_str" in args:
-                            args["new_str"] = placeholder
-                            changed = True
-                        if "edits" in args:
-                            for e in args["edits"]:
-                                if "new_str" in e:
-                                    e["new_str"] = placeholder
-                                    changed = True
-                        if changed:
-                            tc = {**tc, "function": {**tc["function"], "arguments": json.dumps(args)}}
-                    except Exception:
-                        pass
-                new_tcs.append(tc)
-            if changed:
+            new_tcs = [_compact_heavy_tool_call(tc) for tc in m["tool_calls"]]
+            if new_tcs != m["tool_calls"]:
                 m = {**m, "tool_calls": new_tcs}
         stripped_result.append(m)
 
@@ -1446,6 +1523,77 @@ def tool_write(path, content, conn=None, sid=None):
     except Exception as e:
         return f"[error: {e}]"
 
+
+def tool_delete(path, conn=None, sid=None):
+    """Xoá 1 file (không xoá thư mục). Khác tool_write/_resolve_to_sandbox:
+    dùng _check_sandbox_read để TỪ CHỐI thẳng path ngoài sandbox thay vì
+    redirect — với ghi (write) thì redirect vào đúng chỗ là hợp lý, nhưng
+    với xoá thì redirect âm thầm có thể khiến model tưởng đã xoá đúng file
+    trong khi thực ra xoá nhầm 1 file trùng tên khác trong sandbox.
+    Ghi snapshot (before=nội_dung_cũ, after=None) để undo() phục hồi được,
+    đối xứng với cách tool_write dùng before=None cho việc tạo mới.
+
+    BUG FIX #1 (sandbox hở nếu delete là thao tác file đầu tiên trong
+    session): trước đây hàm chỉ gọi _check_sandbox_read() (đọc flag), không
+    bao giờ gọi _ensure_project_dir() (set flag is_placeholder=False) như
+    tool_write/_resolve_to_sandbox làm. Nếu session chưa từng write, sandbox
+    vẫn ở trạng thái placeholder ("chưa enforce"), nên delete có thể xoá bất
+    kỳ file nào ngoài project_dir mà không bị chặn. Fix: nếu đang trong 1
+    session thật (conn và sid có), gọi _ensure_project_dir() trước để trigger
+    flip flag (bỏ qua giá trị trả về — không dùng để redirect path, giữ đúng
+    triết lý "từ chối thẳng, không redirect" của tool này). Nếu không có
+    conn/sid (gọi rời rạc, không qua session) thì giữ nguyên hành vi cũ,
+    không đổi gì.
+
+    BUG FIX #2 (mất file vĩnh viễn nếu snapshot_save lỗi): trước đây thứ tự
+    là unlink() xong mới snapshot_save(), không bọc try/except quanh bước
+    lưu snapshot. Nếu bước đó lỗi (DB lock, disk full, v.v.) → file đã mất,
+    không undo được, exception bay thẳng ra ngoài. Fix: lưu snapshot TRƯỚC
+    khi xoá thật, bọc trong try/except — nếu lỗi thì trả về thông báo lỗi,
+    KHÔNG xoá file, giữ nguyên trạng thái an toàn. Chỉ khi snapshot lưu
+    thành công (hoặc không có conn/sid — trường hợp không cần undo) mới gọi
+    unlink(). snapshot_save() dùng 1 INSERT + commit() duy nhất (transaction
+    đơn) nên nếu raise thì không có record nào bị ghi nửa chừng — không cần
+    dọn dẹp gì thêm ở phía caller.
+    """
+    if conn and sid:
+        _ensure_project_dir(path)  # chỉ để trigger flip flag, không dùng return value
+    err = _check_sandbox_read(path)
+    if err:
+        return err
+    p = Path(path).expanduser().resolve()
+    if not p.exists():
+        return f"[not found: {path}]"
+    if p.is_dir():
+        return (f"[error] '{path}' là thư mục, tool này chỉ xoá file đơn lẻ "
+                f"để tránh xoá nhầm hàng loạt. Xoá từng file bên trong nếu cần.")
+    try:
+        before = p.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        before = None  # file nhị phân hoặc không đọc được text — vẫn xoá được,
+                        # nhưng undo sẽ không khôi phục đúng nội dung gốc.
+
+    resolved = str(p)
+    snap = None
+    if conn and sid:
+        try:
+            snap = snapshot_save(conn, sid, resolved, before, None)
+        except Exception as e:
+            return (f"[error] Không lưu được snapshot để undo, huỷ bỏ thao tác xoá "
+                    f"(file '{path}' vẫn còn nguyên, chưa bị xoá): {e}")
+
+    try:
+        p.unlink()
+    except Exception as e:
+        return f"[error deleting {path}: {e}]"
+
+    _file_cache.pop(resolved, None)
+    _file_read_time.pop(resolved, None)
+    _recent_writes.discard(resolved)
+    if snap is not None:
+        _undo_stack.append(snap)
+        _redo_stack.clear()
+    return f"Deleted {resolved}" + ("" if before is not None else " (nội dung gốc không lưu được để undo — file không phải text UTF-8)")
 
 def tool_extract(src, start, end, dst, mode="move", conn=None, sid=None):
     """Lấy nguyên vẹn các dòng [start..end] (1-indexed, inclusive) từ src,

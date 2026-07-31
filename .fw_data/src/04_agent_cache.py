@@ -11,6 +11,7 @@ PERM_DENY  = "deny"
 DEFAULT_PERMS = {
     "bash":        PERM_ASK,    # dangerous — ask by default
     "write":       PERM_ALLOW,
+    "delete":      PERM_ALLOW,  # undo-stack bảo vệ giống write/edit
     "extract":     PERM_ALLOW,
     "edit":        PERM_ALLOW,
     "apply_patch": PERM_ALLOW,
@@ -31,6 +32,7 @@ DEFAULT_PERMS = {
 PLAN_PERMS = {
     "bash":        PERM_DENY,
     "write":       PERM_DENY,
+    "delete":      PERM_DENY,
     "extract":     PERM_DENY,
     "edit":        PERM_DENY,
     "apply_patch": PERM_DENY,
@@ -395,6 +397,21 @@ def _cache_invalidate(path: str):
     được cả khi KHÔNG ép mtime giả tạo, chỉ cần ghi đè file cùng giây.
     Fix: bỏ fast-path, luôn hash-check. Chi phí chấp nhận được vì _content_hash
     đã tự sample 4KB đầu+cuối cho file >50KB, không đọc toàn bộ file lớn.
+
+    BUG FIX #2 (index.json không đồng bộ với _file_cache khi external edit):
+    trước đây hàm này chỉ pop _file_cache, không đụng gì tới index.json (đọc
+    bởi tool_file_index — lệnh /file_index hoặc "map index" trong CLI/web).
+    Hệ quả thực tế: nếu 1 file được tạo/đọc lần đầu lúc nội dung còn rỗng
+    hoặc chưa có def/class (ví dụ agent tạo file trống, user tự gõ code sau
+    bằng editor khác trên Termux/Android — KHÔNG qua tool_write/tool_edit),
+    index.json giữ nguyên "symbols": {} từ lần cache đầu tiên đó MÃI MÃI, dù
+    _file_cache đã đúng invalidate. Người dùng thấy mọi file .py trong index
+    đều "symbols": {} dù file có def/class thật, vì tool_file_index chỉ đọc
+    index.json (không tự parse lại). Fix: khi phát hiện external edit hoặc
+    file bị xoá, xoá luôn entry tương ứng khỏi index.json — lần read/write
+    kế tiếp trên file đó sẽ tự rebuild symbols đúng qua _cache_put(). Không
+    đổi hành vi khi file không có gì thay đổi (nhánh hash khớp bên dưới vẫn
+    giữ nguyên, không đụng index).
     """
     key = str(Path(path).expanduser().resolve())
     if key not in _file_cache:
@@ -403,6 +420,7 @@ def _cache_invalidate(path: str):
     if not p.exists():
         _cache_log("-", key, "file deleted")
         _file_cache.pop(key, None)
+        _index_drop_stale_entry(key)
         return
     try:
         cached_hash  = _file_cache[key].get("hash", "")
@@ -415,6 +433,7 @@ def _cache_invalidate(path: str):
             if real_mtime > cached_mtime + 1:
                 _cache_log("-", key, "mtime changed, no hash to verify")
                 _file_cache.pop(key, None)
+                _index_drop_stale_entry(key)
             return
 
         real_content = p.read_text(errors="replace")
@@ -427,9 +446,35 @@ def _cache_invalidate(path: str):
 
         _cache_log("-", key, f"external edit detected (hash {cached_hash} → {real_hash})")
         _file_cache.pop(key, None)
+        _index_drop_stale_entry(key)
 
     except Exception as e:
         _cache_log("?", key, f"check error: {e}")
+
+def _index_drop_stale_entry(abs_path_key: str):
+    """Xoá 1 entry khỏi index.json theo abs path (best-effort, không raise).
+    Dùng khi _cache_invalidate() phát hiện file đã đổi/mất từ bên ngoài agent,
+    để tool_file_index() không tiếp tục hiển thị symbols cũ/sai của entry đó.
+    _index_load/_index_save được định nghĩa ở 06_tools_fs.py (load SAU file
+    này) nhưng tra cứu tên global chỉ xảy ra lúc hàm THỰC THI, không phải lúc
+    định nghĩa — nên gọi được bình thường, giống các global cross-file khác
+    trong project (xem comment đầu fw.py).
+    """
+    try:
+        index = _index_load()
+    except Exception:
+        return
+    stale_rel = None
+    for rel, info in index.items():
+        try:
+            if str(Path(info.get("path", "")).resolve()) == abs_path_key:
+                stale_rel = rel
+                break
+        except Exception:
+            continue
+    if stale_rel is not None:
+        del index[stale_rel]
+        _index_save(index)
 
 def _cache_validate_all():
     """Quét toàn cache trước mỗi turn — drop entry nào stale."""
@@ -602,7 +647,7 @@ def db_connect():
             session_id  TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE,
             path        TEXT NOT NULL,
             before      TEXT,
-            after       TEXT NOT NULL,
+            after       TEXT,
             created_at  INTEGER NOT NULL,
             undone      INTEGER NOT NULL DEFAULT 0
         );
@@ -632,6 +677,33 @@ def db_connect():
     if "undone" not in snapshot_cols:
         conn.execute(
             "ALTER TABLE file_snapshot ADD COLUMN undone INTEGER NOT NULL DEFAULT 0")
+        conn.commit()
+    # Migration: DB cũ có thể đã tạo file_snapshot với `after TEXT NOT NULL`
+    # (bug gốc). tool_delete() cần ghi after=NULL để đánh dấu "sau khi xoá
+    # thì không còn nội dung" — SQLite chặn insert NULL vào cột NOT NULL nên
+    # trước đây delete crash với IntegrityError. SQLite không hỗ trợ
+    # ALTER COLUMN để bỏ NOT NULL trực tiếp, nên phải rebuild bảng qua bảng
+    # tạm khi phát hiện constraint cũ.
+    after_info = next((r for r in conn.execute(
+        "PRAGMA table_info(file_snapshot)").fetchall() if r[1] == "after"), None)
+    if after_info is not None and after_info[3] == 1:  # notnull flag == 1
+        conn.executescript("""
+            CREATE TABLE file_snapshot_new (
+                id          TEXT PRIMARY KEY,
+                session_id  TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE,
+                path        TEXT NOT NULL,
+                before      TEXT,
+                after       TEXT,
+                created_at  INTEGER NOT NULL,
+                undone      INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT INTO file_snapshot_new
+                (id, session_id, path, before, after, created_at, undone)
+                SELECT id, session_id, path, before, after, created_at, undone
+                FROM file_snapshot;
+            DROP TABLE file_snapshot;
+            ALTER TABLE file_snapshot_new RENAME TO file_snapshot;
+        """)
         conn.commit()
     conn.commit()
     return conn

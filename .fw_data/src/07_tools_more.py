@@ -1046,6 +1046,28 @@ def tool_question(question, options=None, state=None):
     except (EOFError, KeyboardInterrupt):
         return "(user did not answer)"
 
+def _list_available_skills(exclude_name=None):
+    """Quét SKILLS_DIRS, trả về danh sách tên skill có thật (không hardcode).
+    Cùng guard traversal như nhánh đọc nội dung — bỏ qua symlink/entry
+    resolve ra ngoài skills_dir (xem BUG FIX ở tool_skill bên dưới).
+    exclude_name: bỏ tên này khỏi kết quả (vd skill vừa load xong, để không
+    tự liệt kê chính nó trong gợi ý "còn lại").
+    """
+    available = []
+    for sd in SKILLS_DIRS:
+        if sd.exists():
+            sd_resolved = sd.resolve()
+            for f in sd.rglob("*.md"):
+                try:
+                    f.resolve().relative_to(sd_resolved)
+                except ValueError:
+                    continue  # symlink/entry trỏ ra ngoài skills_dir — không liệt kê tên
+                # Skill dạng thư mục (name/SKILL.md) → hiện tên thư mục, không phải "SKILL"
+                skill_name = f.parent.name if f.stem.upper() == "SKILL" else f.stem
+                if skill_name != exclude_name and skill_name not in available:
+                    available.append(skill_name)
+    return available
+
 def tool_skill(name):
     """Load a SKILL.md file by name from known skills directories."""
     # Normalise: strip .md suffix, try variations
@@ -1088,31 +1110,17 @@ def tool_skill(name):
                         _st.emit(EV_INFO, text=_txt, raw=True)
                     else:
                         print(_txt)
+                    # Danh sách skill khác được cung cấp 1 lần ở đầu conversation
+                    # qua _inject_agents_md_once() (09_api_system.py) — bền hơn
+                    # vì không bị _prune_tool_results stub sau TOOL_KEEP_FULL_TURNS
+                    # turns. Không lặp lại ở đây để tránh 2 nguồn cùng nói 1 việc.
                     return content
                 except Exception as e:
                     return f"[error reading skill: {e}]"
-    # List available skills
-    # BUG FIX: nhánh liệt kê này trước đây KHÔNG áp cùng guard traversal như
-    # nhánh đọc nội dung ở trên — sd.rglob("*.md") liệt kê TẤT CẢ file .md
-    # tìm thấy, kể cả khi đó là 1 symlink trỏ RA NGOÀI skills_dir. Test tái
-    # hiện thật: tạo symlink "evil_link2.md" trong skills_dir trỏ tới file bí
-    # mật ngoài skills_dir → dù KHÔNG đọc được NỘI DUNG (guard ở nhánh đọc
-    # vẫn chặn đúng), TÊN "evil_link2" vẫn xuất hiện trong gợi ý
-    # "Available: ..." — rò rỉ thông tin nhỏ (biết tên 1 symlink tồn tại,
-    # không phải nội dung bí mật). Fix: áp cùng guard traversal khi liệt kê,
-    # bỏ qua file nào resolve ra ngoài skills_dir_resolved, nhất quán với
-    # nhánh đọc nội dung.
-    available = []
-    for sd in SKILLS_DIRS:
-        if sd.exists():
-            sd_resolved = sd.resolve()
-            for f in sd.rglob("*.md"):
-                try:
-                    f.resolve().relative_to(sd_resolved)
-                except ValueError:
-                    continue  # symlink/entry trỏ ra ngoài skills_dir — không liệt kê tên
-                # Skill dạng thư mục (name/SKILL.md) → hiện tên thư mục, không phải "SKILL"
-                available.append(f.parent.name if f.stem.upper() == "SKILL" else f.stem)
+    # List available skills — dùng chung helper với nhánh đọc thành công ở trên
+    # (BUG FIX lịch sử: nhánh này trước đây thiếu guard traversal riêng, đã gộp
+    # vào _list_available_skills để tránh 2 bản logic lệch nhau theo thời gian).
+    available = _list_available_skills()
     hint = f"Available: {', '.join(available)}" if available else f"No skills found in {SKILLS_DIRS}"
     return f"[skill not found: '{name}'. {hint}]"
 

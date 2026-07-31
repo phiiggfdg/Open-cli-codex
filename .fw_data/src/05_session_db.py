@@ -278,7 +278,7 @@ def _session_cost_str() -> str:
 TOOLS = [
   {"type":"function","function":{
     "name":"bash",
-    "description":"Execute shell command. Use for build/test/git/install. NOT for file read/write. Output includes diagnostic fields: exit_code, stderr, error_class, retry_hint.",
+    "description":"Run one allowlisted shell command for inspect/build/test/git/install. No chaining, pipe, redirect, shell expansion, or inline eval; use file tools for mutations. Output includes exit_code, stderr, error_class, retry_hint.",
     "parameters":{"type":"object","properties":{
       "command":{"type":"string"},
       "timeout":{"type":"integer","description":"Seconds (default 30)"}
@@ -301,6 +301,13 @@ TOOLS = [
       "path":   {"type":"string"},
       "content":{"type":"string"}
     },"required":["path","content"]}
+  }},
+  {"type":"function","function":{
+    "name":"delete",
+    "description":"Delete a single existing file (not directories — refuses if path is a directory). Undoable via the same undo/redo stack as write/edit. Use this instead of bash 'rm' — 'rm' is not in the bash allowlist and will be rejected.",
+    "parameters":{"type":"object","properties":{
+      "path":{"type":"string","description":"Path of the file to delete"}
+    },"required":["path"]}
   }},
   {"type":"function","function":{
     "name":"extract",

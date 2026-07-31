@@ -44,15 +44,27 @@ def do_redo():
     snap = _redo_stack.pop()
     p = Path(snap["path"])
     try:
-        p.write_text(snap["after"])
-        _sync_file_state_after_restore(p, snap["after"])
+        if snap["after"] is None:
+            # BUG FIX: trước đây p.write_text(None) sẽ raise TypeError —
+            # chưa từng xảy ra vì trước đây không có nghiệp vụ nào tạo
+            # snapshot với after=None (chỉ before=None cho "tạo mới file").
+            # Tool xoá file mới (tool_delete) tạo snapshot after=None (nghĩa
+            # là "sau thao tác này, file không tồn tại") — redo phải xoá lại
+            # file, đối xứng với do_undo() đã xử lý before=None.
+            p.unlink(missing_ok=True)
+            _sync_file_state_after_restore(p, None)
+            msg = f"Redo: deleted {snap['path']}"
+        else:
+            p.write_text(snap["after"])
+            _sync_file_state_after_restore(p, snap["after"])
+            msg = f"Redo: applied {snap['path']}"
         if _project_dir_conn and snap.get("id"):
             _project_dir_conn.execute(
                 "UPDATE file_snapshot SET undone=0 WHERE id=?", (snap["id"],))
             _project_dir_conn.commit()
         snap["undone"] = 0
         _undo_stack.append(snap)
-        return f"Redo: applied {snap['path']}"
+        return msg
     except Exception as e:
         return f"[redo error: {e}]"
 
@@ -454,6 +466,13 @@ Be concise. Current directory: {os.getcwd()}"""
     steps = 0
     final_text = ""
     while steps < 10:
+        # Subagents do not pass through the main-loop pruning threshold. Keep
+        # the immediately preceding tool group intact for correct follow-up,
+        # then compact older groups. This avoids both extremes of the old
+        # behavior: leaking every large patch, or stripping the current patch
+        # before the model has seen its result.
+        if steps:
+            sub_messages = _prune_tool_results(sub_messages, keep_full_turns=1)
         # tool_choice="required" chỉ hợp lệ khi có ít nhất 1 tool — nếu sub_tools
         # rỗng (không nên xảy ra sau fallback ở trên, nhưng giữ guard tại đây để
         # không phụ thuộc 1 điểm duy nhất), ép "required" sẽ gây HTTP 400 ở mọi
@@ -507,29 +526,16 @@ Be concise. Current directory: {os.getcwd()}"""
                 print(_preview)
 
         if tool_calls:
-            # Strip heavy content/patch/new_str khỏi arguments trước khi lưu vào
-            # sub_messages — subagent loop ngắn (<=10 step) nhưng KHÔNG đi qua
-            # _prune_tool_results, nên nếu giữ full content mỗi step sẽ leak
-            # token y như bug 10M token ở main loop, chỉ là phiên bản mini.
-            STRIP_TOOLS_SUB = {"write", "multiedit", "apply_patch", "edit"}
+            # Preserve a manageable current call for the next reasoning step.
+            # Extremely large generated arguments are compacted immediately to
+            # prevent a single write from exceeding the model context.
             stored_tool_calls = []
             for tc in tool_calls:
-                name = tc["function"]["name"]
-                if name in STRIP_TOOLS_SUB:
-                    try:
-                        a = json.loads(tc["function"]["arguments"])
-                        placeholder = _HISTORY_COMPACTED_MARKER
-                        for k in ("content", "patch", "new_str"):
-                            if k in a:
-                                a[k] = placeholder
-                        if "edits" in a:
-                            for e in a["edits"]:
-                                if "new_str" in e:
-                                    e["new_str"] = placeholder
-                        tc = {**tc, "function": {**tc["function"], "arguments": json.dumps(a)}}
-                    except Exception:
-                        pass
-                stored_tool_calls.append(tc)
+                args_text = tc.get("function", {}).get("arguments", "")
+                stored_tool_calls.append(
+                    _compact_heavy_tool_call(tc)
+                    if len(args_text) > TOOL_OUTPUT_MAX_CHARS else tc
+                )
             sub_messages.append({"role":"assistant","content": text or None,
                                   "tool_calls": stored_tool_calls})
             for tc in tool_calls:
@@ -668,6 +674,7 @@ def _dispatch_tool(name, args, model, api_key, conn, sid, state=None):
         "bash":        lambda a: tool_bash(a["command"], a.get("timeout",30)),
         "read":        lambda a: tool_read(a["path"], a.get("offset",1), a.get("limit",READ_DEFAULT_LIMIT), a.get("depth",4), state),
         "write":       lambda a: tool_write(a["path"], a["content"], conn, sid),
+        "delete":      lambda a: tool_delete(a["path"], conn, sid),
         "extract":     lambda a: tool_extract(a["src"], a["start"], a["end"], a["dst"], a.get("mode","move"), conn, sid),
         "edit":        lambda a: tool_edit(a["path"], a["old_str"], a["new_str"], conn, sid),
         "multiedit":   lambda a: tool_multiedit(a["path"], a["edits"], conn, sid),
@@ -703,6 +710,7 @@ TOOL_ICONS = {
     "bash":        f"{YELLOW}$",
     "read":        f"{CYAN}📄",
     "write":       f"{GREEN}✎",
+    "delete":      f"{RED}🗑",
     "extract":     f"{GREEN}✂",
     "edit":        f"{GREEN}✎",
     "multiedit":   f"{GREEN}✎",

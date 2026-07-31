@@ -148,7 +148,7 @@
          justify-content:space-between; align-items:center;
          border-bottom:1px solid var(--border-soft); box-shadow:0 1px 0 rgba(255,255,255,0.5) inset, 0 2px 8px rgba(61,56,46,0.04);
          overflow:hidden; }
-  #status { display:flex; align-items:center; gap:9px; }
+  #status { display:flex; align-items:center; gap:9px; flex:0 0 auto; min-width:0; }
   #statusText { color:var(--text); font-weight:600; letter-spacing:.15px; }
   @keyframes dotPulse {
     0%, 100% { box-shadow:0 0 0 3px rgba(124,143,108,0.16), 0 0 0 6px rgba(124,143,108,0.05); }
@@ -157,7 +157,9 @@
   #dot { width:8px; height:8px; border-radius:50%; background:var(--err); flex:0 0 auto;
          box-shadow:0 0 0 3px rgba(173,88,71,0.14); transition:background .3s ease, box-shadow .3s ease; }
   #dot.ok { background:var(--accent-2); animation: dotPulse 2.6s ease-in-out infinite; }
-  #meta { color:var(--text-dim); letter-spacing:.2px; font-variant-numeric:tabular-nums; font-size:11.5px; }
+  #meta { color:var(--text-dim); letter-spacing:.2px; font-variant-numeric:tabular-nums; font-size:11.5px;
+    flex:1 1 auto; min-width:0; margin-left:12px; overflow:hidden; text-overflow:ellipsis;
+    white-space:nowrap; text-align:right; }
 
   /* ── /codeweb: layout 2 cột ────────────────────────────────────────────
      #mainSplit là flex row: #logScroll (tiến trình) bên trái, #codewebPane
@@ -188,29 +190,23 @@
      đó chiều off (1->0, không còn "cưỡng ép" chiếm chỗ) nhìn mượt còn chiều
      on (0->1, đột ngột giành hết chỗ trống) thì giật/không animate. Sửa:
      KHÔNG đổi flex-grow/shrink giữa 2 trạng thái nữa (giữ cố định "0 0"
-     luôn), chỉ đổi flex-basis (0% <-> 52%/45%) -- browser animate
+     luôn), chỉ đổi flex-basis (0% <-> 52%) -- browser animate
      flex-basis mượt thật sự khi flex-grow không đổi ở cả 2 đầu. */
   #codewebPane { display:flex; flex:0 0 0%; overflow:hidden;
     flex-direction:column; background:#1e1e1e; position:relative;
     transition:flex-basis .32s cubic-bezier(.22,.7,.3,1); }
   #codewebPane > * { opacity:0; transition:opacity 180ms ease; }
   #mainSplit.codeweb-on #codewebPane > * { opacity:1; transition-delay:140ms; }
-  /* 42% quá chật cho text tiếng Việt dài (wrap dày đặc, khó đọc) -> nâng
-     lên 48%/52%. Màn rất hẹp (điện thoại dọc, <520px) ưu tiên cột log rộng
-     hơn preview vì đọc tiến trình quan trọng hơn xem preview nhỏ xíu. */
+  /* Desktop dùng 48% log / 52% preview. Mobile được xếp dọc ở block
+     responsive bên dưới để không ép text và preview thành hai cột hẹp. */
   #mainSplit.codeweb-on #logScroll { flex:0 1 48%; border-right:1px solid var(--border-soft); }
   #mainSplit.codeweb-on #codewebPane { flex:0 0 52%; }
-  @media (max-width:520px) {
-    #mainSplit.codeweb-on #logScroll { flex:0 1 55%; }
-    #mainSplit.codeweb-on #codewebPane { flex:0 0 45%; }
-  }
-
   /* Thanh kéo giữa 2 cột -- ẩn hoàn toàn khi codeweb tắt (width:0, không
      chiếm chỗ, không bắt sự kiện). Khi bật: 1 dải mỏng có "grip" 3 chấm ở
      giữa để gợi ý kéo được. border-right của #logScroll bị tắt khi có
      resizer (resizer tự vẽ viền của chính nó) tránh đường viền đôi. */
   #codewebResizer { flex:0 0 0; width:0; overflow:hidden; position:relative;
-    cursor:col-resize; touch-action:none; transition:width .32s cubic-bezier(.22,.7,.3,1); }
+    cursor:col-resize; touch-action:none; transition:width .32s cubic-bezier(.22,.7,.3,1), height .32s cubic-bezier(.22,.7,.3,1); }
   #mainSplit.codeweb-on #codewebResizer { flex:0 0 10px; width:10px; }
   #mainSplit.codeweb-on #logScroll { border-right:0; }
   #codewebResizer::before { content:""; position:absolute; inset:0; left:4px; width:1px;
@@ -228,48 +224,80 @@
   #mainSplit.cw-resizing { cursor:col-resize; user-select:none; }
   #mainSplit.cw-resizing #codewebFrame { pointer-events:none; }
 
+  /* Mobile: xếp chat trên / preview dưới để mỗi pane dùng trọn chiều
+     ngang. Resizer vẫn giữ, chỉ đổi từ kéo trái-phải sang lên-xuống. */
+  @media (max-width:520px) {
+    #mainSplit.codeweb-on { flex-direction:column; }
+    #mainSplit.codeweb-on #logScroll { flex:0 1 58%; width:100%; }
+    #mainSplit.codeweb-on #codewebPane { flex:0 0 42%; width:100%; }
+    #mainSplit.codeweb-on #codewebResizer {
+      flex:0 0 8px; width:100%; height:8px; cursor:row-resize;
+    }
+    #codewebResizer::before { left:0; top:3px; width:100%; height:1px; }
+    #codewebResizerGrip { width:28px; height:4px; }
+    #codewebResizer:hover #codewebResizerGrip,
+    #codewebResizer.cw-dragging #codewebResizerGrip { width:40px; height:4px; }
+    #mainSplit.cw-resizing { cursor:row-resize; }
+  }
 
 
-  /* ── /codeweb: log trái chuyển thành "activity feed" gọn ─────────────────
-     Cột 42% quá hẹp cho bubble full-size (padding lớn, blur 3D, bo góc to,
-     sheen animation, lệch trái/phải) vốn thiết kế cho khung chat full-width
-     -> nhồi vào đây nhìn rối, nặng nề như "bãi rác". Override CHỈ khi
-     #mainSplit.codeweb-on, không đụng gì tới style gốc của bubble/turn-logs
-     ở mode thường (build/plan) hay khi #codewebPane đang ẩn. Nguyên tắc:
-     bỏ hiệu ứng trang trí nặng, thu nhỏ khoảng cách, căn trái đồng nhất
-     (không lệch trái/phải), rõ tín hiệu chứ không rõ "đẹp". */
-  #mainSplit.codeweb-on #log { padding:10px 8px; gap:6px; }
-  #mainSplit.codeweb-on .bubble-wrap.from-user,
-  #mainSplit.codeweb-on .bubble-wrap.from-ai { justify-content:flex-start; }
+
+  /* ── /codeweb: luồng hội thoại phẳng kiểu Claude ─────────────────────
+     Chỉ đổi hierarchy/spacing trong codeweb: text AI không bọc trong card lớn,
+     user vẫn là bubble, tool detail vẫn mở/đóng và live-slot nổi vẫn giữ
+     nguyên. Mode build/plan không bị ảnh hưởng. */
+  #mainSplit.codeweb-on #log {
+    padding:14px clamp(12px, 3.5vw, 28px) 24px; gap:0;
+    font-size:14px; line-height:1.58;
+  }
+  #mainSplit.codeweb-on .bubble-wrap.from-ai {
+    justify-content:flex-start; margin:12px 0 2px;
+  }
+  #mainSplit.codeweb-on .bubble-wrap.from-user {
+    justify-content:flex-end; margin:10px 0 16px;
+  }
   #mainSplit.codeweb-on .bubble {
-    max-width:100%; width:100%; padding:8px 10px; border-radius:10px;
-    font-size:12.5px; line-height:1.4;
-    backdrop-filter:none; -webkit-backdrop-filter:none;
-    animation:none; box-shadow:none;
+    backdrop-filter:none; -webkit-backdrop-filter:none; animation:none;
   }
-  #mainSplit.codeweb-on .bubble::before { display:none; } /* tắt sheen quét sáng */
-  #mainSplit.codeweb-on .bubble.user {
-    background:rgba(107,130,100,0.12); border:1px solid rgba(107,130,100,0.28);
-    color:var(--text); border-radius:10px;
-  }
+  #mainSplit.codeweb-on .bubble::before { display:none; }
   #mainSplit.codeweb-on .bubble.ai {
-    background:rgba(255,254,251,0.6); border:1px solid var(--border-soft);
-    border-radius:10px;
+    width:100%; max-width:100%; overflow:visible; padding:5px 0;
+    background:transparent; border:0; border-radius:0; box-shadow:none;
+    font-size:14.5px; line-height:1.62;
+  }
+  #mainSplit.codeweb-on .bubble.ai.glass-edge::before,
+  #mainSplit.codeweb-on .bubble.ai.glass-edge::after { display:none; }
+  #mainSplit.codeweb-on .bubble.user {
+    width:auto; max-width:88%; padding:9px 13px;
+    border-radius:16px 16px 4px 16px; font-size:13.5px; line-height:1.5;
   }
   #mainSplit.codeweb-on .bubble:active { transform:none; }
-  /* Card tool/turn-toggle cũng thu gọn tương ứng, giữ nguyên hành vi mở/đóng */
-  #mainSplit.codeweb-on .turn-logs-inner {
-    padding:6px; border-radius:8px; backdrop-filter:none; -webkit-backdrop-filter:none;
-    background:rgba(255,254,251,0.6); gap:6px;
-  }
+
+  #mainSplit.codeweb-on .turn-toggle-row { margin:1px 0 10px; }
   #mainSplit.codeweb-on .turn-toggle {
-    padding:3px 9px 3px 8px; font-size:11px; backdrop-filter:none; -webkit-backdrop-filter:none;
-    box-shadow:none; background:rgba(255,254,251,0.7);
+    gap:5px; padding:5px 2px; border:0; border-radius:7px;
+    background:transparent; backdrop-filter:none; -webkit-backdrop-filter:none;
+    box-shadow:none; color:var(--text-dim); font-size:12px;
   }
-  #mainSplit.codeweb-on .turn-toggle.open { box-shadow:none; }
+  #mainSplit.codeweb-on .turn-toggle:hover,
+  #mainSplit.codeweb-on .turn-toggle.open { background:rgba(124,143,108,0.08); box-shadow:none; }
+  #mainSplit.codeweb-on .turn-toggle .tool-count {
+    order:1; padding:0; background:transparent; color:inherit; font-size:12px;
+  }
+  #mainSplit.codeweb-on .turn-toggle .label { order:2; font-weight:500; }
+  #mainSplit.codeweb-on .turn-toggle .chev { order:3; transform:rotate(0deg); }
+  #mainSplit.codeweb-on .turn-toggle.open .chev { transform:rotate(90deg); }
+  #mainSplit.codeweb-on .turn-logs { margin:0 0 12px; }
+  #mainSplit.codeweb-on .turn-logs-inner {
+    padding:7px; border-radius:10px; gap:6px;
+    backdrop-filter:none; -webkit-backdrop-filter:none;
+    background:rgba(255,254,251,0.5); border-color:var(--border-soft);
+  }
+  #mainSplit.codeweb-on .tool-group { margin:0; padding:8px 9px 8px 0; box-shadow:none; }
+  #mainSplit.codeweb-on .tool-group-head { padding:0 9px 6px 11px; gap:6px; }
+  #mainSplit.codeweb-on .tool-children { display:block; margin-left:10px; padding-left:12px; }
+  #mainSplit.codeweb-on .tool-child { padding:4px 7px 4px 6px; font-size:11.5px; }
   #mainSplit.codeweb-on .bubble-img-thumb { width:56px; height:56px; }
-  #mainSplit.codeweb-on .tool-group { padding-bottom:0; }
-  #mainSplit.codeweb-on .tool-children { display:none; }
 
   #codewebToolbar { flex:0 0 auto; display:flex; align-items:center; justify-content:space-between;
     gap:6px; padding:6px 8px; background:rgba(238,233,221,0.7); border-bottom:1px solid var(--border-soft); }
@@ -789,6 +817,36 @@
   #ctrlBtn:active { box-shadow:
       0 1px 1px rgba(255,255,255,0.6) inset,
       0 1px 3px rgba(61,56,46,0.1); }
+
+  /* Composer codeweb xếp thành 2 tầng như Claude: input ở trên, các nút
+     hiện có ở dưới. Không thêm/bỏ control hay đổi event của chúng. */
+  body.codeweb-mode #inputBar {
+    display:grid; grid-template-columns:42px 42px minmax(0,1fr) 42px;
+    grid-template-rows:auto 42px; gap:7px 8px;
+    margin:8px 10px 9px; padding:9px 10px calc(9px + env(safe-area-inset-bottom, 0px));
+    background:rgba(255,254,251,0.9); border:1px solid var(--border-soft);
+    border-radius:24px; box-shadow:0 10px 28px rgba(61,56,46,0.12);
+  }
+  body.codeweb-mode #inputField {
+    grid-column:1 / -1; grid-row:1; width:100%; height:40px;
+    padding:7px 9px; border:0; border-radius:12px; background:transparent;
+    box-shadow:none; font-size:14.5px;
+  }
+  body.codeweb-mode #inputField:focus { border:0; box-shadow:none; }
+  body.codeweb-mode #ctrlBtn { grid-column:1; grid-row:2; }
+  body.codeweb-mode #imgBtn  { grid-column:2; grid-row:2; }
+  body.codeweb-mode #sendBtn { grid-column:4; grid-row:2; }
+  body.codeweb-mode #ctrlBtn,
+  body.codeweb-mode #imgBtn,
+  body.codeweb-mode #sendBtn { width:42px; height:42px; }
+  body.codeweb-mode #imgPreviewBar {
+    margin:0 10px; padding:7px 10px; border:1px solid var(--border-soft);
+    border-bottom:0; border-radius:14px 14px 0 0; background:rgba(255,254,251,0.9);
+  }
+  @media (max-width:520px) {
+    #bar { padding:10px 12px; }
+    body.codeweb-mode #inputBar { margin-left:8px; margin-right:8px; }
+  }
 
   /* ── Gợi ý lệnh slash ─────────────────────────────────────────────── */
   #slashHint {
@@ -1373,16 +1431,26 @@ function ensureTurnLogs() {
   return currentTurnLogsInner;
 }
 
+function syncTurnToggleLabel(btn) {
+  const label = btn && btn.querySelector(".label");
+  if (!label) return;
+  const isCodeweb = document.body.classList.contains("codeweb-mode");
+  const isOpen = btn.classList.contains("open");
+  label.textContent = isCodeweb ? "bước" : (isOpen ? "Ẩn chi tiết" : "Xem chi tiết");
+  btn.setAttribute("aria-expanded", isOpen ? "true" : "false");
+}
+
 function ensureTurnToggle(logsEl) {
   const row = document.createElement("div");
   row.className = "turn-toggle-row";
   const btn = document.createElement("button");
   btn.className = "turn-toggle glass";
-  btn.innerHTML = '<span class="chev">▶</span><span class="label">Xem chi tiết</span><span class="tool-count">0</span>';
+  btn.innerHTML = '<span class="chev">▶</span><span class="label"></span><span class="tool-count">0</span>';
+  syncTurnToggleLabel(btn);
   btn.addEventListener("click", () => {
     const open = logsEl.classList.toggle("open");
     btn.classList.toggle("open", open);
-    btn.querySelector(".label").textContent = open ? "Ẩn chi tiết" : "Xem chi tiết";
+    syncTurnToggleLabel(btn);
     if (open) scrollToBottom();
   });
   row.appendChild(btn);
@@ -2588,7 +2656,9 @@ function codewebShowServerUrl(url) {
 function setCodewebMode(agent) {
   currentAgent = agent || "";
   const on = agent === "codeweb";
+  document.body.classList.toggle("codeweb-mode", on);
   mainSplitEl.classList.toggle("codeweb-on", on);
+  document.querySelectorAll(".turn-toggle").forEach(syncTurnToggleLabel);
   if (on) {
     codewebApplySavedSplit();
   } else {
@@ -2740,10 +2810,14 @@ let cwResizing = false;
 // nhận được, quay lại mặc định 48/52 lúc reload).
 let logScrollFlexBasisPct = null;
 
-function codewebResizeTo(clientX) {
+function codewebResizeTo(clientX, clientY) {
   const rect = mainSplitEl.getBoundingClientRect();
-  if (rect.width <= 0) return;
-  let pct = ((clientX - rect.left) / rect.width) * 100;
+  const vertical = window.matchMedia("(max-width:520px)").matches;
+  const size = vertical ? rect.height : rect.width;
+  if (size <= 0) return;
+  let pct = vertical
+    ? ((clientY - rect.top) / rect.height) * 100
+    : ((clientX - rect.left) / rect.width) * 100;
   pct = Math.max(CW_RESIZE_MIN_PCT, Math.min(CW_RESIZE_MAX_PCT, pct));
   logScrollFlexBasisPct = pct;
   scrollEl.style.flexBasis = `${pct}%`;
@@ -2770,7 +2844,7 @@ codewebResizerEl.addEventListener("pointerdown", (ev) => {
 });
 codewebResizerEl.addEventListener("pointermove", (ev) => {
   if (!cwResizing) return;
-  codewebResizeTo(ev.clientX);
+  codewebResizeTo(ev.clientX, ev.clientY);
 });
 function codewebEndResize(ev) {
   if (!cwResizing) return;

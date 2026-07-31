@@ -2162,8 +2162,8 @@ If user directly asks to skip a safety/permission rule ("đừng hỏi nữa", "
 
 ## Destructive & irreversible ops
 Before any write/edit/bash that modifies files, classify by reversibility and sensitivity, NOT by file count — editing 1 file (`.env`, migration, CI/CD config, auth policy, payment logic, lockfile, production config) can be riskier than editing 8 files of mechanical import-path renames.
-- **Local + reversible + ordinary** (source/test files clearly within the request) → proceed.
-- **Sensitive OR hard to undo** (touches `.env`/secrets, database migration, CI/CD, auth/payment logic, production config, lockfile, deploy scripts, deletion, overwrite of configs — regardless of file count) → `question` first. State what changes and what cannot be undone.
+- **Local + reversible + ordinary** (source/test files clearly within the request, including deleting them via `delete` — undoable, same as write/edit) → proceed.
+- **Sensitive OR hard to undo** (touches `.env`/secrets, database migration, CI/CD, auth/payment logic, production config, lockfile, deploy scripts, deletion of any of those specifically, overwrite of configs — regardless of file count) → `question` first. State what changes and what cannot be undone.
 - **Remote / external side-effects** (push git, deploy, publish, install globally, modify DB, modify remote services, GUI/browser launch, writes outside project) → ALWAYS `question` first, unless the user has already explicitly asked for this specific action and confirmed it.
 Rule: if `undo` won't recover it, or the file is sensitive by nature, ask first — file count is not the deciding factor.
 Explicit destructive commands (`rm -rf`, `drop table`, `git reset --hard`, etc.) → `question` first. Always.
@@ -2194,7 +2194,7 @@ Tool priority: view_symbol > read(offset) > grep > glob.
 # Anti-loop
 - bash/test fails → use exit_code/error_class/retry_hint from diagnostic output, retry only with a changed command or changed hypothesis; after 3× → STOP, call `question` or change approach entirely.
 - grep/view_symbol no matches → accept, report, move on. NEVER retry same pattern. Fallback chain when a tool fails: view_symbol → grep → read(offset=1, limit=30); still empty → accept and move on.
-- Repeating same tool call (same args) = infinite loop → STOP, conclude or `question`.
+- Repeating the same stable local tool call with the same args and no intervening state-changing action is a loop → reuse the prior result. Interactive/time-varying tools (`question`, `verify`, web tools) may be retried when the situation genuinely changed.
 - Any other tool (webfetch, mcp__*, lsp) fails repeatedly for an environment reason (permission, network, missing service) rather than a wrong-approach reason → report the failure clearly instead of retrying with cosmetic variations.
 
 # When blocked — MANDATORY
@@ -2281,8 +2281,16 @@ When building or changing a UI:
 - `task`: isolated subagent for long parallel work. Has its OWN context. Send: [description + file paths + output format]. Never use for files main agent is editing.
 - `lsp`: local code intelligence; references scans workspace using Python AST where possible and regex fallback elsewhere.
 - `verify`: visually confirm output after edits, or when there's a concrete reason to doubt actual file state. See "Full re-read after edit = still forbidden for confirmation purposes" in Execution model.
-- `skill`: load SKILL.md by name for unfamiliar domains. Available: `spec-driven` — use it before broad/ambiguous-scope edits (see AGENTS.md).
+- `skill`: load SKILL.md by name for unfamiliar domains. Available: `spec-driven` (use before broad/ambiguous-scope edits, see AGENTS.md), `powerpoint` (use before creating/editing .pptx), `canva` (use for Canva-ready visual/UI design; ask for the user's idea first, then use `powerpoint` to create an editable .pptx), `web-assets` (use to find and verify existing images/icons/fonts/CDNs for web UI; never generate images or invent asset URLs).
 - `bash` fails → see Anti-loop for retry/stop logic.
+- `bash` policy — check BEFORE running, not by trial and error:
+  - Exactly one command per call. Shell composition/expansion is blocked: no `;`, `&&`, `||`, pipe, redirect, subshell, `$` expansion, or multiline command. Do not invoke executables by path; explicit paths must stay inside the project.
+  - Allowed inspect/status commands: `pwd`, `ls` (non-recursive), `rg`, `grep`, `wc`, `file`, `stat`, `tree`, `which`, `basename`, `dirname`, `date`, `uname`, `whoami`, `echo`, `printf`.
+  - Allowed dev/build commands: `git`, `pytest`, `python`/`python3`, `node`, `npm`, `pnpm`, `yarn`, `make`, `pip`/`pip3`, `ruff`, `mypy`, `eslint`, `tsc`.
+  - Hard-blocked even after Bash allow-all: `python -c`, `node -e/-p`, `bash/sh/zsh`, `git push`, `git clean`, `git reset --hard`, package publish, `ls -R`, paths outside the project, and every unlisted command. Run a trusted project `.py`/`.js` file instead of inline eval. Python/Node are still code execution; the path guard is not an OS sandbox.
+  - Use `read`/`glob`/`grep` for file inspection and `write`/`edit`/`delete`/`apply_patch` for file mutation. Commands such as `rm`, `cp`, `mv`, `mkdir`, `touch`, `cat`, `head`, `tail`, `less`, `find`, `curl`, `wget`, `apt`, `pkg`, `sudo` are not allowed.
+  - `pip install` requires `--break-system-packages` on Termux. New dependencies and other sensitive/remote mutations still require `question` under the permission rules above.
+  - Background servers use only `serve: python -m http.server ...`, `serve: node <file>`, `serve: npm run/start ...`, or `serve: pnpm/yarn run|start|dev|serve|preview ...`. `serve:` is validated by the same single-command/path rules and is not an allowlist escape.
 - DEPENDENCY CHECK: new import → `grep` project config first to see if it's already available. Missing → prefer a no-new-dependency solution if reasonable; if a new package is truly needed, state the package + why existing options are insufficient + what manifest/lockfile it touches, then `question` before installing. Do not auto-install.
 
 # Misc
@@ -2307,7 +2315,8 @@ def build_mode_hint(agent=AGENT_BUILD) -> str:
     if agent == AGENT_PLAN:
         parts.append(
             "\n\n[Mode: plan/read-only] KHÔNG write, edit, hoặc apply patch. "
-            "Chỉ đọc, phân tích, và đề xuất. Hỏi permission trước khi chạy bash."
+            "Chỉ đọc, phân tích, và đề xuất. Bash bị từ chối ở mode này; "
+            "dùng read/glob/grep hoặc chuyển sang build mode nếu thật sự cần chạy lệnh."
         )
     return "".join(parts)
 
@@ -2354,11 +2363,27 @@ def build_system(agent=AGENT_BUILD):
 
 def _inject_agents_md_once(messages: list) -> list:
     """
-    Nếu có AGENTS.md và chưa có trong conversation,
-    inject 1 lần như user+assistant message đầu tiên.
-    Lần sau compact sẽ tóm tắt nó như message thường — không tốn system prompt token.
+    Nếu có AGENTS.md và/hoặc có skill, inject 1 lần như user+assistant message
+    đầu tiên (chỉ 1 message dù có 1 hay cả 2 nguồn). Lần sau compact sẽ tóm
+    tắt nó như message thường — không tốn system prompt token.
+
+    Danh sách skill (quét _list_available_skills(), không hardcode) được gộp
+    cùng chỗ này thay vì đưa vào system prompt tĩnh: system prompt bị build
+    lại (build_system()) mỗi request, nên đổi nội dung đó mỗi khi thêm/bớt
+    skill sẽ đổi phần đầu prompt → phá prefix cache của TOÀN BỘ session đang
+    chạy. Message ở đây chỉ chèn 1 lần lúc đầu, không đụng lại system prompt.
+    Đánh đổi: đây là snapshot tại thời điểm chèn — thêm skill mới giữa session
+    sẽ không tự xuất hiện cho tới khi mở session/conversation mới (giống hệt
+    cách AGENTS.md hoạt động).
     """
-    rules = load_agents_md()
+    rules = load_agents_md() or ""
+    try:
+        _skills = _list_available_skills()
+    except Exception:
+        _skills = []
+    if _skills:
+        skill_note = f"[Skills có sẵn: {', '.join(_skills)}. Gọi tool `skill(name=...)` để load.]"
+        rules = f"{rules}\n\n---\n{skill_note}" if rules else skill_note
     if not rules:
         return messages
     marker = "[AGENTS.MD RULES]"
@@ -2458,10 +2483,92 @@ def agent_turn(messages, model, api_key, conn, sid, max_steps=20, agent=AGENT_BU
 # VÀ cho dedup epoch (_mutation_epoch, xem _agent_turn_inner). Đặt module-level
 # (compile 1 lần) thay vì re.compile() lại mỗi vòng lặp như code cũ.
 _BASH_READONLY_RE = re.compile(
-    r"^(git\s+(status|diff|log|show)(\b|$)|"
-    r"ls\b|pwd\b|whoami\b|python(3)?\s+-V\b)",
+    r"^(?:git\s+(?:status|diff|log|show|rev-parse|ls-files|grep)(?:\s|$)|"
+    r"(?:ls|pwd|whoami|rg|grep|wc|file|stat|tree|which|basename|dirname|date|"
+    r"uname|echo|printf)(?:\s|$)|python(?:3)?\s+(?:-V|--version)(?:\s|$))",
     re.IGNORECASE
 )
+
+_LOCAL_MUTATING_TOOLS = {
+    "write", "delete", "extract", "edit", "multiedit", "apply_patch",
+    "todowrite", "task",
+}
+
+# These tools are interactive, time-varying, or may legitimately be retried
+# with identical arguments. Hard-blocking them creates false positives and the
+# warning often costs more tokens than their short result.
+_DEDUP_EXEMPT_TOOLS = {
+    "question", "verify", "webfetch", "websearch", "task", "todowrite",
+}
+
+# MCP schemas are dynamic. Only names that clearly describe a side effect keep
+# the duplicate-side-effect guard; reads/searches remain retryable and are not
+# falsely cached as immutable remote state.
+_MCP_MUTATION_HINT_RE = re.compile(
+    r"(?:^|_)(?:create|update|delete|replace|write|patch|edit|add|remove|move|"
+    r"rename|send|post|publish|upload|finalize|restore|execute|run|start|stop|"
+    r"manage|mutate)(?:_|$)",
+    re.IGNORECASE,
+)
+
+
+def _mcp_name_may_mutate(name: str) -> bool:
+    if not name.startswith("mcp__"):
+        return False
+    action = name.rsplit("__", 1)[-1]
+    action = re.sub(r"(?<!^)(?=[A-Z])", "_", action).replace("-", "_")
+    return bool(_MCP_MUTATION_HINT_RE.search(action))
+
+
+def _tool_may_mutate_state(name: str, args: dict) -> bool:
+    if name in _LOCAL_MUTATING_TOOLS:
+        return True
+    if name == "bash":
+        command = (args.get("command", "") or "").strip()
+        return not bool(_BASH_READONLY_RE.search(command))
+    return _mcp_name_may_mutate(name)
+
+
+def _tool_may_mutate_local_files(name: str, args: dict) -> bool:
+    if name in _LOCAL_MUTATING_TOOLS:
+        return name != "todowrite"
+    if name == "bash":
+        command = (args.get("command", "") or "").strip()
+        return not bool(_BASH_READONLY_RE.search(command))
+    return False
+
+
+def _dedup_should_block(name: str) -> bool:
+    if name in _DEDUP_EXEMPT_TOOLS:
+        return False
+    if name.startswith("mcp__"):
+        return _mcp_name_may_mutate(name)
+    return True
+
+
+def _runtime_tool_call_signature(name: str, args: dict) -> str:
+    history_key = _history_tool_call_key(name, args)
+    if history_key is not None:
+        return f"{history_key[0]}:{history_key[1]}"
+    normalized = dict(args)
+    if name == "extract":
+        normalized.setdefault("mode", "move")
+    elif name == "bash":
+        normalized.setdefault("timeout", 30)
+    return f"{name}:{json.dumps(normalized, sort_keys=True, separators=(',', ':'), ensure_ascii=False)}"
+
+
+def _tool_was_definitely_blocked(result: str) -> bool:
+    """True only when execution certainly never reached a mutation.
+
+    Ordinary tool errors remain conservative because a script, MCP call or
+    multi-file operation can fail after a partial side effect.
+    """
+    text = (result or "").lstrip().lower()
+    return text.startswith((
+        "[permission denied", "[unknown tool", "[tool_error: missing required arg",
+        "[task denied", "[policy]",
+    ))
 
 def _agent_turn_inner(messages, model, api_key, conn, sid, max_steps, agent, state):
     global _current_agent, _todowrite_calls_this_turn, _current_sid, _large_read_credits, _task_depth
@@ -2485,7 +2592,6 @@ def _agent_turn_inner(messages, model, api_key, conn, sid, max_steps, agent, sta
     total_in = total_out = total_cached = 0
     _requesty_turn_cost = 0.0   # Requesty: tích luỹ usage.cost (USD) qua các step
     steps    = 0
-    _read_this_turn: set = set()  # track files read this turn to avoid re-reads
     # ── Dedup guard state ───────────────────────────────────────────────────
     # Trước đây: set đơn giản (call_sig đã gọi -> chặn vĩnh viễn trong cả turn,
     # dù turn có hàng chục step và trạng thái filesystem/git đã đổi nhiều lần
@@ -2494,16 +2600,15 @@ def _agent_turn_inner(messages, model, api_key, conn, sid, max_steps, agent, sta
     # khác, vì key dedup chỉ so "tool+args" (text tĩnh), không biết gì về
     # việc trạng thái đã đổi.
     # Fix: dict {call_sig: epoch_lúc_gọi} thay vì set. _mutation_epoch tăng
-    # mỗi khi có 1 tool có thể đổi trạng thái chạy (write/edit/multiedit/
-    # view_symbol/bash không-readonly — dùng lại _BASH_READONLY_RE, cùng tiêu
-    # chí với lazy cache validate, không phát minh tiêu chí thứ 2). Khi gặp
+    # sau mỗi mutation attempt không bị chặn chắc chắn (đủ write/delete/
+    # extract/edit/apply_patch, todo/task, Bash không-readonly và MCP
+    # mutation có tên rõ). Khi gặp
     # lại call_sig cũ: chỉ chặn nếu epoch KHÔNG đổi kể từ lần gọi trước (thật
     # sự vô ích, không có gì khác đi). Nếu epoch đã tăng -> cho gọi lại (có
     # thể có ích) và cập nhật epoch mới cho lần này.
     # Lưu ý: KHÔNG nới lỏng vô điều kiện theo step -- nếu không có mutation
     # nào ở giữa, dedup vẫn chặn y như cũ (tránh AI lặp vô ích tốn token).
     _seen_calls_this_turn: dict = {}     # dedup: call_sig -> epoch lúc gọi
-    _seen_calls_result: dict = {}        # dedup: store first result for context
     _mutation_epoch = 0                  # tăng mỗi khi có tool đổi trạng thái
     _recent_writes.clear()        # reset read-after-write block mỗi turn
     _index_prune()               # xóa entry file không còn tồn tại
@@ -2535,9 +2640,12 @@ def _agent_turn_inner(messages, model, api_key, conn, sid, max_steps, agent, sta
         # → phải inject lại để prefix cache không bị phá ở step tiếp theo.
         messages = _inject_agents_md_once(messages)
         messages = _inject_git_context_once(messages)
-        # Lazy prune: chỉ prune khi ctx > 45% để giữ prefix stable cho cache
+        # Prune before context becomes expensive to resend. Keep the four most
+        # recent tool groups full, so immediate reasoning and prefix caching are
+        # preserved while old 12k outputs stop accumulating too far into context.
         _, hard_thresh = _compact_threshold(model)
-        if estimate_tokens(messages) > hard_thresh * 0.45:
+        prune_thresh = max(12_000, min(int(hard_thresh * 0.30), 32_000))
+        if estimate_tokens(messages) > prune_thresh:
             messages = _prune_tool_results(messages)
 
         messages_with_cache = list(messages)
@@ -2763,50 +2871,28 @@ def _agent_turn_inner(messages, model, api_key, conn, sid, max_steps, agent, sta
             name = tc["function"]["name"]
             try: args = json.loads(tc["function"].get("arguments") or "{}")
             except: args = {}
-            # Dedup guard: block identical tool calls chỉ khi KHÔNG có gì đổi
+            # Dedup guard: block stable/side-effecting identical calls only when
+            # no observable mutation attempt happened in between. Dynamic,
+            # interactive and read-only MCP tools remain retryable.
             # (_mutation_epoch không tăng) kể từ lần gọi y hệt trước đó trong
             # cùng turn. Xem giải thích đầy đủ ở phần khởi tạo state phía trên.
-            # Skip dedup for tools that have their own internal per-turn limit
-            _SELF_LIMITING_TOOLS = {"todowrite"}
-            _call_sig = f"{name}:{json.dumps(args, sort_keys=True)}"
+            _call_sig = _runtime_tool_call_signature(name, args)
             _prev_epoch = _seen_calls_this_turn.get(_call_sig)
             if (_prev_epoch is not None and _prev_epoch == _mutation_epoch
-                    and name not in _SELF_LIMITING_TOOLS):
-                prev = _seen_calls_result.get(_call_sig, "")
-                prev_snippet = prev[:300].rstrip() if prev else "(no result stored)"
+                    and _dedup_should_block(name)):
                 dupe_msg = (
-                    f"[dedup] Blocked: identical call to `{name}` with same args already made this turn, "
-                    f"and nothing has changed since (no write/edit/mutating command in between).\n"
-                    f"Previous result was:\n{prev_snippet}\n"
-                    f"Do NOT repeat this call. Change your approach or use a different command.\n"
-                    f"If you are stuck, call `question` to ask the user for clarification."
+                    f"[dedup] Skipped unchanged duplicate `{name}`; reuse its previous result."
                 )
                 if state is not None:
                     state.emit(EV_WARN, text=f"[dedup] Blocked duplicate: {name} {json.dumps(args)[:60]}")
                 else:
                     print(f"  {YELLOW}[dedup]{R} {DIM}Blocked duplicate: {name} {json.dumps(args)[:60]}{R}")
                 tool_results.append({"role":"tool","tool_call_id":tc.get("id",""),"content":dupe_msg})
-                # Bản lưu history/DB không cần giữ prev_snippet 300 ký tự —
-                # giá trị của nó (nhắc model đừng lặp lại) chỉ có ý nghĩa
-                # NGAY TURN NÀY, model ở các turn sau không cần đọc lại.
-                dupe_msg_history = f"[dedup] Blocked duplicate call to `{name}` (same args, no state change since)."
+                dupe_msg_history = dupe_msg
                 tool_results_history.append({"role":"tool","tool_call_id":tc.get("id",""),"content":dupe_msg_history})
                 continue
-            # Xác định TRƯỚC khi chạy tool: lệnh này có khả năng đổi trạng thái
-            # không -- dùng cùng tiêu chí _BASH_READONLY_RE với lazy cache
-            # validate, không phát minh tiêu chí thứ 2 (tránh 2 nguồn có thể
-            # lệch nhau). Tăng epoch NGAY (trước khi chạy), để nếu tool này tự
-            # gọi lại chính nó ở step sau, nó cũng thấy epoch đã đổi do chính
-            # nó gây ra -- đúng ngữ nghĩa "trạng thái tại thời điểm SAU lệnh này
-            # khác trạng thái TRƯỚC lệnh này".
-            _is_mutating = name in ("write", "edit", "multiedit", "view_symbol")
-            if name == "bash":
-                _cmd = (args.get("command", "") or "").strip()
-                _is_mutating = not _BASH_READONLY_RE.search(_cmd)
-            if _is_mutating:
-                _mutation_epoch += 1
-            _seen_calls_this_turn[_call_sig] = _mutation_epoch
-            # Track files read this turn
+            _may_mutate_state = _tool_may_mutate_state(name, args)
+            _may_mutate_local = _tool_may_mutate_local_files(name, args)
             if name == "read":
                 try:
                     _p = Path(args.get("path",""))
@@ -2816,21 +2902,25 @@ def _agent_turn_inner(messages, model, api_key, conn, sid, max_steps, agent, sta
                 if not _is_dir:
                     try:
                         p_str = str(Path(args.get("path","")).expanduser().resolve())
-                        _read_this_turn.add(p_str)
                         _cache_touch(p_str)   # LRU: file này vừa được access
                     except Exception:
                         pass
-                # Reset dedup sau read chỉ cho edit-related signatures là quá khó ở đây;
-                # ít nhất không clear toàn bộ giữa step — giữ guard.
-            elif name in ("write", "edit", "multiedit", "view_symbol"):
+            elif name in ("write", "delete", "edit", "multiedit", "apply_patch", "view_symbol"):
                 _cache_touch(str(Path(args.get("path","")).expanduser().resolve()))
-                _had_writes_last_step = True  # lazy validate: validate lần sau
-            elif name == "bash":
-                # Cache correctness: bash mặc định là "dirty" trừ một số lệnh chắc chắn read-only.
-                if _is_mutating:
-                    _had_writes_last_step = True
+            elif name == "extract":
+                for _path_arg in ("src", "dst"):
+                    try:
+                        _cache_touch(str(Path(args.get(_path_arg, "")).expanduser().resolve()))
+                    except Exception:
+                        pass
             out_model, out_history = run_tool(name, args, model, api_key, conn, sid, state=state)
-            _seen_calls_result[_call_sig] = out_model  # store for dedup context
+            _definitely_blocked = _tool_was_definitely_blocked(out_model)
+            if _may_mutate_state and not _definitely_blocked:
+                _mutation_epoch += 1
+            if _may_mutate_local and not _definitely_blocked:
+                _had_writes_last_step = True
+            if _dedup_should_block(name):
+                _seen_calls_this_turn[_call_sig] = _mutation_epoch
             tool_results.append({
                 "role": "tool", "tool_call_id": tc.get("id", ""), "content": out_model
             })
