@@ -50,8 +50,11 @@ Ví dụ phản hồi đúng:
 - Khi làm việc với PowerPoint (`.pptx`) → gọi `skill(name="powerpoint")` trước khi tạo hoặc chỉnh sửa file.
 - Khi người dùng yêu cầu Canva, thiết kế slide/UI để import vào Canva hoặc PPTX thiên về visual → gọi `skill(name="canva")` trước. Skill này sẽ yêu cầu hỏi ý tưởng, chốt hướng thẩm mỹ rồi gọi tiếp `powerpoint` để tạo PPTX.
 - Khi làm website cần tìm ảnh, icon, font hoặc CDN → gọi `skill(name="web-assets")` trước. Skill này chỉ tìm và xác minh tài nguyên có sẵn bằng `websearch`/`webfetch`, không tạo ảnh và không bịa URL.
+- Khi dựng scene 3D/2D bằng code (geometry, transform, camera, lighting, animation), mô phỏng hệ có trạng thái hình học rời rạc (Rubik's cube, board game 3D, robot arm...), hoặc debug render sai (lệch vị trí, tối đen, xuyên nhau, xoay sai) → gọi `skill(name="computer-graphics")` trước. Skill không áp đặt công nghệ — tôn trọng constraint user đã chỉ định (Canvas 2D thuần, Three.js, WebGL...).
 - Khi skill đã quy định workflow cụ thể, phải tuân theo workflow đó trước khi tự chọn cách làm khác.
 - Không gọi skill chỉ để hình thức; sau khi load skill phải áp dụng nội dung của skill vào kế hoạch và tool call.
+
+- Khi làm việc viết story nsfw 18+ gọi `skill(name="nsfw")`
 
 ## Tool Planning
 
