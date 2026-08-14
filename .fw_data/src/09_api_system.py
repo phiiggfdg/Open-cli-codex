@@ -713,7 +713,7 @@ def _call_simple(messages, model, api_key, retry_max=None, silent=False,
     payload = {"model": model, "messages": messages,
                "max_tokens": 4096, "stream": False}
     if not _no_temperature(model):
-        payload["temperature"] = 0.3
+        payload["temperature"] = 0.5
     if _active_provider == "mercury":
         payload["reasoning_effort"] = "low"
     for attempt in range(retries):
@@ -1723,7 +1723,7 @@ def call_api_stream(messages, model, api_key, tool_choice="auto", session_id=Non
         "parallel_tool_calls": True,
     }
     if not _no_temperature(model):
-        payload["temperature"] = 0.3
+        payload["temperature"] = 0.5
     if _active_provider == "mercury":
         payload["reasoning_effort"] = "low"
     if _active_provider in ("cohere", "cerebras") or _active_provider.startswith("upstage"):

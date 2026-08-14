@@ -486,7 +486,7 @@ Be concise. Current directory: {os.getcwd()}"""
         }
         # C29 FIX: không gửi temperature với Claude 4+
         if not _no_temperature(model or ""):
-            payload["temperature"] = 0.3
+            payload["temperature"] = 0.5
 
         # FIX (bug #6): trước đây subagent KHÔNG BAO GIỜ gửi field "thinking"
         # dù "/mode on" đang bật cho phiên chính — inconsistency không

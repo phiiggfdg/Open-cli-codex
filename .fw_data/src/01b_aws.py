@@ -418,7 +418,7 @@ def _to_converse_payload(payload: dict) -> dict:
         "messages": converse_messages,
         "inferenceConfig": {
             "maxTokens": payload.get("max_tokens", 4096),
-            "temperature": payload.get("temperature", 0.3),
+            "temperature": payload.get("temperature", 0.5),
         },
     }
     if system_blocks:
