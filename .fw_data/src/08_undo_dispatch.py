@@ -124,6 +124,21 @@ def tool_apply_patch(path, patch, conn=None, sid=None):
             )
             if result.returncode == 0:
                 after = p.read_text()
+                if after == before:
+                    # BUG FIX: `patch` binary trả returncode 0 dù nội dung
+                    # không thực sự đổi — xảy ra khi hunk hợp lệ về cú pháp
+                    # nhưng vô nghĩa về nội dung (vd "-line\n+line" giống hệt
+                    # nhau, model paraphrase nhầm khi sinh diff). `patch`
+                    # VẪN GHI file xuống đĩa (rewrite y hệt nội dung cũ) nên
+                    # mtime đã đổi dù text giống hệt — phải cập nhật
+                    # _file_read_time ở đây, nếu không lần gọi tool tiếp theo
+                    # (edit/apply_patch khác) trên CÙNG file sẽ bị mtime-guard
+                    # chặn oan (\"modified since last read\") dù nội dung agent
+                    # đang cầm vẫn đúng 100% với đĩa.
+                    _file_read_time[str(p.resolve())] = time.time()
+                    return (f"[error: patch appeared to apply (exit 0) but file content "
+                            f"is unchanged — likely a no-op hunk (removed and re-added "
+                            f"identical content). No changes were made to {path}.]")
                 _file_read_time[str(p.resolve())] = time.time()
                 _cache_put(str(p), after, _current_sid)
                 if conn and sid:
@@ -185,6 +200,13 @@ def tool_apply_patch(path, patch, conn=None, sid=None):
             else:
                 i += 1
         after = "".join(patched)
+        if after == before:
+            # BUG FIX: cùng lý do với nhánh system patch ở trên — nếu mọi
+            # hunk đều có src==dst (patch no-op / đã áp dụng trước đó),
+            # manual parser vẫn "thành công" viết lại y hệt nội dung cũ.
+            return (f"[error: patch parsed and matched but resulted in no actual "
+                    f"change — likely an empty hunk or a patch that was already "
+                    f"applied. No changes were made to {path}.]")
         p.write_text(after)
         _file_read_time[str(p.resolve())] = time.time()
         _cache_put(str(p), after, _current_sid)
@@ -486,7 +508,7 @@ Be concise. Current directory: {os.getcwd()}"""
         }
         # C29 FIX: không gửi temperature với Claude 4+
         if not _no_temperature(model or ""):
-            payload["temperature"] = 0.5
+            payload["temperature"] = 0.3
 
         # FIX (bug #6): trước đây subagent KHÔNG BAO GIỜ gửi field "thinking"
         # dù "/mode on" đang bật cho phiên chính — inconsistency không
