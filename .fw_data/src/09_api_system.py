@@ -875,21 +875,75 @@ def _stream_response(resp, text_parts, tc_raw, usage_out, spinner_ref, reasoning
     # đã có sẵn cho Ctrl-C CLI thật (xem call_api_stream dòng ~1320 và
     # main() 10_main.py, nhánh "except KeyboardInterrupt: checkpoint_save").
     _wb = getattr(state, "web_bridge", None) if state is not None else None
+    _raw_line_count = 0
+    _data_line_count = 0
     for raw_line in resp:
         if _wb is not None and _wb.consume_stream_interrupt():
             raise KeyboardInterrupt()
         line = raw_line.decode("utf-8").strip()
-        if not line.startswith("data:"): continue
+        _raw_line_count += 1
+        if not line.startswith("data:"):
+            # BUG FIX (log): trước đây mọi dòng không bắt đầu bằng "data:"
+            # bị continue vô điều kiện, không dấu vết. Nếu gateway trả lỗi
+            # dạng "event: error" trước "data:", hoặc trả JSON thường (không
+            # phải SSE) khi stream=True bị bỏ qua phía họ, hoặc bất kỳ dòng
+            # rác nào khác — TOÀN BỘ response có thể chỉ toàn dòng dạng này,
+            # khiến vòng lặp chạy hết mà không bao giờ vào nhánh parse JSON
+            # bên dưới. Trước đây không cách nào phân biệt được "stream rỗng
+            # thật" với "mọi dòng đều bị lọc ở đây" — giờ log lại (debug
+            # only, cắt ngắn) mỗi dòng không khớp "data:" để có dấu vết.
+            if _cache_debug and line:
+                if spinner_ref:
+                    spinner_ref[0].stop()
+                _cache_log("?", "stream-non-data-line", f"{line[:200]!r}")
+            continue
+        _data_line_count += 1
         ds = line[5:].strip()
         if ds == "[DONE]": break
         try:
             chunk  = json.loads(ds)
+            if _cache_debug:
+                # BUG FIX (log hiển thị): trước đây _cache_log() print()
+                # thẳng ra stdout trong khi spinner vẫn đang chạy (spinner
+                # tự vẽ đè bằng \r trên cùng dòng) → log debug bị lem/ghi
+                # đè lẫn với animation "Thinking...", hiện tượng quan sát
+                # được: dòng log dính liền ngay sau chữ spinner, không
+                # xuống dòng sạch. Phải stop() spinner trước khi in bất kỳ
+                # log debug nào ở đây, giống cách first_token/first_thinking
+                # đã làm phía dưới khi in "AI:"/"[thinking]" thật.
+                # Đồng thời đây là log chunk ĐẦU TIÊN nhận được — dùng để
+                # chẩn đoán case "stream chạy hết, không lỗi parse, nhưng
+                # vẫn rỗng" (gateway trả finish_reason ngay ở chunk đầu mà
+                # không có content/tool_calls theo sau, hoặc chunk thiếu
+                # hẳn field "delta"). Chỉ log 1 lần để tránh spam.
+                if spinner_ref:
+                    spinner_ref[0].stop()
+                if _data_line_count == 1:
+                    _cache_log("?", "stream-first-chunk", json.dumps(chunk, ensure_ascii=False)[:500])
             if chunk.get("usage"):
                 usage_out.update(chunk["usage"])
-            choice = chunk["choices"][0]
+            choices = chunk.get("choices") or []
+            if not choices:
+                # BUG FIX (nghiêm trọng): 1 số gateway OpenAI-compatible
+                # (xác nhận thật với Upstage — Solar Pro4) gửi chunk usage
+                # RIÊNG ở cuối stream với "choices": [] (mảng rỗng), khác
+                # chuẩn OpenAI gốc (luôn gộp finish_reason vào chunk có
+                # choices không rỗng). code cũ làm chunk["choices"][0] vô
+                # điều kiện → IndexError ngay tại chunk cuối này. Vì nằm
+                # trong try/except (json.JSONDecodeError, KeyError,
+                # IndexError): continue, lỗi bị NUỐT ÂM THẦM — nếu chunk
+                # rỗng này đến SỚM (một số gateway gửi nó ngay từ đầu thay
+                # vì cuối), mọi content phía sau cũng bị continue qua, kết
+                # quả turn "thành công nhưng rỗng" y hệt hiện tượng ban đầu
+                # (không text, không tool_calls, không báo lỗi gì). Giờ xử
+                # lý tường minh: usage đã update ở trên rồi, chunk này
+                # không còn gì để đọc thêm (không có delta) — bỏ qua an
+                # toàn, không cần thử choices[0].
+                continue
+            choice = choices[0]
             if choice.get("finish_reason"):
                 finish_reason = choice["finish_reason"]
-            delta = choice["delta"]
+            delta = choice.get("delta") or {}
             if reasoning_parts is not None and delta.get("reasoning_content"):
                 reasoning_parts.append(delta["reasoning_content"])
             if delta.get("thinking"):
@@ -987,8 +1041,32 @@ def _stream_response(resp, text_parts, tc_raw, usage_out, spinner_ref, reasoning
                     _sig = (tc.get("extra_content", {}) or {}).get("google", {}).get("thought_signature")
                     if _sig:
                         tc_raw[idx]["_thought_signature"] = _sig
-        except (json.JSONDecodeError, KeyError, IndexError):
+        except (json.JSONDecodeError, KeyError, IndexError) as e:
+            # BUG FIX (log): trước đây nuốt lỗi hoàn toàn im lặng — nếu 1
+            # dòng SSE bị lệch schema (provider trả chunk thiếu "choices",
+            # JSON hỏng do network glitch, v.v.), dòng đó bị bỏ qua mà
+            # KHÔNG ai biết. Hậu quả quan sát được: nếu TOÀN BỘ response
+            # chỉ toàn chunk lỗi dạng này, text_parts/tc_raw vẫn rỗng khi
+            # thoát vòng lặp, _stream_response trả về y hệt 1 turn "thành
+            # công nhưng rỗng" — CLI không in gì, không báo lỗi, đứng im.
+            # Giờ log lại (kèm raw line, cắt ngắn) để có dấu vết chẩn đoán,
+            # không đổi hành vi continue (vẫn bỏ qua dòng lỗi, không crash
+            # cả stream vì 1 chunk hỏng).
+            if _cache_debug:
+                _cache_log("?", "stream-sse-parse-error",
+                           f"{type(e).__name__}: {e} | raw={line[:200]!r}")
             continue
+    if _cache_debug and _data_line_count == 0:
+        # BUG FIX (log): phân biệt rõ 2 case khác hẳn nhau — "server đóng
+        # kết nối/không gửi gì" (raw_line_count == 0, lỗi network/timeout
+        # phía server) vs "server gửi dòng nhưng không dòng nào là data:"
+        # (raw_line_count > 0, lỗi format/gateway trả sai kiểu response
+        # dù đã request stream=True). Trước đây cả 2 case đều im lặng y
+        # hệt nhau — không cách nào phân biệt chỉ nhìn output CLI.
+        _cache_log("?", "stream-empty-summary",
+                   f"raw_lines={_raw_line_count} data_lines={_data_line_count} "
+                   f"(0 data lines nhận được — server không gửi content nào "
+                   f"đúng format SSE 'data:', dù raw_line_count={_raw_line_count})")
     valid_tool_names = set(valid_tool_names or ())
     for tc in tc_raw.values():
         tc["function"]["name"] = _resolve_streamed_tool_name(
@@ -2108,9 +2186,28 @@ def call_api_stream(messages, model, api_key, tool_choice="auto", session_id=Non
     truncated = (finish_reason == "length")
     if truncated:
         print(f"{YELLOW}  ⚠ Output bị cắt (finish_reason=length) — tự động tiếp tục...{R}")
+    final_text = "".join(text_parts)
+    final_tcs  = list(tc_raw.values())
+    # BUG FIX (log): turn "thành công" (không lỗi HTTP, không exception)
+    # nhưng rỗng hoàn toàn — không text, không tool_calls, không bị cắt,
+    # không bị interrupt. Trước đây rơi vào im lặng tuyệt đối: agent_turn()
+    # nhận text="" rồi kết thúc turn bình thường, user chỉ thấy step-log
+    # rồi màn hình đứng im, không có dấu hiệu gì là có vấn đề. Thường do
+    # toàn bộ SSE response chỉ có chunk lỗi/lệch schema bị nuốt ở
+    # _stream_response (xem log stream-sse-parse-error phía trên nếu debug
+    # bật), hoặc provider trả response hợp lệ nhưng rỗng thật (hiếm, có
+    # thể do content filter / provider bug). In cảnh báo rõ ràng thay vì
+    # im lặng coi như turn bình thường.
+    if not final_text and not final_tcs and not truncated and not interrupted:
+        if state is not None:
+            state.emit(EV_WARN, text="⚠ Model trả về phản hồi rỗng (không text, "
+                       "không tool_calls). Có thể do lỗi parse response — thử lại.")
+        else:
+            print(f"{YELLOW}  ⚠ Model trả về phản hồi rỗng (không text, không "
+                  f"tool_calls). Có thể do lỗi parse response — thử lại.{R}")
     return {
-        "text":       "".join(text_parts),
-        "tool_calls": list(tc_raw.values()),
+        "text":       final_text,
+        "tool_calls": final_tcs,
         "usage":      usage,
         "truncated":  truncated,
         "interrupted": interrupted,
