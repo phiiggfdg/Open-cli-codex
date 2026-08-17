@@ -2812,10 +2812,19 @@ def _agent_turn_inner(messages, model, api_key, conn, sid, max_steps, agent, sta
         # Auto-continue if output was cut off (finish_reason=length), up to 3 times
         continue_count = 0
         while truncated and not tcs and continue_count < 3:
-            # Append partial assistant message, then ask to continue
-            if text:
-                messages.append({"role": "assistant", "content": text})
-                message_save(conn, sid, "assistant", {"role": "assistant", "content": text})
+            # Append partial assistant message, then ask to continue.
+            # BUG FIX: dùng `_delta` (chỉ đoạn MỚI của vòng lặp này) để
+            # append vào messages/DB — nếu dùng `text` (đã tích luỹ toàn bộ
+            # các đoạn từ vòng trước, sau khi sửa "text = text + text2" bên
+            # dưới), các đoạn cũ sẽ bị append TRÙNG LẶP vào messages mỗi
+            # vòng lặp tiếp theo (vòng 1 append đoạn A, vòng 2 append lại
+            # "A+B" dù A đã có trong messages từ vòng 1). `_delta` khởi tạo
+            # bằng `text` gốc lần đầu (chưa từng append), rồi từ vòng 2 trở
+            # đi chỉ còn `text2` (đoạn mới của riêng vòng đó).
+            _delta = text if continue_count == 0 else text2
+            if _delta:
+                messages.append({"role": "assistant", "content": _delta})
+                message_save(conn, sid, "assistant", {"role": "assistant", "content": _delta})
             messages.append({"role": "user", "content": "continue"})
             full2   = [{"role":"system","content":build_system(agent)}] + messages
             result2 = call_api_stream(full2, model, api_key, tool_choice="auto", session_id=sid,
@@ -2835,7 +2844,20 @@ def _agent_turn_inner(messages, model, api_key, conn, sid, max_steps, agent, sta
                     print(f"{YELLOW}  checkpoint {cid} saved after interrupt{R}")
                 break
             # Merge
-            text      = text2
+            # BUG FIX (nghiêm trọng — mất nội dung): trước đây `text = text2`
+            # GHI ĐÈ hoàn toàn thay vì nối — mỗi vòng lặp continue xoá sạch
+            # nội dung các đoạn trước đó khỏi biến `text` (biến này được dùng
+            # để hiển thị "AI: ..." VÀ lưu message cuối cùng vào session/DB
+            # sau khi thoát vòng lặp). Nếu bị cắt 3 lần liên tiếp, output
+            # cuối cùng user thấy/lưu chỉ còn ĐOẠN CUỐI, 2 đoạn đầu bị mất
+            # khỏi bản ghi cuối (dù đã append tạm vào messages[] để làm
+            # context cho lần continue kế — nhưng đó không phải điều user
+            # nhìn thấy). Đây rất có thể là nguyên nhân gây hiện tượng
+            # "toàn dấu [ [ [" — mỗi lần continue, model tiếp nối một đoạn
+            # KHÔNG CÒN NGỮ CẢNH đầy đủ về việc nó đã viết gì trước populate
+            # trong `text` hiển thị, dễ lặp lại cùng 1 pattern (mở ngoặc,
+            # bullet list...) nhiều lần liên tiếp.
+            text      = text + text2
             tcs       = tcs2
             truncated = result2.get("truncated", False)
             total_in     += result2["usage"].get("prompt_tokens", 0)
