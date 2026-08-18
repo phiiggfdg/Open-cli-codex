@@ -716,6 +716,8 @@ def _call_simple(messages, model, api_key, retry_max=None, silent=False,
         payload["temperature"] = 0.5
     if _active_provider == "mercury":
         payload["reasoning_effort"] = "low"
+    if _is_upstage_custom_provider():
+        payload["reasoning_effort"] = _upstage_thinking_effort or "medium"
     for attempt in range(retries):
         if check_cancel and _cancel_bg.is_set():
             return {"text": "[cancelled]", "tool_calls": []}
@@ -756,7 +758,12 @@ def _call_simple(messages, model, api_key, retry_max=None, silent=False,
                     parsed = parse_responses_response(body)
                     return {"text": parsed["text"], "tool_calls": []}
                 msg = body["choices"][0]["message"]
-                return {"text": msg.get("content", ""), "tool_calls": []}
+                out = {"text": msg.get("content", ""), "tool_calls": []}
+                if msg.get("reasoning"):
+                    out["reasoning"] = msg.get("reasoning", "")
+                elif msg.get("reasoning_content"):
+                    out["reasoning"] = msg.get("reasoning_content", "")
+                return out
         except urllib.error.HTTPError as e:
             _rate_limit_mark()
             if attempt < retries - 1:
@@ -837,9 +844,8 @@ def _stream_response(resp, text_parts, tc_raw, usage_out, spinner_ref, reasoning
     Trả về finish_reason (str | None).
     spinner_ref: list[Spinner] — stop spinner khi token đầu tiên về.
     reasoning_parts: list | None — nếu truyền vào, gom delta.reasoning_content
-        (DeepSeek thinking mode / adapter dịch sang field này). Không in ra
-        màn hình (chỉ là CoT nội bộ) — chỉ giữ lại để gửi lại API ở lượt sau
-        nếu turn có tool_calls (DeepSeek bắt buộc trong trường hợp đó).
+        (DeepSeek thinking mode / adapter dịch sang field này) và delta.reasoning
+        (Upstage reasoning). Cả hai đều được render như thinking.
         Mặc định None → không gom gì cả, hành vi y hệt code cũ.
     thinking_parts: list | None — gom delta.thinking (Anthropic/Bedrock
         extended thinking thật, KHÁC reasoning_content ở trên — xem
@@ -860,6 +866,7 @@ def _stream_response(resp, text_parts, tc_raw, usage_out, spinner_ref, reasoning
         riêng của Google. Việc tách call khác ID và resolve tên bị stream
         lặp áp dụng cho mọi OpenAI-compatible provider.
     """
+    global _thinking_leak_warned_session
     finish_reason = None
     first_token   = True
     first_thinking = True
@@ -944,8 +951,33 @@ def _stream_response(resp, text_parts, tc_raw, usage_out, spinner_ref, reasoning
             if choice.get("finish_reason"):
                 finish_reason = choice["finish_reason"]
             delta = choice.get("delta") or {}
-            if reasoning_parts is not None and delta.get("reasoning_content"):
-                reasoning_parts.append(delta["reasoning_content"])
+            # OpenAI-compatible providers use either field; do not restrict
+            # `reasoning` to Upstage because the support probe checks both.
+            reasoning_delta = delta.get("reasoning_content") or delta.get("reasoning")
+            if reasoning_parts is not None and reasoning_delta:
+                reasoning_parts.append(reasoning_delta)
+            if reasoning_delta and (
+                    _thinking_mode == "off"
+                    or (_is_upstage_custom_provider() and _upstage_thinking_effort == "none")
+                ) and not _thinking_leak_warned_session:
+                _leak_msg = ("⚠ Model vẫn trả thinking dù mode/effort đang tắt; "
+                             "vẫn ghi nhận nội dung này.")
+                if state is not None:
+                    state.emit(EV_WARN, text=_leak_msg)
+                else:
+                    print(f"\n{YELLOW}{_leak_msg}{R}")
+                _thinking_leak_warned_session = True
+            if reasoning_delta:
+                if first_thinking:
+                    if spinner_ref:
+                        spinner_ref[0].stop()
+                    if state is None:
+                        print(f"\n{DIM}[thinking] ", end="", flush=True)
+                    first_thinking = False
+                if state is not None:
+                    state.emit(EV_THINKING_DELTA, text=reasoning_delta)
+                else:
+                    print(f"{DIM}{reasoning_delta}{R}", end="", flush=True)
             if delta.get("thinking"):
                 if thinking_parts is not None:
                     thinking_parts.append(delta["thinking"])
@@ -961,7 +993,6 @@ def _stream_response(resp, text_parts, tc_raw, usage_out, spinner_ref, reasoning
                         # đã bị skip do cache _thinking_disable_already_probed.
                         # Chỉ in 1 lần/phiên (cờ in-memory) — tránh spam nếu
                         # leak xảy ra liên tục nhiều turn liền.
-                        global _thinking_leak_warned_session
                         if not _thinking_leak_warned_session:
                             if state is not None:
                                 state.emit(EV_WARN, text="⚠ Mode đang OFF nhưng provider vẫn trả "
@@ -1131,6 +1162,7 @@ def _sanitize_tool_turns(messages: list) -> list:
 # không" thì lưu xuống config.json (xem _thinking_support_get/_set) để lần
 # mở app sau khỏi phải dò lại — tránh tốn token / lỗi vô ích cho mọi turn.
 _thinking_mode: str = "off"   # "off" hoặc "on" — set qua lệnh /mode
+_upstage_thinking_effort: str | None = None  # None|none|medium|high — set qua /thinking
 
 # Cờ in-memory (KHÔNG persist) — chỉ cảnh báo leak runtime (mode off nhưng
 # provider vẫn trả thinking) 1 lần mỗi phiên chạy app, tránh spam mỗi turn
@@ -1161,6 +1193,21 @@ def _thinking_support_set(model: str, supported: bool):
         table[_thinking_key(model)] = supported
         cfg["thinking_support"] = table
         save_config(cfg)
+
+def _is_upstage_custom_provider() -> bool:
+    """True only for the user-added custom provider named exactly `upstage`."""
+    try:
+        return _active_provider == "upstage" and bool(_prov().get("_custom"))
+    except Exception:
+        return False
+
+def _upstage_normalize_thinking_effort(value: str) -> str | None:
+    val = (value or "").strip().lower()
+    if val == "on":
+        val = "high"
+    elif val == "off":
+        val = "none"
+    return val if val in ("none", "medium", "high") else None
 
 # Cache riêng: model CÓ support thinking (xác nhận ở _thinking_support_*
 # bên trên) NHƯNG gửi {"type": "disabled"} có thực sự tắt được không.
@@ -1624,6 +1671,10 @@ def _apply_thinking_param(payload: dict, model: str):
     nên gộp chung điều kiện với nhánh Anthropic/Bedrock ở dưới, KHÔNG viết
     nhánh riêng — tránh trùng lặp code cho cùng 1 schema trung gian.
     """
+    if _is_upstage_custom_provider():
+        payload["reasoning_effort"] = _upstage_thinking_effort or "medium"
+        return
+
     supported = _thinking_support_get(model)
     if supported is not True:
         return  # chưa biết hoặc biết chắc KHÔNG support → không gắn gì cả, dù on hay off
@@ -1655,6 +1706,7 @@ def _probe_thinking_support(model: str, api_key: str) -> bool:
     """
     Gửi 1 request rất nhẹ (1 câu hỏi ngắn, không tool, max_tokens nhỏ) kèm
     tham số thinking để xem provider+model này có thực sự trả reasoning_content
+    hoặc reasoning
     không. Dùng đúng 1 lần cho mỗi cặp (provider, model) — kết quả được cache
     lại (_thinking_support_set) nên các lần sau không tốn thêm request nào.
 
@@ -1697,7 +1749,7 @@ def _probe_thinking_support(model: str, api_key: str) -> bool:
             # tự nhận diện item type "reasoning" có "summary" hay không.
             return bool(parse_responses_response(body).get("has_reasoning_summary"))
         msg = body.get("choices", [{}])[0].get("message", {})
-        return bool(msg.get("reasoning_content"))
+        return bool(msg.get("reasoning_content") or msg.get("reasoning"))
     except Exception:
         # Lỗi (400/422/network...) → coi như KHÔNG support, tránh thử lại
         # liên tục gây tốn request mỗi lần user gõ /mode.
@@ -1837,6 +1889,14 @@ def call_api_stream(messages, model, api_key, tool_choice="auto", session_id=Non
     # ở lần sau (_format_override_get_raw trả None) nên tự nhiên dừng — cờ
     # này chỉ để tránh trường hợp logic tương lai vô tình cho phép xoá lặp.
     _format_recovery_done = False
+    # Cờ chặn lặp cho cơ chế tự retry-bỏ-bash (xem nhánh "no endpoints found
+    # that support tool use" bên dưới): 1 số provider free-tier trên
+    # OpenRouter route model qua endpoint không hỗ trợ tool `bash` cụ thể
+    # (dù model NÓI CHUNG có hỗ trợ tool use — lỗi message chỉ rõ "Try
+    # disabling bash", không phải "tool use" nói chung). Chỉ tự bỏ ĐÚNG 1
+    # LẦN trong cả vòng retry — nếu bỏ bash rồi vẫn 404 y hệt, không có gì
+    # để bỏ thêm, rơi xuống lỗi generic để user tự xử lý.
+    _bash_tool_removed = False
 
     for attempt in range(_RETRY_MAX):
         text_parts    = []
@@ -1938,6 +1998,38 @@ def call_api_stream(messages, model, api_key, tool_choice="auto", session_id=Non
                 return {"text": "", "tool_calls": [], "usage": {}, "truncated": False,
                         "reasoning": "", "thinking": "", "thinking_signature": "",
                         "redacted_thinking_data": "", "vision_unsupported": True}
+
+            # "No endpoints found that support tool use. Try disabling 'bash'."
+            # — 1 số route free-tier OpenRouter (và có thể provider tương tự)
+            # không có endpoint nào hỗ trợ ĐÚNG tool `bash` trong bộ tools gửi
+            # lên, dù model vẫn hỗ trợ tool-calling nói chung (message chỉ rõ
+            # tên tool, khác lỗi "không hỗ trợ tool use" chung chung). Trước
+            # đây: lỗi 404 này rơi thẳng xuống nhánh generic bên dưới, in ra
+            # y nguyên rồi dừng — buộc user phải tự đổi model thủ công dù
+            # thật ra chỉ cần bỏ 1 tool. Giờ: tự bỏ tool "bash" khỏi payload,
+            # báo rõ cho user biết, và retry 1 lần — agent vẫn dùng được các
+            # tool còn lại (read/edit/apply_patch/grep...), chỉ mất khả năng
+            # chạy lệnh shell trực tiếp cho model/route này.
+            if (e.code == 404 and not _bash_tool_removed
+                    and "support tool use" in body_lower
+                    and "bash" in body_lower
+                    and any(t.get("function", {}).get("name") == "bash"
+                            for t in (api_tools or []))):
+                _bash_tool_removed = True
+                api_tools = [t for t in api_tools if t.get("function", {}).get("name") != "bash"]
+                payload["tools"] = api_tools
+                spinner_ref[0].stop()
+                _txt = (f"\n{YELLOW}  ⚠ Provider/route hiện tại không hỗ trợ tool "
+                         f"'bash' (model vẫn dùng được các tool khác) → đã tự bỏ "
+                         f"'bash' khỏi request, thử lại. Model sẽ không chạy được "
+                         f"lệnh shell trực tiếp cho tới khi bạn đổi sang model/route "
+                         f"khác có hỗ trợ đầy đủ.{R}")
+                if state: state.emit(EV_WARN, text=_txt, raw=True)
+                else: print(_txt, flush=True)
+                spinner = Spinner(f"Retry {attempt+1}")
+                spinner.start()
+                spinner_ref[0] = spinner
+                continue
 
             if e.code == 400 and ("max_tokens" in body_lower or "max tokens" in body_lower):
                 if attempt == 0:
@@ -2660,7 +2752,38 @@ def _tool_was_definitely_blocked(result: str) -> bool:
     return text.startswith((
         "[permission denied", "[unknown tool", "[tool_error: missing required arg",
         "[task denied", "[policy]",
+        # BUG FIX: guard marker chống copy-paste history-compaction
+        # placeholder (06_tools_fs.py, _COMPACTION_MARKER_ERROR) return NGAY
+        # dòng đầu tool_write/tool_edit/tool_apply_patch, TRƯỚC bất kỳ ghi
+        # đĩa nào — chắc chắn 100% không mutate, y hệt các case khác trong
+        # danh sách này. Trước đây thiếu prefix này khiến
+        # _tool_may_mutate_state("write",...) vẫn coi là "có thể đã mutate"
+        # (luôn True cho write/edit/apply_patch, không xem kết quả) →
+        # _mutation_epoch tăng dù không hề ghi gì → nếu model gọi lại đúng
+        # tool_call y hệt (cùng step do parallel_tool_calls, hoặc step kế
+        # tiếp), dedup-guard chặn nó và trả "[dedup] Skipped unchanged
+        # duplicate" — CHE MẤT lý do thật (marker sai) khỏi model, khiến
+        # model hiểu nhầm nguyên nhân là "trùng nội dung với file cũ" thay
+        # vì "tôi đang gửi placeholder rác" — quan sát thực tế gây vòng lặp
+        # 14 step không tự thoát được (model liên tục đổi hướng suy luận
+        # sai theo lỗi dedup thay vì sửa đúng vấn đề gốc).
+        "[error] the content you provided is a history-compaction placeholder marker",
     ))
+
+def _tool_failure_signature(result: str) -> str | None:
+    """Stable signature for tool failures that are useful for loop breaking."""
+    text = (result or "").strip()
+    low = text.lower()
+    if not low.startswith((
+        "[error", "[permission denied", "[unknown tool", "[tool_error:",
+        "[task denied", "[policy]",
+    )):
+        return None
+    # Dedup is a framework shortcut, not the original tool failure. It already
+    # short-circuits before run_tool(), but keep this explicit for future moves.
+    if low.startswith("[dedup]"):
+        return None
+    return low
 
 def _agent_turn_inner(messages, model, api_key, conn, sid, max_steps, agent, state):
     global _current_agent, _todowrite_calls_this_turn, _current_sid, _large_read_credits, _task_depth
@@ -2702,6 +2825,10 @@ def _agent_turn_inner(messages, model, api_key, conn, sid, max_steps, agent, sta
     # nào ở giữa, dedup vẫn chặn y như cũ (tránh AI lặp vô ích tốn token).
     _seen_calls_this_turn: dict = {}     # dedup: call_sig -> epoch lúc gọi
     _mutation_epoch = 0                  # tăng mỗi khi có tool đổi trạng thái
+    _repeat_error_sig = None             # no-progress: (call_sig, failure_sig, epoch)
+    _repeat_error_count = 0
+    _loop_break_requested = False
+    _loop_break_msg = ""
     _recent_writes.clear()        # reset read-after-write block mỗi turn
     _index_prune()               # xóa entry file không còn tồn tại
     _had_writes_last_step: bool = False  # lazy validate: chỉ recheck khi có write
@@ -2981,7 +3108,7 @@ def _agent_turn_inner(messages, model, api_key, conn, sid, max_steps, agent, sta
         if state is None or not (getattr(state, "web_bridge", None) and state.web_bridge.is_armed()):
             print()
         tool_results_history = []   # saved to DB (smaller)
-        for tc in tcs:
+        for _tc_index, tc in enumerate(tcs):
             name = tc["function"]["name"]
             try: args = json.loads(tc["function"].get("arguments") or "{}")
             except: args = {}
@@ -3027,13 +3154,14 @@ def _agent_turn_inner(messages, model, api_key, conn, sid, max_steps, agent, sta
                         _cache_touch(str(Path(args.get(_path_arg, "")).expanduser().resolve()))
                     except Exception:
                         pass
+            _epoch_before_tool = _mutation_epoch
             out_model, out_history = run_tool(name, args, model, api_key, conn, sid, state=state)
             _definitely_blocked = _tool_was_definitely_blocked(out_model)
             if _may_mutate_state and not _definitely_blocked:
                 _mutation_epoch += 1
             if _may_mutate_local and not _definitely_blocked:
                 _had_writes_last_step = True
-            if _dedup_should_block(name):
+            if _dedup_should_block(name) and not _definitely_blocked:
                 _seen_calls_this_turn[_call_sig] = _mutation_epoch
             tool_results.append({
                 "role": "tool", "tool_call_id": tc.get("id", ""), "content": out_model
@@ -3041,11 +3169,51 @@ def _agent_turn_inner(messages, model, api_key, conn, sid, max_steps, agent, sta
             tool_results_history.append({
                 "role": "tool", "tool_call_id": tc.get("id", ""), "content": out_history
             })
+            _failure_sig = _tool_failure_signature(out_model)
+            if _failure_sig is not None and _mutation_epoch == _epoch_before_tool:
+                _current_repeat_sig = (_call_sig, _failure_sig, _mutation_epoch)
+                if _repeat_error_sig == _current_repeat_sig:
+                    _repeat_error_count += 1
+                else:
+                    _repeat_error_sig = _current_repeat_sig
+                    _repeat_error_count = 1
+            else:
+                _repeat_error_sig = None
+                _repeat_error_count = 0
+            if _repeat_error_count >= 3:
+                _loop_break_requested = True
+                _loop_break_msg = (
+                    f"[no-progress] Đã dừng turn vì `{name}` được gọi lặp lại "
+                    "với cùng args và cùng lỗi 3 lần liên tiếp, trong khi không "
+                    "có state change nào xảy ra. Model có thể đang mắc vòng lặp."
+                )
+                if state is not None:
+                    state.emit(EV_WARN, text=_loop_break_msg)
+                else:
+                    print(f"  {YELLOW}{_loop_break_msg}{R}")
+                for _remaining_tc in tcs[_tc_index + 1:]:
+                    _abort_msg = (
+                        "[no-progress] Skipped because this turn was stopped "
+                        "after repeated identical tool failures."
+                    )
+                    tool_results.append({
+                        "role": "tool",
+                        "tool_call_id": _remaining_tc.get("id", ""),
+                        "content": _abort_msg,
+                    })
+                    tool_results_history.append({
+                        "role": "tool",
+                        "tool_call_id": _remaining_tc.get("id", ""),
+                        "content": _abort_msg,
+                    })
+                break
         messages.extend(tool_results)
         for tr in tool_results_history:
             message_save(conn, sid, "tool", tr)
         memory_pressure_evict()   # evict file cache nếu RAM cao
         steps += 1
+        if _loop_break_requested:
+            break
 
     if steps >= max_steps:
         _max_step_msg = (

@@ -24,7 +24,6 @@ def _auto_rename_session(conn, sid, messages, model, api_key):
         return
 
     def _do_rename():
-        import concurrent.futures as _cf
         def _api_call():
             # retry_max=2 (KHÔNG phải 1): tác vụ phụ, không quan trọng, nên
             # tránh retry dài 5 lần (loop >90s khi bị 429 — bug gốc). Nhưng
@@ -50,9 +49,12 @@ def _auto_rename_session(conn, sid, messages, model, api_key):
                 model, api_key, retry_max=2, silent=True, check_cancel=True
             )
         try:
-            with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
-                fut = _ex.submit(_api_call)
-                result = fut.result(timeout=15)  # timeout 15s — tránh zombie thread
+            # _do_rename() itself already runs in a daemon thread.  Do not
+            # create a nested ThreadPoolExecutor here: its non-daemon worker
+            # is joined by Python during interpreter shutdown, which can
+            # turn a normal Ctrl-C into a traceback if the network call is
+            # still pending.
+            result = _api_call()
             if result.get("text") == "[cancelled]":
                 return  # người dùng đã Ctrl+C — không lưu tên
             new_title = result.get("text", "").strip().strip('"').strip("'")
@@ -379,6 +381,7 @@ HELP = f"""
   {CYAN}/sequential{R}          step-by-step mode  {DIM}(safer, more tokens){R}
   {CYAN}/batch{R}               batched tool calls {DIM}(default, faster){R}
   {CYAN}/mode{R}                thinking on/off  {DIM}(if model supports it){R}
+  {CYAN}/thinking{R}            Upstage reasoning_effort {DIM}(none / medium / high){R}
 
 {GRAY}Context & Memory{R}
   {CYAN}/tokens{R}              token usage + cost
@@ -535,14 +538,15 @@ def main():
     # B2 FIX: thiếu global cho các biến này khiến các lần "reset" ở /sessions
     # và /perm bash ask (xem dưới) chỉ tạo biến local trong main(), không
     # đụng tới biến module-level thật mà tool_bash()/_check_permission() đọc.
-    global _input_history, _tool_mode, _thinking_mode, _bash_allow_all
+    global _input_history, _tool_mode, _thinking_mode, _upstage_thinking_effort, _bash_allow_all
     _input_history = history_load()
     choose_provider()
     api_key = get_api_key()
     conn    = db_connect()
 
     _tool_mode = "batch"  # mặc định batch, user có thể gõ /sequential để đổi
-    _thinking_mode = "off"  # mặc định off, user gõ /mode on để bật (nếu model hỗ trợ)
+    _thinking_mode = "on"  # tự bật; /mode chỉ là override request, không chặn việc bắt thinking
+    _upstage_thinking_effort = None  # chỉ dùng cho custom provider upstage qua /thinking
 
     session, model, messages = pick_session(conn, api_key)
     sid    = session["id"]
@@ -733,7 +737,7 @@ def main():
         # giống lý do các lệnh trên được whitelist. Lệnh này CHỈ có ý nghĩa
         # khi armed trong web (đổi agent + bật layout 2 cột cho chính phiên
         # web đang mở), nên bắt buộc phải nằm trong whitelist này.
-        _WEB_ALLOWED_CMDS = ("/listkeys", "/rmkey", "/deletekey", "/addkey", "/setkey", "/model", "/mode", "/format", "/codeweb")
+        _WEB_ALLOWED_CMDS = ("/listkeys", "/rmkey", "/deletekey", "/addkey", "/setkey", "/model", "/mode", "/thinking", "/format", "/codeweb")
         _cmd0 = user.split(None, 1)[0].lower() if user.split(None, 1) else ""
         if (state is not None and state.web_bridge is not None
                 and state.web_bridge.is_armed()
@@ -742,7 +746,7 @@ def main():
             state.emit(EV_WARN, text=(
                 "Lệnh / (và exit/quit) không dùng được qua Web UI — bấm Esc "
                 "trên CLI để chạy lệnh, Web UI chỉ để chat/thao tác code.\n"
-                "(Riêng /listkeys /rmkey /deletekey /addkey /setkey /model /mode /format "
+                "(Riêng /listkeys /rmkey /deletekey /addkey /setkey /model /mode /thinking /format "
                 "/codeweb on|off dùng được.)\n"
             ))
             continue
@@ -1042,6 +1046,15 @@ def main():
         if _cmd_parts and _cmd_parts[0].lower() == "/mode":
             arg = _cmd_parts[1].strip().lower() if len(_cmd_parts) > 1 else ""
 
+            if _is_upstage_custom_provider():
+                _mode_msg = (f"{YELLOW}⚠ Upstage không dùng /mode. Hãy dùng /thinking "
+                             f"(none / medium / high).{R}\n")
+                if state is not None:
+                    state.emit(EV_INFO, text=_mode_msg, raw=True)
+                else:
+                    print(_mode_msg)
+                continue
+
             def _mode_out(text):
                 """In ra CLI hoặc emit qua bus tuỳ có state hay không -- pattern
                 dùng chung khắp file, tách hàm nhỏ ở đây vì /mode có nhiều
@@ -1120,6 +1133,43 @@ def main():
                 if _mode_lines:
                     _mode_out("\n".join(_mode_lines))
                 continue
+
+        if _cmd_parts and _cmd_parts[0].lower() == "/thinking":
+            arg = _cmd_parts[1].strip().lower() if len(_cmd_parts) > 1 else ""
+
+            def _thinking_out(text):
+                if state is not None:
+                    state.emit(EV_INFO, text=text, raw=True)
+                else:
+                    print(text)
+
+            if not _is_upstage_custom_provider():
+                _thinking_out(
+                    f"{YELLOW}⚠ /thinking chỉ dùng cho custom provider 'upstage'.{R}\n"
+                    f"{DIM}  Provider hiện tại: {_active_provider}. Dùng /model để đổi provider/model nếu cần.{R}\n"
+                )
+                continue
+
+            if not arg:
+                cur = _upstage_thinking_effort or "unset"
+                _thinking_out(
+                    f"{GREEN if _upstage_thinking_effort else DIM}Upstage reasoning_effort: {cur}{R}\n"
+                    f"{DIM}  Gõ {CYAN}/thinking none{R}{DIM}, {CYAN}/thinking medium{R}{DIM}, "
+                    f"hoặc {CYAN}/thinking high{R}{DIM}.{R}\n"
+                )
+                continue
+
+            effort = _upstage_normalize_thinking_effort(arg)
+            if effort is None:
+                _thinking_out(
+                    f"{YELLOW}⚠ Giá trị không hợp lệ: {arg}{R}\n"
+                    f"{DIM}  Upstage hỗ trợ: none, medium, high.{R}\n"
+                )
+                continue
+
+            _upstage_thinking_effort = effort
+            _thinking_out(f"{GREEN}✓ Upstage reasoning_effort: {effort}{R}\n")
+            continue
 
         if user.lower() == "/clear":
             conn.execute("DELETE FROM message WHERE session_id=?", (sid,))

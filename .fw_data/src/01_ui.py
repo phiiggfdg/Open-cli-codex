@@ -118,7 +118,7 @@ class Spinner:
 
 # ── Slash-complete ────────────────────────────────────────────────────────────
 SLASH_COMMANDS = [
-    "/model", "/agent", "/mode", "/session", "/sessions", "/todos", "/compact",
+    "/model", "/agent", "/mode", "/thinking", "/session", "/sessions", "/todos", "/compact",
     "/clear", "/delete", "/deleteall", "/cd", "/title", "/tokens",
     "/undo", "/redo", "/diff", "/sandbox", "/export", "/cache", "/checkpoint",
     "/perm", "/perms", "/skills", "/setkey", "/deletekey", "/init", "/rules",
@@ -131,6 +131,7 @@ SLASH_DESC = {
     "/model":      "đổi model",
     "/agent":      "đổi agent mode (build/plan)",
     "/mode":       "bật/tắt thinking mode (nếu model hỗ trợ)",
+    "/thinking":   "đặt reasoning_effort cho Upstage custom",
     "/session":    "info session hiện tại",
     "/sessions":   "switch/tạo session",
     "/todos":      "xem todo list",

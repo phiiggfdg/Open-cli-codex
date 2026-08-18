@@ -518,7 +518,9 @@ Be concise. Current directory: {os.getcwd()}"""
         # tốn thêm 1 request riêng cho subagent). Nếu model chưa từng được
         # biết là có support thinking (None hoặc False), không gửi gì —
         # giữ nguyên hành vi an toàn cũ, không gây 400/422 cho model lạ.
-        if _thinking_mode == "on" and _thinking_support_get(model) is True:
+        if _is_upstage_custom_provider():
+            payload["reasoning_effort"] = _upstage_thinking_effort or "medium"
+        elif _thinking_mode == "on" and _thinking_support_get(model) is True:
             if _format_anthropic_for(model or "") or _active_provider == "aws_bedrock":
                 payload["thinking"] = {"type": "enabled", "budget_tokens": 8000}
             else:
