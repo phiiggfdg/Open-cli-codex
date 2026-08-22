@@ -353,6 +353,7 @@ def _content_hash(content: str) -> str:
 
 def _cache_put(path: str, content: str, sid: str = ""):
     """Lưu file vào cache sau khi đọc hoặc ghi. Cập nhật access time cho LRU."""
+    sid = sid or _project_dir_sid or ""
     p   = Path(path).expanduser().resolve()
     ext = p.suffix.lower()
     now = time.time()
@@ -508,81 +509,69 @@ def _project_dir_str() -> str:
 
 def _sandbox_init(conn, sid, project_dir_str: str | None):
     """Called at session start to restore or reset the sandbox.
-    project_dir luon co san tu session_create() — path stable cho cache tu turn 0.
-    is_placeholder=True: tools_fs chua enforce sandbox read (AI doc duoc project co san).
-    is_placeholder=False: sau write dau tien, sandbox enforce day du.
-    """
-    global _project_dir, _project_dir_conn, _project_dir_sid, _project_dir_is_placeholder
+    project_dir luôn có sẵn từ session_create() — path ổn định suốt session."""
+    global _project_dir, _project_dir_conn, _project_dir_sid
     _project_dir_conn = conn
     _project_dir_sid  = sid
     if project_dir_str:
-        _project_dir = Path(project_dir_str)
+        _project_dir = Path(project_dir_str).resolve()
         _project_dir.mkdir(parents=True, exist_ok=True)
-        # Kiem tra xem session nay da tung write chua (co file trong sid/)
-        # Neu chua co file → placeholder (cho phep read rong hon)
-        # Neu da co file → sandbox that (restore dung trang thai)
-        # C10 FIX: rglob("*") match cả directory rỗng → dùng is_file() để chỉ đếm file thật
-        has_files = any(p for p in _project_dir.rglob("*") if p.is_file())
-        _project_dir_is_placeholder = not has_files
     else:
-        # Fallback legacy session chua co project_dir → tao ngay, bat dau nhu moi
-        proj = Path.cwd().resolve() / sid
+        proj = (Path.cwd().resolve() / sid).resolve()
         proj.mkdir(parents=True, exist_ok=True)
         _project_dir = proj
-        _project_dir_is_placeholder = True
-        session_update(conn, sid, project_dir=str(proj))
+        if conn:
+            session_update(conn, sid, project_dir=str(proj))
 
-def _ensure_project_dir(requested_path: str) -> Path:
-    """
-    Tra ve project_dir va dam bao sandbox duoc enforce (is_placeholder=False).
-    Goi khi AI write lan dau — flip placeholder → real sandbox.
-    project_dir luon co san tu session_create(), chi can flip flag.
-    """
-    global _project_dir, _project_dir_is_placeholder
-    if _project_dir is not None and not _project_dir_is_placeholder:
+def _ensure_project_dir(requested_path: str = "") -> Path:
+    """Trả về project_dir của session hiện tại (tạo nếu chưa có)."""
+    global _project_dir
+    if _project_dir is not None:
         return _project_dir
 
-    if _project_dir is not None and _project_dir_is_placeholder:
-        # path da co san tu session_create() — chi flip flag
-        # Khong clear _system_full_cache vi cache key (sid/) khong doi
-        _project_dir_is_placeholder = False
-        if _project_dir_conn and _project_dir_sid:
-            session_update(_project_dir_conn, _project_dir_sid,
-                           project_dir=str(_project_dir))
-        # BUG ĐÃ SỬA: cùng loại bug với tool_todowrite (07_tools_more.py) --
-        # print() trần trong hàm helper sâu (_ensure_project_dir, gọi từ
-        # bên trong write/edit tool), không nhận state, không emit gì --
-        # dòng "[sandbox] enforced: ..." chỉ hiện trên CLI thật, web không
-        # bao giờ thấy. Dùng current_state() (thread-local) cùng pattern
-        # đã áp cho tool_todowrite.
-        _txt = f"  {GREEN}[sandbox]{R} enforced: {DIM}{_project_dir}{R}"
-        _st = current_state()
-        if _st is not None:
-            _st.emit(EV_INFO, text=_txt, raw=True)
-        else:
-            print(_txt)
-        return _project_dir
-
-    # Fallback legacy session chua co project_dir (rat hiem)
     sid = _project_dir_sid or "project"
-    proj = Path.cwd().resolve() / sid
+    proj = (Path.cwd().resolve() / sid).resolve()
     proj.mkdir(parents=True, exist_ok=True)
     _project_dir = proj
-    _project_dir_is_placeholder = False
-    _system_full_cache.clear()
     if _project_dir_conn and _project_dir_sid:
-        session_update(_project_dir_conn, _project_dir_sid,
-                       project_dir=str(proj))
-    print(f"  {GREEN}[sandbox]{R} project_dir (fallback): {DIM}{proj}{R}")
+        session_update(_project_dir_conn, _project_dir_sid, project_dir=str(proj))
     return proj
+
+def _resolve_read_path(path: str | Path) -> Path:
+    """
+    Resolve path cho các tool đọc (read, view_symbol, verify, lsp, extract src).
+    Quy tắc nghiêm ngặt:
+    1. Nếu rỗng -> trả về project_dir (hoặc cwd nếu chưa có session).
+    2. Nếu là absolute -> resolve trực tiếp (sẽ qua _check_sandbox_read kiểm tra).
+    3. Nếu là relative có prefix proj.name (vd '9aa25482/01_ui.py') -> strip prefix và map vào project_dir.
+    4. Mọi relative path khác -> LUÔN resolve từ project_dir (project_dir / path).
+    Không fallback sang Path.cwd() để triệt tiêu 100% nguy cơ bất đồng bộ workspace root.
+    """
+    if not path:
+        return _project_dir.resolve() if _project_dir is not None else Path.cwd().resolve()
+    p_orig = Path(path).expanduser()
+    proj = _project_dir.resolve() if _project_dir is not None else Path.cwd().resolve()
+
+    if p_orig.is_absolute():
+        return p_orig.resolve()
+
+    # Kiểm tra xem có bị prefix tên project_dir không (vd "9aa25482/foo.py")
+    if p_orig.parts and p_orig.parts[0] == proj.name:
+        stripped = Path(*p_orig.parts[1:]) if len(p_orig.parts) > 1 else Path(".")
+        return (proj / stripped).resolve()
+
+    # Luôn resolve từ project_dir duy nhất
+    return (proj / p_orig).resolve()
+
 
 def _resolve_to_sandbox(path: str) -> Path:
     """
     Tự động redirect path vào project_dir (tạo nếu chưa có).
     - Nếu path đã nằm trong project_dir → giữ nguyên.
+    - Nếu path bắt đầu bằng proj.name (vd '9aa25482/01_ui.py') → strip để tránh double nesting.
     - Nếu path là relative hoặc nằm ngoài → rewrite vào project_dir,
       giữ lại cấu trúc thư mục con tương đối nếu có.
-    Dùng chung cho write / edit / apply_patch.
+    Dùng chung cho write / edit / multiedit / apply_patch / delete / extract dst.
     """
     proj = _ensure_project_dir(path)
     p_orig = Path(path).expanduser()
@@ -590,18 +579,27 @@ def _resolve_to_sandbox(path: str) -> Path:
     # Đã nằm trong project_dir rồi → không đổi
     try:
         p_orig.resolve().relative_to(proj.resolve())
-        return p_orig
+        return p_orig.resolve()
     except ValueError:
         pass
+
+    # Nếu path bắt đầu bằng tên của proj (vd '9aa25482/01_ui.py') → strip để tránh double nesting
+    if not p_orig.is_absolute():
+        parts = p_orig.parts
+        if parts and parts[0] == proj.name:
+            stripped = Path(*parts[1:]) if len(parts) > 1 else Path(".")
+            return (proj / stripped).resolve()
 
     # Nằm trong cwd nhưng ngoài project_dir → giữ relative path từ cwd
     try:
         rel = p_orig.resolve().relative_to(Path.cwd().resolve())
+        if rel.parts and rel.parts[0] == proj.name:
+            rel = Path(*rel.parts[1:]) if len(rel.parts) > 1 else Path(".")
     except ValueError:
         # Absolute hoàn toàn ngoài cwd → chỉ lấy phần tên file/subpath
         rel = Path(*p_orig.parts[1:]) if p_orig.is_absolute() else Path(p_orig.name)
 
-    return proj / rel
+    return (proj / rel).resolve()
 
 # ════════════════════════════════════════════════════════════════════════════
 # DATABASE

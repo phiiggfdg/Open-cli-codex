@@ -119,10 +119,31 @@ def _validate_bash_command(command: str, for_serve: bool = False):
     if name not in allowed:
         return False, f"Command '{name}' không nằm trong allowlist.", argv
 
-    if name in ("python", "python3") and "-c" in argv[1:]:
-        return False, "python -c bị chặn; hãy viết file .py trong project rồi chạy file đó.", argv
-    if name == "node" and any(a in ("-e", "--eval", "-p", "--print") for a in argv[1:]):
-        return False, "node eval/print inline bị chặn; hãy chạy file .js trong project.", argv
+    # BUG FIX: trước đây dùng "-c" in argv[1:] (flat scan toàn bộ args) nên
+    # "python3 script.py -c val" và "python3 -m pytest -c cfg.ini" bị block
+    # sai — "-c" là arg của script/module, không phải của interpreter.
+    # Fix: chỉ scan flags TRƯỚC tên script (first non-flag arg), bỏ qua
+    # "-m <module>" (là interpreter-level flag, không phải script name).
+    if name in ("python", "python3"):
+        i = 1
+        while i < len(argv):
+            a = argv[i]
+            if a == "-c":
+                return False, "python -c bị chặn; hãy viết file .py trong project rồi chạy file đó.", argv
+            if a == "-m" and i + 1 < len(argv):
+                i += 2  # bỏ qua "-m <module>", tiếp tục check flag sau module
+                continue
+            if not a.startswith("-"):
+                break   # đã tới tên script — mọi arg sau đây thuộc về script
+            i += 1
+    if name == "node":
+        _node_eval_flags = {"-e", "--eval", "-p", "--print"}
+        for a in argv[1:]:
+            if a in _node_eval_flags:
+                return False, "node eval/print inline bị chặn; hãy chạy file .js trong project.", argv
+            if not a.startswith("-"):
+                break   # đã tới tên script
+
 
     if name == "git":
         lower = [a.lower() for a in argv[1:]]
@@ -1007,20 +1028,14 @@ def _index_save(index: dict):
 def _index_update(abs_path: str, content: str, symbols: dict):
     """Thêm/update entry cho file vào index của project."""
     index = _index_load()
-    rel = abs_path
-    # C37 FIX: dùng _workspace_root() thay vì Path.cwd() để key index không có sid/ prefix
-    # khi sandbox enforce — tránh AI thấy key "sid/foo.py" mà gọi path sai.
     root = _workspace_root()
     try:
         rel = str(Path(abs_path).resolve().relative_to(root))
     except ValueError:
-        try:
-            rel = str(Path(abs_path).relative_to(Path.cwd()))
-        except ValueError:
-            pass
+        rel = Path(abs_path).name
     sym_map = {name: s["line"] for name, s in symbols.items()}
     index[rel] = {
-        "path": abs_path,
+        "path": str(Path(abs_path).resolve()),
         "lines": len(content.splitlines()),
         "symbols": sym_map,
         "mtime": time.time(),
@@ -1086,7 +1101,7 @@ _REFERENCE_EXTS = {
 }
 
 def _workspace_root() -> Path:
-    if _project_dir is not None and not _project_dir_is_placeholder:
+    if _project_dir is not None:
         return _project_dir.resolve()
     return Path.cwd().resolve()
 
@@ -1183,7 +1198,7 @@ def _workspace_references(name: str, seed_file: str | None = None,
     if not hits:
         return f"[lsp] No references to `{name}` found in workspace ({len(files)} files scanned)"
     out = [f"References to `{name}` in workspace ({len(hits)} hits, {len(files)} files scanned):"]
-    root = Path.cwd().resolve()
+    root = _workspace_root()
     for p, ln, text in hits:
         try:
             rel = str(p.resolve().relative_to(root))
@@ -1195,28 +1210,11 @@ def _workspace_references(name: str, seed_file: str | None = None,
     return "\n".join(out)
 
 def tool_read(path, offset=1, limit=READ_DEFAULT_LIMIT, depth=4, state=None):
-
-    # Auto-resolve vào sandbox chỉ khi sandbox đã enforce (không phải placeholder)
-    if _project_dir is not None and not _project_dir_is_placeholder:
-        resolved_p = Path(path).expanduser()
-        try:
-            resolved_p.resolve().relative_to(_project_dir.resolve())
-        except ValueError:
-            # Nằm ngoài sandbox → thử resolve vào sandbox
-            sandbox_p = _resolve_to_sandbox(path)
-            if sandbox_p.exists():
-                path = str(sandbox_p)
-    err = _check_sandbox_read(path)
+    p = _resolve_read_path(path)
+    err = _check_sandbox_read(str(p))
     if err: return err
-    p = Path(path).expanduser()
     if not p.exists(): return f"[not found: {path}]"
     if p.is_dir():
-        # Redirect về project_dir chỉ khi sandbox đã enforce
-        if _project_dir is not None and not _project_dir_is_placeholder:
-            try:
-                p.resolve().relative_to(_project_dir.resolve())
-            except ValueError:
-                p = _project_dir  # redirect về sandbox
         lines = [f"{p.resolve()}/"]
         lines += _dir_tree(p, "", max_depth=int(depth))
         count = sum(1 for l in lines if not l.endswith("/") and "..." not in l)
@@ -1388,11 +1386,10 @@ def tool_read(path, offset=1, limit=READ_DEFAULT_LIMIT, depth=4, state=None):
 
 def _check_sandbox_read(path: str) -> str | None:
     """
-    Nếu project_dir đã được gán, chỉ cho phép đọc bên trong đó.
+    Nếu project_dir đã được gán, chỉ cho phép đọc bên trong đó (hoặc cwd khi placeholder).
     Luôn chặn .fw_data và fw.py bất kể project_dir.
     Trả về error string nếu vi phạm, None nếu OK.
     """
-    # Chặn .fw_data tuyệt đối — không ai được đọc thư mục ẩn này
     p = Path(path).expanduser().resolve()
     fw_data = (Path.cwd() / FW_DATA_NAME).resolve()
     try:
@@ -1406,8 +1403,8 @@ def _check_sandbox_read(path: str) -> str | None:
     if p == fw_py:
         return f"[not found: {path}]"
 
-    if _project_dir is None or _project_dir_is_placeholder:
-        return None  # chua enforce sandbox read — AI doc duoc project co san o cwd
+    if _project_dir is None:
+        return None
     proj = _project_dir.resolve()
     try:
         p.relative_to(proj)
@@ -1556,12 +1553,10 @@ def tool_delete(path, conn=None, sid=None):
     đơn) nên nếu raise thì không có record nào bị ghi nửa chừng — không cần
     dọn dẹp gì thêm ở phía caller.
     """
-    if conn and sid:
-        _ensure_project_dir(path)  # chỉ để trigger flip flag, không dùng return value
-    err = _check_sandbox_read(path)
+    p = _resolve_read_path(path)
+    err = _check_sandbox_read(str(p))
     if err:
         return err
-    p = Path(path).expanduser().resolve()
     if not p.exists():
         return f"[not found: {path}]"
     if p.is_dir():
@@ -1600,33 +1595,12 @@ def tool_extract(src, start, end, dst, mode="move", conn=None, sid=None):
     append vào dst (tạo mới nếu chưa có). mode='move' (default) xoá vùng đó
     khỏi src; mode='copy' giữ src nguyên. Không qua model — tránh việc AI
     đọc rồi gõ lại nội dung khi tách/refactor file."""
-    # BUG FIX A (nghiêm trọng — sandbox read bypass, đã verify bằng test thật):
-    # _resolve_to_sandbox() chỉ rewrite path cho việc GHI, không hề chặn ĐỌC.
-    # tool_extract đọc thẳng sp.read_text() mà trước đây không qua
-    # _check_sandbox_read() như tool_read bắt buộc phải qua — nghĩa là khi
-    # sandbox đã enforce, agent có thể dùng extract để đọc trộm .fw_data,
-    # fw.py, hoặc bất kỳ file ngoài project nào (thứ tool_read chặn tuyệt
-    # đối) bằng cách "extract" nó ra dst rồi đọc dst. Fix: áp đúng pattern
-    # tool_read dùng — auto-redirect relative path hợp lệ vào sandbox TRƯỚC,
-    # rồi mới check quyền đọc trên path đã redirect, trước khi resolve/ghi
-    # bất cứ gì. Tự làm redirect ở đây (không gọi thẳng _resolve_to_sandbox
-    # cho src) để tránh side-effect enforce sandbox sớm khi path thật ra
-    # không đọc được (giữ đúng tinh thần fix ở tool_write).
-    src_check = src
-    if _project_dir is not None and not _project_dir_is_placeholder:
-        _p = Path(src).expanduser()
-        try:
-            _p.resolve().relative_to(_project_dir.resolve())
-        except ValueError:
-            _candidate = _project_dir / Path(src).expanduser()
-            if _candidate.exists():
-                src_check = str(_candidate)
-    err = _check_sandbox_read(src_check)
+    sp = _resolve_read_path(src)
+    err = _check_sandbox_read(str(sp))
     if err:
         return err
-    sp = Path(src_check).expanduser()
     if not sp.exists():
-        return f"[not found: {sp}]"
+        return f"[not found: {src}]"
     dp = _resolve_to_sandbox(dst)
     try:
         src_lines = sp.read_text().splitlines(keepends=True)

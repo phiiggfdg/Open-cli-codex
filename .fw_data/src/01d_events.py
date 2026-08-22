@@ -19,6 +19,7 @@
 
 import threading
 import uuid as _uuid
+import re
 
 
 class Event:
@@ -315,7 +316,7 @@ def cli_ask_handler(pending: PendingAsk):
     if _st is not None and getattr(_st, "web_bridge", None) is not None and _st.web_bridge.is_armed():
         return
     try:
-        explanation = pending.extra.get("explanation")
+        explanation = pending.extra.get("explanation") if pending.extra else None
         if explanation:
             print(f"\n  {YELLOW}{'─'*56}{R}")
             for line in explanation.splitlines():
@@ -323,27 +324,31 @@ def cli_ask_handler(pending: PendingAsk):
             print(f"  {YELLOW}{'─'*56}{R}")
             ans = input(f"  {CYAN}Allow? [y/N/a(ll)]: {R}").strip().lower()
         elif pending.kind == "confirm":
-            ans = input(f"  {CYAN}{pending.prompt}{R}").strip().lower()
+            clean_prompt = pending.prompt.strip()
+            clean_prompt = re.sub(r"\s*\[[yY]/[nN]\]:?$", "", clean_prompt)
+            hint = "[Y/n]" if (pending.default or "").lower() in ("y", "yes") else "[y/N]"
+            ans = input(f"  {CYAN}{clean_prompt}{R} {DIM}{hint}: {R}").strip().lower()
+            if not ans:
+                ans = pending.default or "n"
         elif pending.kind == "choice":
-            # BUG FIX: nhánh này trước đây rơi vào `else` cuối, chỉ in
-            # pending.prompt rồi input() tự do — KHÔNG hiển thị
-            # pending.extra["options"] (vd tool_question có options list).
-            # Hậu quả: user thấy câu hỏi nhưng không biết gõ số nào để
-            # chọn, không rõ cách trả lời -- đúng hiện tượng "có option
-            # nhưng vẫn không hiện" đã gặp thật. Sửa: in danh sách options
-            # đánh số, cho phép gõ số (map ra option đó) HOẶC gõ thẳng text
-            # option / free text (fallback), giữ tương thích ngược.
             print(f"  {CYAN}{pending.prompt}{R}")
-            options = pending.extra.get("options") or []
+            options = pending.extra.get("options") if pending.extra else []
             for i, opt in enumerate(options, 1):
-                print(f"    {DIM}{i}.{R} {opt}")
+                print(f"    {YELLOW}{i}.{R} {opt}")
             raw = input(f"  {CYAN}Chọn số hoặc gõ trực tiếp: {R}").strip()
             if raw.isdigit() and 1 <= int(raw) <= len(options):
                 ans = options[int(raw) - 1]
+            elif not raw and pending.default is not None:
+                ans = pending.default
             else:
                 ans = raw
         else:
-            ans = input(f"{CYAN}{pending.prompt}{R}").strip()
+            prompt_str = pending.prompt
+            if not prompt_str.endswith(" ") and not prompt_str.endswith(":"):
+                prompt_str += ": "
+            ans = input(f"  {CYAN}{prompt_str}{R}").strip()
+            if not ans and pending.default is not None:
+                ans = pending.default
     except (EOFError, KeyboardInterrupt):
         ans = pending.default
     pending.resolve(ans)

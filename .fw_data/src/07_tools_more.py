@@ -123,35 +123,17 @@ def _explain_tool_action(name: str, args: dict) -> str:
 
 def _sandbox_resolve_read(path: str) -> str:
     """Auto-redirect relative/outside path vào sandbox nếu file tồn tại ở đó."""
-    if _project_dir is None:
-        return path
-    # C13 FIX: khi sandbox còn là placeholder (chưa có write đầu tiên),
-    # KHÔNG redirect — _resolve_to_sandbox() sẽ gọi _ensure_project_dir()
-    # và flip is_placeholder=False chỉ vì AI glob/grep.
-    if _project_dir_is_placeholder:
-        return path
-    p = Path(path).expanduser()
-    try:
-        p.resolve().relative_to(_project_dir.resolve())
-        return path  # đã trong sandbox
-    except ValueError:
-        sandbox_p = _resolve_to_sandbox(path)
-        if sandbox_p.exists():
-            return str(sandbox_p)
-    return path
+    return str(_resolve_read_path(path))
 
 def tool_glob(pattern, cwd=None):
-    base_str = str(Path(cwd).expanduser()) if cwd else str(Path.cwd())
-    base_str = _sandbox_resolve_read(base_str)
-    base = Path(base_str)
+    if cwd:
+        base = _resolve_read_path(cwd)
+    elif _project_dir is not None:
+        base = _project_dir.resolve()
+    else:
+        base = Path.cwd().resolve()
     err = _check_sandbox_read(str(base))
     if err: return err
-    # FIX (bug #3): _check_sandbox_read() chỉ kiểm tra `base` (root tìm kiếm),
-    # KHÔNG kiểm tra từng kết quả match sau khi `pattern` được áp dụng. Nếu
-    # pattern chứa "../" (vd "../other_session/*.py"), kết quả có thể nằm
-    # NGOÀI sandbox dù base hợp lệ — lộ tên/đường dẫn file của session khác.
-    # Giải pháp: resolve `base` một lần, rồi lọc lại từng match để đảm bảo nó
-    # thực sự nằm trong base sau khi resolve (chặn mọi dạng "..").
     base_resolved = base.resolve()
     def _inside_base(m: Path) -> bool:
         try:
@@ -167,13 +149,9 @@ def tool_glob(pattern, cwd=None):
                 ["fd", "--glob", pattern, "--base-directory", str(base),
                  "--exclude", FW_DATA_NAME, "--exclude", "fw.py"],
                 capture_output=True, text=True, timeout=10)
-            # fd exit code: 0 = OK (có hoặc không có match), 1 = lỗi thật
-            # (base-directory không tồn tại, pattern glob không hợp lệ...)
             if r.returncode == 0:
                 out = r.stdout.strip()
                 lines = [l for l in out.splitlines() if l.strip() not in ("fw.py", "./fw.py")]
-                # FIX (bug #3): fd cũng có thể trả về path "../..." nếu pattern
-                # chứa traversal — lọc lại từng dòng theo base_resolved.
                 lines = [l for l in lines if _inside_base(base / l)]
                 return "\n".join(lines) or "(no matches)"
             fd_error = f"fd exit {r.returncode}: {r.stderr.strip()[:300]}"
@@ -215,7 +193,13 @@ def tool_grep(pattern, path=None, glob=None, ignore_case=False, fixed_string=Fal
     Các tham số này CỘNG DỒN — có thể kết hợp tự do, vd:
       ignore_case=True + word=True + context=2  ~=  grep -iwC2
     """
-    base = _sandbox_resolve_read(path or str(Path.cwd()))
+    if path:
+        base_p = _resolve_read_path(path)
+    elif _project_dir is not None:
+        base_p = _project_dir.resolve()
+    else:
+        base_p = Path.cwd().resolve()
+    base = str(base_p)
     err = _check_sandbox_read(base)
     if err: return err
     rg_errors = []  # lưu lý do rg fail để không nuốt im lặng nếu grep cũng fail
@@ -323,19 +307,9 @@ def tool_view_symbol(path, symbol):
     Không cần đọc full file — tiết kiệm token tối đa.
     Hỗ trợ: Python, JS/TS, Java, Go, Rust, PHP, Ruby, C/C++
     """
-    # Auto-resolve vào sandbox chỉ khi sandbox đã enforce (không phải placeholder)
-    # — đồng bộ với tool_read, tránh side-effect tự enforce sandbox sớm.
-    if _project_dir is not None and not _project_dir_is_placeholder:
-        resolved_p = Path(path).expanduser()
-        try:
-            resolved_p.resolve().relative_to(_project_dir.resolve())
-        except ValueError:
-            sandbox_p = _resolve_to_sandbox(path)
-            if sandbox_p.exists():
-                path = str(sandbox_p)
-    err = _check_sandbox_read(path)
+    p = _resolve_read_path(path)
+    err = _check_sandbox_read(str(p))
     if err: return err
-    p = Path(path).expanduser()
     if not p.exists():
         return f"[not found: {path}]"
     try:
@@ -1070,9 +1044,10 @@ def _list_available_skills(exclude_name=None):
 
 def tool_skill(name):
     """Load a SKILL.md file by name from known skills directories."""
-    # Normalise: strip .md suffix, try variations
-    candidates = [name, name + ".md", name + "/SKILL.md",
-                  name.upper() + "/SKILL.md", f"{name}.skill.md"]
+    # Normalise: strip .md suffix and trailing slashes, try variations
+    clean_name = re.sub(r"\.md$", "", str(name).strip(), flags=re.IGNORECASE).rstrip("/")
+    candidates = [clean_name, f"{clean_name}.md", f"{clean_name}/SKILL.md",
+                  f"{clean_name.upper()}/SKILL.md", f"{clean_name}.skill.md"]
     for skills_dir in SKILLS_DIRS:
         skills_dir_resolved = skills_dir.resolve()
         for c in candidates:
@@ -1145,7 +1120,7 @@ def tool_verify(path: str, reason: str = "") -> str:
     _st = current_state()
     if _st is not None:
         ans = _st.ask(
-            prompt=f"⊙ Verify {path}{reason_str}? [y/N]",
+            prompt=f"⊙ Verify {path}{reason_str}?",
             kind="confirm",
             default="n",
         ) or "n"
@@ -1158,40 +1133,10 @@ def tool_verify(path: str, reason: str = "") -> str:
         except (EOFError, KeyboardInterrupt):
             return "verification skipped"
     if ans in ("y", "yes"):
-        # BUG FIX: trước đây gọi thẳng `p = _resolve_to_sandbox(path)` — hàm
-        # này gọi _ensure_project_dir() bên trong, có side-effect VĨNH VIỄN
-        # flip _project_dir_is_placeholder: True→False, VÔ ĐIỀU KIỆN, bất kể
-        # sau đó có đọc được gì hay không. Test tái hiện thật: agent đang ở
-        # placeholder mode, đọc thành công 1 file NGOÀI project (kịch bản tự
-        # nhiên: user bảo agent làm việc trên project có sẵn ở path khác).
-        # Chỉ cần gọi tool_verify() trên 1 path KHÔNG LIÊN QUAN và KHÔNG TỒN
-        # TẠI (vd gõ nhầm tên khi verify build artifact) — verify thất bại
-        # hoàn toàn ("[verify] not found: ...") nhưng sandbox đã bị enforce
-        # ngay từ dòng resolve, khiến agent MẤT VĨNH VIỄN quyền đọc file
-        # ngoài project đã đọc được trước đó, dù chưa có gì thay đổi trên đĩa
-        # và verify chẳng thành công gì cả. Đây đúng cùng root cause với bug
-        # đã fix ở tool_write (phiên 3) nhưng bị bỏ sót ở tool_verify.
-        #
-        # Fix: verify là thao tác THUẦN ĐỌC, không bao giờ cần kích hoạt
-        # enforce sandbox — copy đúng pattern auto-redirect của tool_read:
-        # chỉ redirect vào sandbox khi sandbox ĐÃ enforce từ trước (không tự
-        # kích hoạt lần đầu), và chỉ khi path redirect thực sự tồn tại ở đó.
-        # Sau đó luôn qua _check_sandbox_read() (không có side-effect) để
-        # chặn đọc ngoài sandbox khi đã enforce — đúng gate mà tool_read bắt
-        # buộc phải qua, tool_verify trước đây hoàn toàn bỏ qua gate này.
-        vpath = path
-        if _project_dir is not None and not _project_dir_is_placeholder:
-            resolved_p = Path(vpath).expanduser()
-            try:
-                resolved_p.resolve().relative_to(_project_dir.resolve())
-            except ValueError:
-                sandbox_p = _resolve_to_sandbox(vpath)
-                if sandbox_p.exists():
-                    vpath = str(sandbox_p)
-        err = _check_sandbox_read(vpath)
+        p = _resolve_read_path(path)
+        err = _check_sandbox_read(str(p))
         if err:
             return err
-        p = Path(vpath).expanduser()
         if p.is_dir():
             return tool_read(str(p), depth=2)
         elif p.is_file():
@@ -1217,14 +1162,7 @@ def tool_lsp(operation, file=None, line=None, character=None, query=None):
     def _resolve_lsp_file(path):
         if not path:
             return None, "[lsp] file required"
-        p = Path(path).expanduser()
-        if _project_dir is not None and not _project_dir_is_placeholder:
-            try:
-                p.resolve().relative_to(_project_dir.resolve())
-            except ValueError:
-                sandbox_p = _resolve_to_sandbox(path)
-                if sandbox_p.exists():
-                    p = sandbox_p
+        p = _resolve_read_path(path)
         err = _check_sandbox_read(str(p))
         if err:
             return None, err

@@ -299,8 +299,8 @@ def _tool_task_inner(description, tools=None, model=None, api_key=None, conn=Non
         print(f"\n{BLUE}{BOLD}[subagent]{R} {description[:80]}")
 
     sub_messages = [{"role":"user","content": description}]
-    sub_sys = f"""You are a focused subagent. Complete the given task and return a clear result.
-Be concise. Current directory: {os.getcwd()}"""
+    sub_sys = """You are a focused subagent. Complete the given task and return a clear result.
+Be concise. All relative file paths operate directly from workspace root."""
 
     # C29 FIX: check _no_temperature() thay vì hardcode temperature=0.3
     # C33 FIX: truyền x-session-affinity header như call_api_stream để Requesty cache hit
