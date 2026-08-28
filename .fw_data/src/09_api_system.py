@@ -348,9 +348,16 @@ def _choose_model_tui(models: list, is_requesty: bool, free_set: set,
         return cp, tp, tc
 
     def _cur_items():
-        """Items hiện ra trên màn hình (browse: 1 trang; search: toàn bộ sres)."""
+        """Items hiện ra trên màn hình (browse: 1 trang; search: 1 cửa sổ
+        tối đa PAGE_SIZE dòng quanh vị trí con trỏ — KHÔNG BAO GIỜ vẽ hết
+        toàn bộ sres, vì với hàng trăm kết quả sẽ tràn màn hình và làm
+        \\033[nA nhảy vượt quá đỉnh terminal, gây vẽ chồng/spam)."""
         if st["mode"] == "search":
-            return st["sres"]
+            sres = st["sres"]
+            if not sres:
+                return []
+            start = (st["scur"] // PAGE_SIZE) * PAGE_SIZE
+            return sres[start: start + PAGE_SIZE]
         _, lst = tabs[st["tab"]]
         cp, _, _ = _page_info()
         return lst[cp * PAGE_SIZE: (cp + 1) * PAGE_SIZE]
@@ -367,13 +374,49 @@ def _choose_model_tui(models: list, is_requesty: bool, free_set: set,
         st["scur"] = 0
 
     def _act_cur():
-        return st["scur"] if st["mode"] == "search" else st["cur"]
+        if st["mode"] == "search":
+            return st["scur"] % PAGE_SIZE if st["sres"] else 0
+        return st["cur"]
 
     def _clear():
         n = st["drawn"]
         if n > 0:
             sys.stdout.write(f"\033[{n}A\033[J")
             sys.stdout.flush()
+
+    import re as _re
+    _ANSI_RE = _re.compile(r"\033\[[0-9;]*m")
+
+    def _vislen(s: str) -> int:
+        """Độ dài hiển thị thực (bỏ mã màu ANSI)."""
+        return len(_ANSI_RE.sub("", s))
+
+    def _truncate_vis(s: str, maxw: int) -> str:
+        """Cắt chuỗi (có mã màu) về đúng maxw ký tự hiển thị, giữ mã màu nguyên vẹn
+        và luôn tắt màu ở cuối để không rò rỉ sang dòng sau."""
+        if maxw <= 0:
+            return ""
+        out = []
+        vis = 0
+        i = 0
+        n = len(s)
+        while i < n and vis < maxw:
+            m = _ANSI_RE.match(s, i)
+            if m:
+                out.append(m.group(0))
+                i = m.end()
+                continue
+            out.append(s[i])
+            vis += 1
+            i += 1
+        return "".join(out) + R
+
+    def _emit(text: str, tw: int) -> int:
+        """Ghi 1 'dòng logic' đã cắt về đúng bề rộng terminal (tw), trả về
+        số dòng MÀN HÌNH THỰC mà nó chiếm (luôn 1, vì đã bị cắt/không wrap)."""
+        safe = _truncate_vis(text, max(tw - 1, 1))
+        sys.stdout.write(safe + "\r\n")
+        return 1
 
     def _draw():
         tw = shutil.get_terminal_size((80, 24)).columns
@@ -384,7 +427,7 @@ def _choose_model_tui(models: list, is_requesty: bool, free_set: set,
         hdr = f"  {BOLD}{CYAN}◈ Chọn model  {DIM}[{provider_name}]{R}"
         if is_requesty:
             hdr += f"  {DIM}🆓 = free (200 req/day){R}"
-        sys.stdout.write(hdr + "\r\n"); lines += 1
+        lines += _emit(hdr, tw)
 
         # ── Tab bar (browse only) ────────────────────────────────────────────
         if st["mode"] == "browse":
@@ -395,21 +438,23 @@ def _choose_model_tui(models: list, is_requesty: bool, free_set: set,
                     parts.append(f"{TEAL}{BOLD}[{tname} {cnt}]{R}")
                 else:
                     parts.append(f"{GRAY}{tname} {cnt}{R}")
-            sys.stdout.write("  " + "  ".join(parts) + "\r\n"); lines += 1
+            lines += _emit("  " + "  ".join(parts), tw)
 
         # ── Search bar (search only) ─────────────────────────────────────────
         if st["mode"] == "search":
             q_disp = f"{CYAN}{st['q']}{R}" if st["q"] else ""
-            sys.stdout.write(
+            lines += _emit(
                 f"  {YELLOW}🔍 {R}{q_disp}{TEAL}▌{R}"
-                f"  {DIM}Esc quay lại{R}\r\n"
-            ); lines += 1
-            cnt_info = (f"  {DIM}{len(st['sres'])} kết quả{R}"
+                f"  {DIM}Esc quay lại{R}", tw
+            )
+            cnt_info = (f"  {DIM}{len(st['sres'])} kết quả "
+                        f"(trang {(st['scur']//PAGE_SIZE)+1}/"
+                        f"{max(1,(len(st['sres'])+PAGE_SIZE-1)//PAGE_SIZE)}){R}"
                         if st["q"] else f"  {DIM}Gõ để tìm...{R}")
-            sys.stdout.write(cnt_info + "\r\n"); lines += 1
+            lines += _emit(cnt_info, tw)
 
         # ── Divider ──────────────────────────────────────────────────────────
-        sys.stdout.write(f"  {GRAY}{'─' * dw}{R}\r\n"); lines += 1
+        lines += _emit(f"  {GRAY}{'─' * dw}{R}", tw)
 
         # ── Model list ───────────────────────────────────────────────────────
         items = _cur_items()
@@ -417,7 +462,7 @@ def _choose_model_tui(models: list, is_requesty: bool, free_set: set,
         if not items:
             msg = ("(không tìm thấy)" if (st["mode"] == "search" and st["q"])
                    else "(tab trống)")
-            sys.stdout.write(f"  {DIM}{msg}{R}\r\n"); lines += 1
+            lines += _emit(f"  {DIM}{msg}{R}", tw)
         else:
             for i, m in enumerate(items):
                 is_sel  = (i == act)
@@ -425,13 +470,12 @@ def _choose_model_tui(models: list, is_requesty: bool, free_set: set,
                 display = m if is_requesty else m.split("/")[-1]
                 badge   = f" {GREEN}🆓{R}" if is_free else ""
                 if is_sel:
-                    sys.stdout.write(f"  {TEAL}▶ {BOLD}{display}{R}{badge}\r\n")
+                    lines += _emit(f"  {TEAL}▶ {BOLD}{display}{R}{badge}", tw)
                 else:
-                    sys.stdout.write(f"  {GRAY}  {R}{display}{badge}\r\n")
-                lines += 1
+                    lines += _emit(f"  {GRAY}  {R}{display}{badge}", tw)
 
         # ── Divider ──────────────────────────────────────────────────────────
-        sys.stdout.write(f"  {GRAY}{'─' * dw}{R}\r\n"); lines += 1
+        lines += _emit(f"  {GRAY}{'─' * dw}{R}", tw)
 
         # ── Footer nav ───────────────────────────────────────────────────────
         if st["mode"] == "browse":
@@ -440,12 +484,12 @@ def _choose_model_tui(models: list, is_requesty: bool, free_set: set,
             nav = (f"{CYAN}↑↓{R} chọn  {CYAN}←→{R} tab  "
                    f"{CYAN}[]{R} trang  {YELLOW}/{R} tìm  "
                    f"{YELLOW}T{R} thêm  {RED}q{R} thoát")
-            sys.stdout.write(f"  {pg}\r\n"); lines += 1
-            sys.stdout.write(f"  {nav}\r\n"); lines += 1
+            lines += _emit(f"  {pg}", tw)
+            lines += _emit(f"  {nav}", tw)
         else:
             nav = (f"{CYAN}↑↓{R} chọn  {GREEN}Enter{R} xác nhận  "
                    f"{RED}Esc{R} quay lại")
-            sys.stdout.write(f"  {nav}\r\n"); lines += 1
+            lines += _emit(f"  {nav}", tw)
 
         sys.stdout.flush()
         st["drawn"] = lines
@@ -502,7 +546,7 @@ def _choose_model_tui(models: list, is_requesty: bool, free_set: set,
                                     st["page"] += 1
                                     st["cur"] = 0
                         else:
-                            if st["scur"] < len(items) - 1:
+                            if st["scur"] < len(st["sres"]) - 1:
                                 st["scur"] += 1
                         _clear(); _draw()
 
