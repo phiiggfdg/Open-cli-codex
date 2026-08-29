@@ -2937,6 +2937,18 @@ def _agent_turn_inner(messages, model, api_key, conn, sid, max_steps, agent, sta
 
 
     while steps < max_steps:
+        # BUG FIX: khung "┌─ thinking ─...└─" (render_cli, 01d_events.py)
+        # dùng cờ global _cli_render_flags, chỉ được cli_render_reset() 1 lần
+        # ở ĐẦU agent_turn — nhưng 1 turn có thể chạy NHIỀU step (mỗi lần
+        # model gọi tool rồi được gọi lại là 1 step mới, cùng 1 turn). Từ
+        # step 2 trở đi, first_thinking/first_token đã là False từ step 1
+        # nên thinking của step mới không được mở khung lại — bị in thẳng
+        # không có "┌─ thinking" và không thụt lề "│ ", trong khi dòng
+        # đóng khung "└─" của step 1 (chưa từng in vì AI: đã xuất hiện)
+        # lại xổ ra sai chỗ ở cuối step 2. Reset đầu MỖI step, không chỉ
+        # đầu turn, để mỗi step có khung thinking riêng biệt, đúng vị trí.
+        if state is not None:
+            cli_render_reset()
         # Lazy validate: chỉ kiểm tra cache khi bước trước có write/edit.
         # Nếu agent chỉ read/grep/chat thì mtime chắc chắn không đổi → skip để tiết kiệm I/O.
         if _had_writes_last_step:
