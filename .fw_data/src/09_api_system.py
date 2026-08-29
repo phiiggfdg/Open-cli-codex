@@ -1121,12 +1121,14 @@ def _stream_response(resp, text_parts, tc_raw, usage_out, spinner_ref, reasoning
                     if spinner_ref:
                         spinner_ref[0].stop()
                     if state is None:
-                        print(f"\n{DIM}[thinking] ", end="", flush=True)
+                        print(f"\n{DIM}┌─ thinking ─────────────────────{R}")
+                        print(f"{DIM}│ {R}", end="", flush=True)
                     first_thinking = False
                 if state is not None:
                     state.emit(EV_THINKING_DELTA, text=reasoning_delta)
                 else:
-                    print(f"{DIM}{reasoning_delta}{R}", end="", flush=True)
+                    _chunk = reasoning_delta.replace("\n", f"{R}\n{DIM}│ {R}{DIM}")
+                    print(f"{DIM}{_chunk}{R}", end="", flush=True)
             if delta.get("thinking"):
                 if thinking_parts is not None:
                     thinking_parts.append(delta["thinking"])
@@ -1151,12 +1153,14 @@ def _stream_response(resp, text_parts, tc_raw, usage_out, spinner_ref, reasoning
                                       f"(leak runtime, không qua probe).{R}")
                             _thinking_leak_warned_session = True
                     if state is None:
-                        print(f"\n{DIM}[thinking] ", end="", flush=True)
+                        print(f"\n{DIM}┌─ thinking ─────────────────────{R}")
+                        print(f"{DIM}│ {R}", end="", flush=True)
                     first_thinking = False
                 if state is not None:
                     state.emit(EV_THINKING_DELTA, text=delta["thinking"])
                 else:
-                    print(f"{DIM}{delta['thinking']}{R}", end="", flush=True)
+                    _chunk = delta["thinking"].replace("\n", f"{R}\n{DIM}│ {R}{DIM}")
+                    print(f"{DIM}{_chunk}{R}", end="", flush=True)
             if delta.get("thinking_signature") and thinking_sig is not None:
                 thinking_sig.append(delta["thinking_signature"])
             if delta.get("redacted_thinking_data") and redacted_parts is not None:
@@ -1167,14 +1171,15 @@ def _stream_response(resp, text_parts, tc_raw, usage_out, spinner_ref, reasoning
                     if state is not None:
                         state.emit(EV_INFO, text="[thinking — redacted by safety system]")
                     else:
-                        print(f"\n{DIM}[thinking — redacted by safety system]{R}", end="", flush=True)
+                        print(f"\n{DIM}┌─ thinking ─────────────────────{R}")
+                        print(f"{DIM}│ (redacted by safety system){R}", end="", flush=True)
                     first_thinking = False
             if first_token and (delta.get("content") or delta.get("tool_calls")):
                 if spinner_ref:
                     spinner_ref[0].stop()
                 if state is None:
                     if not first_thinking:
-                        print()  # xuống dòng sạch sau block thinking trước khi in AI:
+                        print(f"\n{DIM}└─────────────────────────────────{R}")
                     print(f"\n{GREEN}{BOLD}AI:{R} ", end="", flush=True)
                 first_token = False
             if delta.get("content"):

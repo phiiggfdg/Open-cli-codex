@@ -909,8 +909,59 @@ def _prune_tool_results(messages: list, keep_full_turns: int | None = None) -> l
         else:
             seen_file_tool.add(key)
 
+    # ── Bước 3: dedup range chồng lấn cho `read` cùng path ────────────────────
+    # Bước 2 chỉ bắt exact-match tham số. Nhưng thực tế AI thường đọc cùng
+    # 1 file nhiều lần với offset/limit HƠI khác nhau (dò gate verify, đọc
+    # tiếp phần kế — offset=1,limit=80 rồi offset=1,limit=150...) — đây là
+    # 2 key khác nhau ở bước 2 nên KHÔNG bị dedup, dù range dòng đọc được
+    # gần như trùng lặp hoàn toàn. Ở đây so sánh theo [offset, offset+limit)
+    # thật: nếu 1 lần đọc SAU (mới hơn) có range bao trọn 1 lần đọc TRƯỚC
+    # (cũ hơn) trên CÙNG path, bản cũ chỉ còn là tập con thông tin của bản
+    # mới → stub bản cũ. Range lệch nhau (không bao trọn) vẫn giữ nguyên cả
+    # hai, vì có thể là 2 đoạn thật sự khác nhau của file.
+    read_ranges: list[tuple[int, str, int, int]] = []  # (idx, path, start, end)
+    for m_idx, m in enumerate(messages):
+        if m.get("role") != "tool":
+            continue
+        key = tc_id_to_key.get(m.get("tool_call_id", ""))
+        if key is None or key[0] != "read":
+            continue
+        try:
+            normalized = json.loads(key[1])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        path = normalized.get("path")
+        if path is None:
+            continue
+        # Chỉ áp dụng range-overlap cho FILE read (offset/limit có ý nghĩa
+        # thật). Không cách nào phân biệt file/dir chỉ từ args đã lưu, nhưng
+        # vô hại: 2 lần đọc cùng 1 "path" là thư mục sẽ luôn có cùng
+        # start=1 (offset mặc định), nên range luôn giống hệt nhau — rơi
+        # đúng vào trường hợp bao trọn hợp lệ (bản sau thay thế bản trước),
+        # không có rủi ro stub nhầm sang path khác vì đã lọc theo path ở trên.
+        offset = int(normalized.get("offset", 1))
+        limit  = int(normalized.get("limit", READ_DEFAULT_LIMIT))
+        start, end = offset, offset + limit
+        read_ranges.append((m_idx, path, start, end))
+
+    range_stub: set[int] = set()
+    # So từng cặp theo cùng path; vì read_ranges đã theo thứ tự message
+    # (tăng dần idx = tăng dần thời gian), "sau" luôn ở vị trí j > i.
+    for i in range(len(read_ranges)):
+        idx_i, path_i, s_i, e_i = read_ranges[i]
+        if idx_i in stub_indices or idx_i in range_stub:
+            continue  # đã bị stub lý do khác, khỏi so tiếp cho nhanh
+        for j in range(i + 1, len(read_ranges)):
+            idx_j, path_j, s_j, e_j = read_ranges[j]
+            if path_j != path_i:
+                continue
+            if s_j <= s_i and e_j >= e_i:
+                # bản sau (j) bao trọn bản trước (i) → bản trước thừa
+                range_stub.add(idx_i)
+                break
+
     # ── Áp dụng stub ─────────────────────────────────────────────────────────
-    all_stub = stub_indices | dedup_stub
+    all_stub = stub_indices | dedup_stub | range_stub
     if not all_stub:
         return messages
 
@@ -1332,12 +1383,22 @@ def tool_read(path, offset=1, limit=READ_DEFAULT_LIMIT, depth=4, state=None):
                     else:
                         print(f"  {GREEN}✓ Cho phép đọc tối đa 500 dòng 2 lần.{R}")
                 else:
-                    return (
-                        f"[verify] User từ chối đọc {limit} dòng.\n"
-                        f"Hãy dùng grep/view_symbol để thu hẹp vị trí cần đọc,\n"
-                        f"rồi read với limit ≤ 135 quanh đúng đoạn cần.\n"
-                        f"Ví dụ: grep('keyword') → read(path, offset=N-5, limit=60)"
+                    # BUG FIX: trước đây trả về tay không kèm hướng dẫn "gọi
+                    # lại với limit≤135" — nếu AI cứ thử lại đúng limit cũ
+                    # (hoặc user vô tình Enter trống ở prompt confirm, luôn
+                    # rơi vào default="n"), nó bị từ chối lặp lại y hệt,
+                    # nhìn giống "đọc qua lại liên tục, bị cắt mất liên tục".
+                    # Sửa: fallback NGAY trong lần gọi này — đọc thẳng 135
+                    # dòng đầu (mức tối đa không cần hỏi) thay vì bắt AI
+                    # phải tự gọi lại lần nữa cho cùng 1 file.
+                    limit = 135
+                    warn = (
+                        f"[verify] User từ chối đọc {orig_limit} dòng — "
+                        f"đã tự động đọc {limit} dòng đầu thay thế (không cần gọi lại).\n"
+                        f"Nếu cần phần xa hơn, dùng grep/view_symbol để tìm đúng vị trí "
+                        f"rồi read với offset+limit hẹp quanh đó.\n"
                     )
+
 
         # Large-file soft warning: chỉ áp dụng SAU khi limit đã qua gate ở trên
         # (tức limit hiện tại ≤135, hoặc =500 nếu user/credit đã cho phép rõ
@@ -1348,7 +1409,7 @@ def tool_read(path, offset=1, limit=READ_DEFAULT_LIMIT, depth=4, state=None):
         _READ_LARGE_FILE_THRESHOLD = 80  # lines
         if (total > _READ_LARGE_FILE_THRESHOLD and int(offset) == 1
                 and int(limit) >= total and int(limit) != 500):
-            warn = (
+            warn += (
                 f"[policy] File '{path}' có {total} dòng. "
                 f"Đọc toàn bộ file lãng phí token.\n"
                 f"Hãy dùng grep/view_symbol để tìm đúng vị trí trước, "

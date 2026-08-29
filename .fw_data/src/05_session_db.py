@@ -290,7 +290,7 @@ TOOLS = [
     "parameters":{"type":"object","properties":{
       "path":  {"type":"string"},
       "offset":{"type":"integer","description":"Start line 1-indexed (files only)"},
-      "limit": {"type":"integer","description":"Max lines to read. Always pass explicitly. Keep ≤60. Default 60. Never exceed 150."},
+      "limit": {"type":"integer","description":"Max lines to read. Always pass explicitly. Keep ≤80 to avoid a confirmation prompt (81-135 asks the user to approve; >135 is rejected outright — use grep/view_symbol to narrow down instead of raising this)."},
       "depth": {"type":"integer","description":"Max tree depth for directories (default 4)"}
     },"required":["path"]}
   }},

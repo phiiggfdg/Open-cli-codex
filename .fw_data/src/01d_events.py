@@ -245,13 +245,17 @@ def render_cli(ev: Event):
     t, d = ev.type, ev.data
     if t == EV_THINKING_DELTA:
         if _cli_render_flags["first_thinking"]:
-            print(f"\n{DIM}[thinking] ", end="", flush=True)
+            print(f"\n{DIM}┌─ thinking ─────────────────────{R}")
+            print(f"{DIM}│ {R}", end="", flush=True)
             _cli_render_flags["first_thinking"] = False
-        print(f"{DIM}{d['text']}{R}", end="", flush=True)
+        # Thụt lề "│ " sau mỗi lần xuống dòng bên trong nội dung thinking,
+        # để cả khối luôn nằm gọn trong khung, không lẫn với text chat.
+        chunk = d["text"].replace("\n", f"{R}\n{DIM}│ {R}{DIM}")
+        print(f"{DIM}{chunk}{R}", end="", flush=True)
     elif t == EV_TEXT_DELTA:
         if _cli_render_flags["first_token"]:
             if not _cli_render_flags["first_thinking"]:
-                print()  # xuống dòng sạch sau block thinking
+                print(f"\n{DIM}└─────────────────────────────────{R}")
             print(f"\n{GREEN}{BOLD}AI:{R} ", end="", flush=True)
             _cli_render_flags["first_token"] = False
         print(d["text"], end="", flush=True)
