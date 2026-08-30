@@ -2,9 +2,7 @@
 
 **Minimum code giải quyết đúng vấn đề. Không thêm gì ngoài yêu cầu.**
 
-- Không retry cùng một lệnh khi dính lỗi hoặc bị policy chặn.
-- Không retry cùng một kiểu lệnh đã bị policy chặn bằng cách chỉ đổi nhẹ cú pháp.
-- Không thử một lệnh nếu rule hiện tại đã nói rõ lệnh đó sẽ bị chặn.
+- Không retry lệnh đã lỗi hoặc bị policy chặn — kể cả khi chỉ đổi nhẹ cú pháp, hoặc rule hiện tại đã nói rõ trước là sẽ bị chặn.
 - Không thêm feature ngoài những gì được hỏi.
 - Không tạo abstraction cho code chỉ dùng một lần.
 - Không thêm "flexibility" hay "configurability" không ai xin.
@@ -21,18 +19,9 @@ Tự hỏi: "Senior engineer có nói cái này overcomplicated không?" Nếu c
 
 ## Tuân thủ rule và phản hồi khi sai
 
-- Rule đã được cung cấp phải được áp dụng trước khi gọi tool, không chờ sandbox chặn rồi mới sửa.
-- Không dùng sandbox hoặc policy gate như một cơ chế thử-sai.
-- Khi rule đã cấm rõ một command hoặc pattern, tuyệt đối không tạo command đó.
-- Nếu một tool call bị policy chặn, đọc đúng lý do và đổi sang cách tiếp cận hợp lệ.
-- Không lặp lại cùng nguyên nhân lỗi trong các bước sau của cùng session.
-- Không gọi tool chỉ để xác nhận một giới hạn đã biết từ prompt, skill hoặc thông báo policy.
-- Khi giải thích hành động trước đó, mô tả đúng diễn biến thực tế.
-- Nếu bước trước đã sai hoặc vi phạm rule, phải thừa nhận rõ bước đó sai.
-- Phân biệt rõ giữa lần thử ban đầu và cách giải quyết cuối cùng.
-- Không phủ nhận, biện minh hoặc viết lại lịch sử tool call đã xuất hiện trong log.
-- Không nói "tôi không vi phạm rule" nếu trước đó đã tạo một tool call vi phạm nhưng bị hệ thống chặn.
-- Khi bị hỏi vì sao đã dùng một lệnh sai, trả lời trực tiếp nguyên nhân và nhận lỗi, không chỉ giải thích cách đúng sau đó.
+- Áp dụng rule đã có trước khi gọi tool — không dùng sandbox/policy gate như cơ chế thử-sai, không chờ bị chặn rồi mới sửa.
+- Nếu bị policy chặn: đọc đúng lý do, đổi cách tiếp cận hợp lệ, không lặp lại cùng nguyên nhân lỗi ở bước sau.
+- Khi thuật lại hành động trước đó (kể cả khi bị hỏi vì sao dùng lệnh sai): mô tả đúng diễn biến thực tế, thừa nhận rõ nếu bước đó sai, phân biệt lần thử ban đầu vs cách giải quyết cuối cùng. Không phủ nhận, biện minh, hay viết lại lịch sử tool call đã có trong log.
 
 Ví dụ phản hồi đúng:
 
@@ -69,27 +58,23 @@ Ví dụ phản hồi đúng:
 ## Thứ tự ưu tiên & Phối hợp Skill (Composition & Precedence)
 
 Khi một task liên quan đến nhiều skill, phối hợp theo giai đoạn (KHÔNG load nhiều skill cùng lúc trong 1 turn):
-- **Bug / Sửa lỗi**: Gọi `debugging` trước (Reproduce → Isolate → Fix) ➔ Gọi `verification` khi chuẩn bị hoàn tất thay đổi.
+- **Bug / Sửa lỗi**: Gọi `debugging` trước (Reproduce → Isolate → Fix).
 - **Task lớn / Chưa rõ yêu cầu**: Gọi `spec-driven` trước (làm rõ yêu cầu) ➔ Gọi `code-discovery` (khi cần định vị kiến trúc) ➔ Gọi `large-change` (khi bắt đầu triển khai theo tầng).
-- **Tái cấu trúc / Refactor**: Gọi `file-refactoring` trước (chiến lược trích xuất/tách file) ➔ Gọi `code-discovery` (nếu chưa định vị rõ symbol) ➔ Gọi `verification` (khi chuẩn bị hoàn tất).
+- **Tái cấu trúc / Refactor**: Gọi `file-refactoring` trước (chiến lược trích xuất/tách file) ➔ Gọi `code-discovery` (nếu chưa định vị rõ symbol).
 - **Thêm thư viện**: Gọi `dependency-management` trước khi quyết định cài package.
 - **Ủy quyền tác vụ**: Gọi `multi-agent` trước khi dùng tool `task` để đảm bảo tính độc lập.
 - **Quy tắc chung**: Load skill xác định **workflow chính trước**; chỉ load skill bổ trợ khi thực sự chuyển sang giai đoạn đó. Khi chuẩn bị hoàn thành code, **BẮT BUỘC load `verification`**.
 
 ## Môi trường: Termux / Android
 
-- `pip install` luôn dùng `--break-system-packages`.
-- Không có `sudo`, không dùng `apt`, `systemctl` hoặc lệnh cần quyền root.
-- File mutation dùng `write`/`edit`/`delete`/`apply_patch`; không dùng `rm`, `cp`, `mv`, `mkdir`, `touch`, `sed -i`. File inspection ưu tiên `read`/`glob`/`grep`.
-- Lệnh Python/Node chỉ chạy file tin cậy trong project; không dùng inline eval (`python -c`, `node -e`).
+- Không có quyền root: không dùng `apt`, `systemctl`, hay bất kỳ lệnh nào cần `sudo`.
+- Ngoài các lệnh mutation đã bị chặn ở system prompt, cấm thêm `sed -i`.
 
-## Thứ tự ưu tiên
+## Thứ tự ưu tiên khi thực thi
 
 1. Đúng yêu cầu.
 2. Đúng rule và policy.
 3. Đúng layer và kiến trúc.
 4. Ít tool call nhất.
 5. Ít code và ít token nhất.
-- File mới >80 dòng dùng `##== NAME ==##`.
-- Không emoji trong output. Sau khi hoàn thành: tóm tắt ngắn gọn các file đã thay đổi và cách chạy/verify.
-- Khi có lỗi hoặc bước sai trước đó, phần tóm tắt phải nói đúng việc đã xảy ra nếu người dùng hỏi. Không che giấu tool call thất bại hoặc policy block.
+- Mỗi turn, trước khi gọi tool, giải thích ngắn gọn (1-2 câu) đang làm gì và vì sao.
