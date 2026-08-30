@@ -102,7 +102,16 @@ def _explain_tool_action(name: str, args: dict) -> str:
             return f"{YELLOW}Web search:{R} {BOLD}{args.get('query','?')}{R}"
 
         if name == "task":
-            return f"{YELLOW}Spawn subagent:{R} {BOLD}{args.get('description','?')[:120]}{R}"
+            _ms = args.get("max_steps")
+            _ms_note = f"  {DIM}(max_steps={_ms}){R}" if _ms is not None else ""
+            return f"{YELLOW}Spawn subagent:{R} {BOLD}{args.get('description','?')[:120]}{R}{_ms_note}"
+
+        if name == "delegate":
+            _tt = args.get("task_type", "?")
+            _instr = args.get("instruction", "?")[:120]
+            _ms = args.get("max_steps")
+            _ms_note = f"  {DIM}(max_steps={_ms}){R}" if _ms is not None else ""
+            return f"{YELLOW}Delegate [{_tt}]:{R} {BOLD}{_instr}{R}{_ms_note}"
 
         if name.startswith("mcp__"):
             parts = name.split("__", 2)
@@ -836,7 +845,6 @@ _todos: list = []
 _todos_sid: str = ""
 _todos_conn = None
 _todowrite_calls_this_turn: int = 0  # hard limit: reset mỗi agent_turn
-_large_read_credits: int = 0  # số lần còn được đọc 500 dòng sau khi user y
 
 # FileTime tracking: {resolved_path: timestamp} — ensures AI reads before editing
 _file_read_time: dict = {}

@@ -172,6 +172,7 @@ Every API call resends the ENTIRE context. Reduce unnecessary calls — but corr
 - Independent tools → emit in ONE response. Sequential only when B genuinely needs A's output.
 - Files read this turn → reuse, do NOT re-read. After write/edit → content is known, do not re-read the whole file just to confirm — but a targeted diff/changed-region read is fine when there's a concrete reason to doubt the actual state (patch applied wrong, formatter altered content).
 - Prefer `read(offset)` over whole-file reads on large files.
+- Delegation is not "an extra call": this rule is about your own redundant read/grep loop, not about handing off. `task`/`delegate` trade one call now for fewer rounds later — judge by scope, not by call count.
 Tool priority for locating code: `view_symbol` > `read(offset)` > `grep` > `glob`.
 **Shell:** batch independent read-only inspections when safe. Chain state-changing commands only when each step depends on the previous one.
 ❌ FORBIDDEN: unnecessary preamble before obvious tool calls / one tool per response when independent / re-reading files already read/written this turn.
@@ -205,9 +206,10 @@ Use `todowrite` only for multi-step tasks where a todo list reduces confusion.
 # File navigation & editing
 
 ## Discovery
+- **Before this, size the work**: trivial (1-2 calls either way — one known line, one quick lookup) → just do it. Target/expected output already nameable but reaching it takes several steps (e.g. "why does function X return None" — know the function, question is precise, but tracing it takes a few reads; "find every call site still using the old endpoint" — know exactly what to grep for, but it's a full sweep) → `delegate` candidate. No target to name yet, scope still unknown (e.g. "crashes on startup, no traceback, don't know which module") → `task` candidate. Escape hatch: 1-2 calls either way → do it yourself regardless. Judgment call — see `# Tools available in this mode`. Why: `task`/`delegate` keep the digging out of your context and return only the distilled result — cleaner for you, shorter for the user.
 - For existing-code tasks, call `file_index` first. If a symbol/path is listed, use `view_symbol`.
 - For files >80 lines, avoid whole-file reads. Order: `grep("##==")` / `lsp(documentSymbol)` → section headers → language symbols → task keyword → `read(offset=1, limit=60)` last resort.
-- Prefer `view_symbol` or `read(offset=N, limit=60)` over broad reads. Max read limit is 150; use >135 only when a large contiguous block is truly needed.
+- Prefer `view_symbol` or `read(offset=N, limit=60)` over broad reads. Max read limit is 700; go beyond a small offset+limit only when a large contiguous block is truly needed.
 - For unknown paths, use `glob`.
 - Re-read only when the file was read many turns ago, changed externally, or the needed offset was not in context.
 
@@ -294,7 +296,8 @@ If the user asks for "review", "kiểm tra", or "xem lỗi" without asking for e
   Once started, tell the user the full URL in your reply — links to
   localhost/private-IP URLs are auto-detected and open directly in the
   preview pane when clicked.
-- `task`: isolated subagent for long parallel work. Has its OWN context. Send: [description + file paths + output format]. Never use for files main agent is editing.
+- `task`: isolated subagent for long parallel work. Has its OWN context. Send: [description + file paths + output format]. Never use for files main agent is editing. Full edit power (multiedit/apply_patch included, not just single replacements); `tools` param adds to its default set, never restricts below it.
+- `delegate`: hand off a self-contained, well-scoped unit (search, fix/edit at a known location, find-bug, find-code, summarize) to a helper with its own model, chosen once via `/delegate-model`. Use once the target and expected result are already clear. Not for architecture decisions or scope you're still discovering — those go to `task` or direct work. Same edit power as `task` — fine for multi-location fixes, not just single-line ones.
 - `lsp`: local code intelligence; references scans workspace using Python AST where possible and regex fallback elsewhere.
 - `verify`: ask the user to confirm something you cannot see yourself — in this mode that mainly means asking them to describe what the preview pane shows, since you have no visual access to it (see "HOW THE PREVIEW WORKS").
 - `skill`: load SKILL.md by name for unfamiliar domains. Available: `spec-driven` (use before broad/ambiguous-scope edits, see AGENTS.md), `powerpoint` (use before creating/editing .pptx), `canva` (use for Canva-ready visual/UI design; ask for the user's idea first, then use `powerpoint` to create an editable .pptx), `web-assets` (use to find and verify existing images/icons/fonts/CDNs for web UI; never generate images or invent asset URLs).
@@ -449,7 +452,7 @@ def codeweb_maybe_auto_preview(tool_name, args, state):
     if err:
         return  # ngoài sandbox / bị chặn — bỏ qua im lặng, không phải lỗi cần model biết
 
-    # KHÔNG dùng tool_read() ở đây — nó áp policy "limit ≤ 150 dòng" (dành
+    # KHÔNG dùng tool_read() ở đây — nó áp policy "limit ≤ 700 dòng" (dành
     # cho model đọc từng đoạn để tiết kiệm token) và có thể trả cảnh báo
     # "[policy] ..." kèm nội dung đã cắt thay vì full file. Auto-preview cần
     # TOÀN BỘ nội dung file thật để hiển thị đúng, không phải 1 đoạn cho

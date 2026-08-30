@@ -377,6 +377,7 @@ HELP = f"""
 
 {GRAY}Model & Agent{R}
   {CYAN}/model{R}               change model
+  {CYAN}/delegate-model{R}      change model & provider for the "delegate" tool  {DIM}(any provider with a key — independent of /model){R}
   {CYAN}/agent{R}               switch agent mode  {DIM}(build / plan){R}
   {CYAN}/sequential{R}          step-by-step mode  {DIM}(safer, more tokens){R}
   {CYAN}/batch{R}               batched tool calls {DIM}(default, faster){R}
@@ -433,7 +434,7 @@ HELP = f"""
 
 {GRAY}AI tools{R}  {DIM}bash · read · write · edit · glob · grep{R}
            {DIM}webfetch · websearch · todowrite · todoread{R}
-           {DIM}question · apply_patch · task · skill · lsp{R}
+           {DIM}question · apply_patch · task · delegate · skill · lsp{R}
 
 {GRAY}Rules{R}   {DIM}AGENTS.md (project) · .fw_data/AGENTS.md (local){R}
 {GRAY}Data{R}    {DIM}{DATA_DIR}{R}
@@ -539,6 +540,7 @@ def main():
     # và /perm bash ask (xem dưới) chỉ tạo biến local trong main(), không
     # đụng tới biến module-level thật mà tool_bash()/_check_permission() đọc.
     global _input_history, _tool_mode, _thinking_mode, _upstage_thinking_effort, _bash_allow_all
+    global _active_provider
     _input_history = history_load()
     choose_provider()
     api_key = get_api_key()
@@ -737,17 +739,21 @@ def main():
         # giống lý do các lệnh trên được whitelist. Lệnh này CHỈ có ý nghĩa
         # khi armed trong web (đổi agent + bật layout 2 cột cho chính phiên
         # web đang mở), nên bắt buộc phải nằm trong whitelist này.
-        _WEB_ALLOWED_CMDS = ("/listkeys", "/rmkey", "/deletekey", "/addkey", "/setkey", "/model", "/mode", "/thinking", "/format", "/codeweb")
+        _WEB_ALLOWED_CMDS = ("/listkeys", "/rmkey", "/deletekey", "/addkey", "/setkey", "/model", "/delegate-model", "/mode", "/thinking", "/format", "/codeweb")
         _cmd0 = user.split(None, 1)[0].lower() if user.split(None, 1) else ""
         if (state is not None and state.web_bridge is not None
                 and state.web_bridge.is_armed()
                 and (_cmd0.startswith("/") or _cmd0 in ("exit", "quit", "q"))
                 and _cmd0 not in _WEB_ALLOWED_CMDS):
+            # BUG FIX: thông báo trước đây gõ tay danh sách lệnh được phép,
+            # lệch với _WEB_ALLOWED_CMDS thật (thiếu "/delegate-model" dù nó
+            # đã nằm trong whitelist và hoạt động bình thường qua web) --
+            # user đọc thông báo tưởng nhầm là không dùng được. Dựng chuỗi
+            # từ chính _WEB_ALLOWED_CMDS để 2 nơi không bao giờ lệch nhau nữa.
             state.emit(EV_WARN, text=(
                 "Lệnh / (và exit/quit) không dùng được qua Web UI — bấm Esc "
                 "trên CLI để chạy lệnh, Web UI chỉ để chat/thao tác code.\n"
-                "(Riêng /listkeys /rmkey /deletekey /addkey /setkey /model /mode /thinking /format "
-                "/codeweb on|off dùng được.)\n"
+                f"(Riêng {' '.join(_WEB_ALLOWED_CMDS)} dùng được.)\n"
             ))
             continue
 
@@ -772,7 +778,23 @@ def main():
                 # __file__ trong namespace chung được fw.py set = path thật
                 # của chính fw.py (dùng để tìm web_index.html cạnh nó).
                 _fw_path_real = globals().get("__file__") or sys.argv[0]
-                host, port = start_web_server(_fw_path_real)
+                # BUG FIX: trước đây start_web_server() không bọc gì cả --
+                # nếu port mặc định (8765) đang bị process KHÁC giữ (phiên
+                # fw.py cũ chưa thoát hẳn, app khác...), OSError EADDRINUSE
+                # văng thẳng ra ngoài main(), làm crash cả CLI với traceback
+                # thô. start_web_server() giờ tự dò port rảnh trước khi bind
+                # (xem _find_free_port, 12_web.py) nên trường hợp này đã
+                # hiếm; nhưng vẫn bọc try/except ở đây làm lớp bảo hiểm cuối
+                # cho ca cực đoan (hết cả dải port thử) -- báo lỗi gọn rồi
+                # quay lại vòng lặp CLI bình thường, không crash cả phiên.
+                try:
+                    host, port = start_web_server(_fw_path_real)
+                except OSError as e:
+                    if state is not None:
+                        state.emit(EV_INFO, text=f"{RED}✗ {e}{R}\n", raw=True)
+                    else:
+                        print(f"{RED}✗ {e}{R}")
+                    continue
             # Khoá bàn phím CLI hiện tại, arm() web_bridge, chờ Esc/Ctrl-C để
             # lấy lại quyền. Server + kết nối WS vẫn chạy nền trong lúc này.
             wait_web_mode(state, host, port, color_fns={"GREEN": GREEN, "DIM": DIM, "R": R})
@@ -991,6 +1013,118 @@ def main():
                        vision_support=_vision_support_get(state.model))
             out = f"{GREEN}✓ {short}{R}\n"
             state.emit(EV_INFO, text=out, raw=True)
+            continue
+
+        # /delegate-model — chọn/đổi model + provider RIÊNG cho tool
+        # "delegate", độc lập với model/provider của agent chính (không đụng
+        # biến `model`/state.model/_active_provider của agent chính ở trên).
+        # Provider cho delegate KHÔNG bắt buộc trùng provider chính — có thể
+        # là bất kỳ provider có sẵn trong PROVIDERS (kể cả custom provider
+        # thêm qua "T"), miễn có API key hợp lệ cho provider đó (xem
+        # _resolve_delegate_model/_get_api_key_for_provider, 08_undo_dispatch.py).
+        #
+        # Cú pháp tham số: "/delegate-model <provider>::<model_id>" — dùng
+        # "::" làm dấu phân cách (không phải "/") vì nhiều model_id BẢN THÂN
+        # đã chứa dấu "/" (vd Fireworks: "accounts/fireworks/models/
+        # deepseek-v3p1") — join bằng "/" sẽ mơ hồ, không biết cắt ở đâu.
+        # "::" là quy ước ĐÃ CÓ SẴN trong codebase này cho đúng mục đích nối
+        # provider+model (xem _format_override cache key, 09_api_system.py:
+        # f"{_active_provider}::{model}") — dùng lại, không bịa quy ước mới.
+        # Không có "::" trong tham số → coi cả chuỗi là model_id, provider =
+        # _active_provider hiện tại (giữ tương thích ngược 100% với cú pháp
+        # cũ "/delegate-model <model_id>" trước khi có multi-provider).
+        #
+        # Không tham số → mở picker: CLI cho chọn PROVIDER trước
+        # (_choose_provider_key_for_delegate, 02_provider.py — không đổi
+        # _active_provider global) rồi mới chọn model trong provider đó.
+        # Web giữ NGUYÊN hành vi cũ (chỉ chọn model trong _active_provider
+        # hiện tại) — frontend model_picker (web_index.html) chưa có UI
+        # chọn provider, mở rộng ở đây sẽ phải sửa mù JS, ngoài phạm vi an
+        # toàn của bản vá này; dùng cú pháp "<provider>::<model>" ở trên nếu
+        # cần đổi provider qua web.
+        if user.lower() == "/delegate-model" or user.lower().startswith("/delegate-model "):
+            _dm_arg = user[len("/delegate-model"):].strip()
+            if _dm_arg:
+                if "::" in _dm_arg:
+                    _dm_provider, _dm_model = _dm_arg.split("::", 1)
+                    _dm_provider = _dm_provider.strip()
+                    _dm_model = _dm_model.strip()
+                else:
+                    _dm_provider = _active_provider
+                    _dm_model = _dm_arg
+                if _dm_provider not in PROVIDERS:
+                    out = (f"{RED}✗ Provider \"{_dm_provider}\" không tồn tại.{R}  "
+                           f"{DIM}Dùng /delegate-model (không tham số) để xem danh sách provider.{R}\n")
+                    state.emit(EV_INFO, text=out, raw=True)
+                    continue
+                if not _dm_model:
+                    out = f"{RED}✗ Thiếu model_id sau \"::\".{R}\n"
+                    state.emit(EV_INFO, text=out, raw=True)
+                    continue
+                cfg = load_config()
+                cfg["delegate_model"] = _dm_model
+                cfg["delegate_provider"] = _dm_provider
+                save_config(cfg)
+                out = (f"{GREEN}✓ delegate provider = {PROVIDERS[_dm_provider]['name']}"
+                       f"  model = {_dm_model}{R}\n")
+                state.emit(EV_INFO, text=out, raw=True)
+                continue
+
+            _web_armed_now = state.web_bridge is not None and state.web_bridge.is_armed()
+            if _web_armed_now:
+                new_dprovider = _active_provider
+                new_dmodel = _web_choose_model(state, api_key)
+            else:
+                new_dprovider = _choose_provider_key_for_delegate()
+                new_dmodel = None
+                if new_dprovider is not None:
+                    # fetch_models/_choose_model_tui đọc _active_provider
+                    # global — swap tạm CHỈ trong phạm vi 2 lời gọi này,
+                    # bọc _pool_lock (tránh chồng lấn với thread nền
+                    # _auto_rename_session) + try/finally để luôn khôi phục
+                    # provider của agent chính. Cùng pattern y hệt đã dùng ở
+                    # _resolve_delegate_model (08_undo_dispatch.py) — không
+                    # viết logic swap khác đi giữa 2 nơi để tránh lệch hành
+                    # vi nếu sau này chỉ 1 bên được sửa.
+                    with _pool_lock:
+                        _saved_provider = _active_provider
+                        try:
+                            _active_provider = new_dprovider
+                            p = _prov()
+                            is_requesty = (new_dprovider == "requesty")
+                            free_set = set(p.get("free_models", [])) if is_requesty else set()
+                            _dm_key = _get_api_key_for_provider(new_dprovider)
+                            if _dm_key is None:
+                                out = (f"{RED}✗ Không tìm thấy API key cho provider "
+                                       f"\"{PROVIDERS[new_dprovider]['name']}\".{R}  "
+                                       f"{DIM}Dùng /setkey sau khi chuyển sang provider đó "
+                                       f"bằng /model, hoặc set biến môi trường "
+                                       f"{p.get('env_key','')}.{R}\n")
+                                state.emit(EV_INFO, text=out, raw=True)
+                                continue
+                            sys.stdout.write(f"{DIM}  Đang tải model...{R}")
+                            sys.stdout.flush()
+                            models = fetch_models(_dm_key)
+                            sys.stdout.write("\r\033[K")
+                            sys.stdout.flush()
+                            try:
+                                new_dmodel = _choose_model_tui(models, is_requesty, free_set,
+                                                                p.get("name", new_dprovider))
+                            except KeyboardInterrupt:
+                                new_dmodel = None
+                        finally:
+                            _active_provider = _saved_provider
+            if new_dmodel and new_dmodel != "__add_custom__" and new_dprovider is not None:
+                cfg = load_config()
+                cfg["delegate_model"] = new_dmodel
+                cfg["delegate_provider"] = new_dprovider
+                save_config(cfg)
+                short_d = new_dmodel.split("/")[-1]
+                out = (f"{GREEN}✓ delegate provider = {PROVIDERS[new_dprovider]['name']}"
+                       f"  model = {short_d}{R}\n")
+                state.emit(EV_INFO, text=out, raw=True)
+            else:
+                state.emit(EV_INFO, text=f"{DIM}(huỷ, không đổi delegate model){R}\n", raw=True)
             continue
 
         if user.lower() == "/format":

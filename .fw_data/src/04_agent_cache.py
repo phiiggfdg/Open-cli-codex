@@ -24,6 +24,7 @@ DEFAULT_PERMS = {
     "todoread":    PERM_ALLOW,
     "question":    PERM_ALLOW,
     "task":        PERM_ALLOW,
+    "delegate":    PERM_ALLOW,
     "skill":       PERM_ALLOW,
     "lsp":         PERM_ALLOW,
 }

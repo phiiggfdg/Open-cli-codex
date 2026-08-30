@@ -124,7 +124,7 @@ SLASH_COMMANDS = [
     "/perm", "/perms", "/skills", "/setkey", "/deletekey", "/init", "/rules",
     "/commands", "/sequential", "/batch", "/commit", "/review", "/help", "/mcp",
     "/addkey", "/listkeys", "/rmkey", "/keystrategy", "/web", "/format",
-    "/codeweb",
+    "/codeweb", "/delegate-model",
 ]
 
 SLASH_DESC = {
@@ -170,6 +170,7 @@ SLASH_DESC = {
     "/web":        "mở web UI local (terminal bridge qua trình duyệt)",
     "/format":     "đổi format API (openai/anthropic/openai_responses) cho model hiện tại",
     "/codeweb":    "chỉ dùng trong /web — /codeweb on|off, mode code frontend với live preview 2 cột",
+    "/delegate-model": "đổi model + provider riêng cho tool delegate (bất kỳ provider có key, độc lập agent chính)",
 }
 
 def _slash_hint(prefix: str) -> list[str]:

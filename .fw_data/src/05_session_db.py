@@ -290,7 +290,7 @@ TOOLS = [
     "parameters":{"type":"object","properties":{
       "path":  {"type":"string"},
       "offset":{"type":"integer","description":"Start line 1-indexed (files only)"},
-      "limit": {"type":"integer","description":"Max lines to read. Always pass explicitly. Keep ≤80 to avoid a confirmation prompt (81-135 asks the user to approve; >135 is rejected outright — use grep/view_symbol to narrow down instead of raising this)."},
+      "limit": {"type":"integer","description":"Max lines to read. Always pass explicitly. Hard cap 700 — values above are rejected outright; use grep/view_symbol to narrow down instead of raising this."},
       "depth": {"type":"integer","description":"Max tree depth for directories (default 4)"}
     },"required":["path"]}
   }},
@@ -420,11 +420,13 @@ TOOLS = [
 
   {"type":"function","function":{
     "name":"task",
-    "description":"Spawn subagent for isolated subtask. Only for complex multi-step searches or long analysis. Do NOT use for simple single-file tasks — do those directly.",
+    "description":"Spawn subagent for open-ended search or analysis whose scope isn't fully known yet — use once you expect several rounds of searching/reading before you'd have enough to act. Do NOT use for something resolvable in your next tool call or two — do that directly. Defaults to 20 internal steps if you don't set max_steps — scope the work to fit, or expect a partial (Gaps) result.",
     "parameters":{"type":"object","properties":{
-      "description":{"type":"string","description":"What the subagent should do"},
+      "description":{"type":"string","description":"What the subagent should do. The subagent has NO memory of this conversation and cannot ask you or the user anything back — state every fact, constraint, and goal it needs up front. For open-ended exploration, describe the exploration goal and what would count as a satisfying answer, not just a single narrow question."},
       "tools":      {"type":"array","items":{"type":"string"},
-                     "description":"Tools the subagent may use (default: all except task)"}
+                     "description":"Extra tools to add ON TOP of the subagent's always-available default (bash, read, write, edit, multiedit, apply_patch, glob, grep, webfetch, websearch, todoread) — this list adds to that default, it does not replace or restrict it; there is no way to give the subagent fewer than the default tools. task, delegate, and question are never available to it no matter what you pass here (recursion and asking back are both blocked)."},
+      "max_steps":  {"type":"integer","minimum":1,"maximum":50,
+                     "description":"Optional. How many internal tool-call steps the subagent gets before it's forced to stop and answer with what it has. Default 20 if omitted. Use fewer (e.g. 5-10) for a quick, narrow lookup; use more (up to 50) for a genuinely large exploration you don't want cut short. Whatever the budget, running out never produces silence — the subagent is always forced to output a structured partial answer instead of nothing."}
     },"required":["description"]}
   }},
   {"type":"function","function":{
@@ -433,6 +435,24 @@ TOOLS = [
     "parameters":{"type":"object","properties":{
       "name":{"type":"string","description":"Skill name or path, e.g. 'python', 'react', 'testing'"}
     },"required":["name"]}
+  }},
+  {"type":"function","function":{
+    "name":"delegate",
+    "description":"Hand a SELF-CONTAINED, WELL-SCOPED unit of work to an independent helper agent (own model/provider, chosen once via /delegate-model, separate from yours). Use for: web search, fixing/editing code at an ALREADY-KNOWN location, finding a bug, finding code in a specific file/dir, summarizing a document. Do NOT use for: architecture decisions, ambiguous work that needs the user clarified first, or anything whose scope you're still discovering — just do those directly or use 'task'. The helper has NO memory of this conversation — 'instruction' must spell out every fact it needs; it cannot ask you or the user anything back. Prefer this over 'task' whenever the work is self-contained enough to state up front — 'task' is for open-ended exploration where you'd rather keep steering interactively. Defaults to 20 internal steps if you don't set max_steps — scope the work to fit, or expect a partial (Gaps) result.",
+    "parameters":{"type":"object","properties":{
+      "task_type":{"type":"string","enum":["web_search","fix_bug","edit_code","find_bug","find_code","read_summarize","other"],
+                   "description":"What kind of work this is — shapes the helper's instructions and expected result shape."},
+      "instruction":{"type":"string","description":"Full, self-contained request. The helper does NOT see this conversation's history — write every needed fact directly, never 'as discussed above'."},
+      "target_files":{"type":"array","items":{"type":"string"},
+                      "description":"Relevant file/dir paths, if known."},
+      "target_location":{"type":"string",
+                      "description":"Known location if any — 'file.py lines 40-60', 'function foo()', 'class Bar'. Saves the helper from re-searching."},
+      "expected_output":{"type":"string","description":"What YOU need back — e.g. 'just the diff', 'bug location + cause, do NOT fix', '3 web sources with links', 'the edited file contents'. Required — this is what keeps the helper's answer short and on-target instead of rambling."},
+      "tools":{"type":"array","items":{"type":"string"},
+               "description":"Extra tools to add ON TOP of the helper's always-available default (bash, read, write, edit, multiedit, apply_patch, glob, grep, webfetch, websearch, todoread) — this list adds to that default, it does not replace or restrict it; there is no way to give the helper fewer than the default tools. task, delegate, and question are never available to it no matter what you pass here (recursion and asking back are both blocked)."},
+      "max_steps":{"type":"integer","minimum":1,"maximum":50,
+               "description":"Optional. How many internal tool-call steps the helper gets before it's forced to stop and answer with what it has. Default 20 if omitted. Use fewer (e.g. 5-10) for a quick, narrow lookup; use more (up to 50) for a task you know needs a lot of back-and-forth. Whatever the budget, running out never produces silence — the helper is always forced to output a structured partial answer instead of nothing."}
+    },"required":["task_type","instruction","expected_output"]}
   }},
   {"type":"function","function":{
     "name":"lsp",

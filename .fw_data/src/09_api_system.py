@@ -2524,7 +2524,8 @@ Every API call resends the context. Reduce unnecessary calls, but correctness an
 - **Batch independent tools** in ONE response (`[tool1]+[tool2]+[tool3]`). Sequential only when B depends on A.
 - **Files read this turn** → reuse, do NOT re-read. After write/edit → content is known, never re-read the whole file just to confirm what was just written.
 - **Targeted verification** is allowed when state is doubtful (patch location, linter/formatter). Use scoped diff, `read(offset=N, limit=20)`, or syntax/lint/test check.
-- **Checkpoint**: After 3 consecutive read/grep rounds without editing, STOP and assess if enough evidence exists or if `question` is needed.
+- **Delegation is not "an extra call"**: this rule is about YOUR own redundant read/grep/verify loop, not about handing off. Spawning `task`/`delegate` trades one call now for fewer read/grep rounds spent in your own context later — judge it by the scope of the remaining work (see Tools below), never skip it just to keep this turn's call count low.
+- **Checkpoint**: After 3 consecutive read/grep rounds without editing, STOP and assess if enough evidence exists, if `question` is needed, or if the remaining scope is open-ended enough to hand to `task` instead of continuing solo.
 
 # Anti-loop
 - bash/test fails → use exit_code/error_class/retry_hint; retry only with changed hypothesis. After 3× → STOP, call `question` or change approach.
@@ -2551,7 +2552,13 @@ Every API call resends the context. Reduce unnecessary calls, but correctness an
 - Use `todowrite` only for multi-step tasks (3+ steps). Batch updates at major milestones (~50%, completion).
 
 # File navigation & editing
-- **Discovery**: For large codebases, see `skill(name="code-discovery")`. Priority: `view_symbol` > `read(offset)` > `grep` > `glob`. For files >80 lines, locate with grep/view_symbol, then `read(offset=Line-5, limit=50)`. Max read limit is 150.
+- **Before discovery, size the work**:
+  - Trivial (answer/fix needs 1-2 tool calls regardless — one known line, one quick lookup) → just do it; writing a handoff costs more than doing it.
+  - Target and expected output already nameable, but reaching it takes several steps of digging → `delegate` candidate. E.g.: "check why `parse_config()` in `06_tools_fs.py` returns None on empty input" (know the exact function, question is precise, but tracing it takes a few reads); "list every call site across the project still using the old `/v1/legacy` endpoint" (know exactly what to grep for and what the output looks like, but it's a full-project sweep). Rough guide, not a strict test: you can already say what you're looking for and what the result looks like, and it's more than a couple of calls to get there.
+  - Scope/location still unknown, no target to name yet → `task` candidate. E.g.: "app crashes on startup, no traceback yet, don't know which module" — nothing to point at until you've explored.
+  - Escape hatch: if it's genuinely 1-2 calls either way, do it yourself regardless of category. Judgment call each time — see `# Tools` for the fuller distinction.
+  - Why bother: `task`/`delegate` do the digging in their own context and hand back only the distilled result — your own context stays clean instead of filling up with every intermediate read/grep, and the user gets a shorter, more focused answer.
+- **Discovery**: For large codebases, see `skill(name="code-discovery")`. Priority: `view_symbol` > `read(offset)` > `grep` > `glob`. For files >80 lines, locate with grep/view_symbol, then `read(offset=Line-5, limit=50)`. Max read limit is 700.
 - **Path handling**: Relative paths always resolve directly against workspace root (use clean relative paths e.g. `01_ui.py` or `src/app.py`).
 - **Section markers**: New files >80 lines use `##== NAME ==##`.
 - **Editing**: Fix only what was requested. Use `edit` for 1 replacement, `multiedit` for 2-5 replacements, `apply_patch` for large diffs, `write` only for new files. To split/move modules, see `skill(name="file-refactoring")` (use `extract` with line range). For multi-module features, see `skill(name="large-change")`. `edit` requires `path`, `old_str`, `new_str`. `old_str` must be exact and unique. Never overwrite uncommitted user changes in working tree (see `skill(name="git-safety")`).
@@ -2561,7 +2568,9 @@ After modifying code, MUST verify the change before claiming completion (load `s
 
 # Tools
 - `websearch`/`webfetch`: external docs, error codes, APIs, current facts.
-- `task`: isolated subagent for long parallel work. See `skill(name="multi-agent")` for delegation rules (never invoke for simple single-file edits or direct bug fixes).
+- `task`: isolated subagent, same model as you, for open-ended multi-step search or analysis whose full scope isn't known yet — spawn it once you expect (or the Checkpoint rule above already told you) more read/grep rounds are needed than would fit cleanly in your own turn. Do NOT spawn it for something you can resolve in the next tool call or two — do that directly. `tools` param adds to its default set, it never restricts below it. See `skill(name="multi-agent")` for delegation/coordination rules once you've decided to call it.
+- `delegate`: hand off a self-contained, well-scoped unit (search, fix/edit at a known location, find-bug, find-code, summarize) to a helper with its own model, chosen once via `/delegate-model`. Use it once you can already state the target and the expected result — that's what `task_type`/`expected_output` require up front. Do NOT use it for architecture decisions, work that still needs the user clarified first, or anything whose scope you're still discovering — those go to `task` or direct work instead. See `skill(name="multi-agent")`.
+- `task`/`delegate` shared traits: both get full edit power (edit/multiedit/apply_patch, not just single replacements) and always see their actual tool list, so either can handle multi-file changes on its own. Both default to a 20-internal-step budget — override per-call with `max_steps` (1-50) if you know the work is unusually small or unusually large; too low forces a premature partial result, too high just wastes steps it won't need. If a run finishes normally, the result starts with `[task]`/`[delegate:<type>]`. If it runs out of budget before finishing, it is ALWAYS forced to answer instead of returning nothing — you get a structured report ending in a numbered **Gaps** section naming exactly what it did not get to check. A result with a Gaps section is NOT a completed result — treat it as partial. Do not summarize it to the user as done. Pick one: finish the named gaps yourself directly, re-spawn `task`/`delegate` scoped ONLY to what the Gaps section lists (raise `max_steps` if the gap was itself caused by running out of budget), or — if the gap changes what you'd recommend — surface it via `question` instead of guessing. Never silently drop a stated gap.
 - `lsp`: local code intelligence and references.
 - `verify`: visually confirm output after edits.
 - `skill`: load specialized SKILL.md by name (see project rules for triggers and composition/precedence rules; never load multiple skills in a single turn).
@@ -2706,9 +2715,7 @@ def _inject_git_context_once(messages: list) -> list:
     return inject + messages
 
 def agent_turn(messages, model, api_key, conn, sid, max_steps=20, agent=AGENT_BUILD, state=None):
-    # C1 FIX: thêm _large_read_credits vào global declaration.
-    # Tất cả modules exec() vào cùng một namespace → global ở đây là đúng.
-    global _current_agent, _todowrite_calls_this_turn, _current_sid, _large_read_credits
+    global _current_agent, _todowrite_calls_this_turn, _current_sid
     # state: SessionState | None — khi có, output đi qua state.emit(...) thay vì
     # print() trực tiếp (xem 01d_events.py). None → hành vi CLI cũ y hệt, dùng
     # khi agent_turn() được gọi từ nơi chưa migrate (vd tool_task() subagent).
@@ -2874,11 +2881,10 @@ def _tool_failure_signature(result: str) -> str | None:
     return low
 
 def _agent_turn_inner(messages, model, api_key, conn, sid, max_steps, agent, state):
-    global _current_agent, _todowrite_calls_this_turn, _current_sid, _large_read_credits, _task_depth
+    global _current_agent, _todowrite_calls_this_turn, _current_sid, _task_depth
     _current_agent    = agent
     _current_sid      = sid
     _todowrite_calls_this_turn = 0  # reset hard limit mỗi turn
-    _large_read_credits        = 0  # reset large read credits mỗi turn
     # BUG FIX (đi kèm fix depth-limit của tool_task, 08_undo_dispatch.py):
     # _task_depth luôn được tool_task tự giảm lại đúng trong finally, nên về
     # lý thuyết không cần reset ở đây. Nhưng phòng trường hợp bất thường (vd
@@ -2920,6 +2926,24 @@ def _agent_turn_inner(messages, model, api_key, conn, sid, max_steps, agent, sta
     _recent_writes.clear()        # reset read-after-write block mỗi turn
     _index_prune()               # xóa entry file không còn tồn tại
     _had_writes_last_step: bool = False  # lazy validate: chỉ recheck khi có write
+    # Checkpoint nudge: đếm số STEP liên tiếp chỉ có tool đọc/tìm (read/grep/
+    # glob/view_symbol/lsp/bash read-only...), không có bước nào "giải quyết"
+    # (edit/write/apply_patch/extract/delete, hoặc task/delegate/question).
+    # Lý do cần cái này: rule Checkpoint trong system prompt (EXECUTION MODEL)
+    # chỉ nằm cố định ở ĐẦU system prompt — với turn dài (nhiều step), phần đó
+    # càng lúc càng "xa" so với step hiện tại trong context, model dễ quên áp
+    # dụng dù kỹ thuật vẫn được gửi lại mỗi API call. Đếm ở đây và tự chèn nhắc
+    # lại vào tool result (gần step hiện tại nhất) mỗi khi chạm bội số 3 —
+    # đúng ngưỡng "3 vòng liên tiếp" đã ghi trong rule, không tạo ngưỡng mới.
+    _discovery_streak = 0
+    _maxstep_notice_ref = None  # (dict tool_results[-1], nội_dung_gốc) hoặc None
+    # — dùng để revert lại đúng 1 nudge "sắp hết step" ngay sau khi nó đã
+    # phục vụ xong đúng 1 lượt API cuối cùng (xem chỗ chèn/chỗ revert bên
+    # dưới), KHÔNG để tồn tại lâu dài trong `messages` như checkpoint nudge.
+    _PROGRESS_TOOLS = {
+        "edit", "multiedit", "apply_patch", "write", "delete", "extract",
+        "task", "delegate", "question",
+    }
 
 
     # ── MCP: merge tools của các MCP server vào api_tools nếu provider hỗ trợ ──
@@ -2966,6 +2990,11 @@ def _agent_turn_inner(messages, model, api_key, conn, sid, max_steps, agent, sta
         prune_thresh = max(12_000, min(int(hard_thresh * 0.30), 32_000))
         if estimate_tokens(messages) > prune_thresh:
             messages = _prune_tool_results(messages)
+            # delegate: nén sớm hơn RIÊNG cho kết quả "delegate" — chạy SAU
+            # _prune_tool_results ở trên, không thay thế nó. Cùng ngưỡng
+            # token trigger (chỉ chạy khi context đã đủ lớn để đáng nén),
+            # nhưng áp ngưỡng tuổi ngắn hơn CHỈ cho message "[delegate:...]".
+            messages = _prune_delegate_results(messages)
 
         messages_with_cache = list(messages)
         # cache_block bỏ — không inject vào messages để giữ prefix stable cho Fireworks cache
@@ -3307,6 +3336,58 @@ def _agent_turn_inner(messages, model, api_key, conn, sid, max_steps, agent, sta
                         "content": _abort_msg,
                     })
                 break
+        # Checkpoint nudge: step này có tool nào "giải quyết" không (edit/task/
+        # delegate/question/...)? Nếu có -> reset streak. Nếu step chỉ toàn
+        # tool đọc/tìm -> streak += 1, và tại đúng bội số 3 thì chèn nhắc vào
+        # tool result CUỐI CÙNG của step (gần nhất với lượt suy nghĩ tiếp theo
+        # của model, không phải chôn ở đầu system prompt).
+        if any(tc["function"]["name"] in _PROGRESS_TOOLS for tc in tcs):
+            _discovery_streak = 0
+        else:
+            _discovery_streak += 1
+            if tool_results and _discovery_streak % 3 == 0:
+                _checkpoint_nudge = (
+                    f"\n\n[checkpoint] {_discovery_streak} step liên tiếp chỉ "
+                    "read/grep/glob/view_symbol/lsp, chưa edit/task/delegate/"
+                    "question. Dừng lại tự hỏi: đã đủ evidence để sửa chưa? "
+                    "Cần hỏi qua `question`? Hay phạm vi còn mở nên giao cho "
+                    "`task`/`delegate` thay vì tiếp tục tự đọc?"
+                )
+                tool_results[-1]["content"] = (tool_results[-1].get("content") or "") + _checkpoint_nudge
+                if tool_results_history:
+                    tool_results_history[-1]["content"] = (
+                        (tool_results_history[-1].get("content") or "") + _checkpoint_nudge
+                    )
+        # Step-budget notice: cảnh báo model NGAY TRƯỚC lượt gọi API cuối
+        # cùng còn lại trong turn — nếu không có cái này, model không biết
+        # bước tiếp theo sẽ bị cắt cứng, dễ bắt đầu 1 việc dang dở (vd sửa
+        # nhiều file) rồi bị ngưng giữa chừng không kịp chốt/verify.
+        # Điều kiện steps == max_steps - 2: `steps` ở đây là số step ĐÃ XONG
+        # (chưa += 1), nên khi steps == max_steps-2 nghĩa là vừa xong step
+        # thứ (max_steps-1) — lượt kế tiếp (steps sẽ thành max_steps-1) LÀ
+        # lượt cuối cùng còn được phép chạy trong `while steps < max_steps`.
+        # Chỉ chèn vào tool_results (context sống gửi model), KHÔNG chèn
+        # tool_results_history (không lưu DB) — và bị revert lại NGAY sau
+        # khi vòng while kết thúc (xem đoạn `if _maxstep_notice_ref` bên
+        # dưới, sau while) để không tồn tại lâu dài trong `messages` — khác
+        # checkpoint nudge ở trên (nudge đó CỐ Ý giữ vĩnh viễn vì có nghĩa
+        # lặp lại suốt turn; nudge này chỉ có nghĩa đúng 1 lần, trước bước
+        # cuối, giữ lại sau đó chỉ tổ làm bẩn context cho các turn kế tiếp
+        # trong cùng session — messages là list được return và tái dùng
+        # nguyên vẹn cho lần agent_turn() sau, xem 10_main.py).
+        if tool_results and max_steps >= 2 and steps == max_steps - 2:
+            _orig_content = tool_results[-1].get("content") or ""
+            _maxstep_notice = (
+                f"\n\n[step-budget] Chỉ còn ĐÚNG 1 lượt gọi API nữa trong turn "
+                f"này (bước {max_steps}/{max_steps}) — sau đó turn dừng cứng, "
+                "không còn cơ hội gọi thêm tool hay xem thêm kết quả nào. Đừng "
+                "bắt đầu việc mới dang dở (vd sửa nhiều file chưa xong, chạy "
+                "lệnh nhiều bước). Ưu tiên: chốt lại trạng thái hiện tại — đã "
+                "làm gì, còn thiếu gì — người dùng có thể gõ tiếp để tiếp tục "
+                "ở turn sau."
+            )
+            tool_results[-1]["content"] = _orig_content + _maxstep_notice
+            _maxstep_notice_ref = (tool_results[-1], _orig_content)
         messages.extend(tool_results)
         for tr in tool_results_history:
             message_save(conn, sid, "tool", tr)
@@ -3314,6 +3395,16 @@ def _agent_turn_inner(messages, model, api_key, conn, sid, max_steps, agent, sta
         steps += 1
         if _loop_break_requested:
             break
+
+    # Revert nudge step-budget (nếu đã chèn) — dọn khỏi `messages` NGAY khi
+    # đã phục vụ xong đúng 1 lượt cuối, dù turn kết thúc tự nhiên (hết
+    # max_steps) hay bị ngắt sớm (no-progress/_loop_break_requested) — chạy
+    # VÔ ĐIỀU KIỆN ở đây (không lồng trong `if steps >= max_steps`) để cả 2
+    # đường ra khỏi while đều được dọn, tránh sót rác lại 1 turn không dùng
+    # tới nudge (vd bị stop qua no-progress trước khi chạm bước cuối).
+    if _maxstep_notice_ref is not None:
+        _msg_ref, _orig_content = _maxstep_notice_ref
+        _msg_ref["content"] = _orig_content
 
     if steps >= max_steps:
         _max_step_msg = (

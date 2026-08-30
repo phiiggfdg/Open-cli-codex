@@ -508,6 +508,41 @@ _server_thread = None
 _server_addr = None  # (host, port) của server đang chạy, None nếu chưa start
 
 
+def _find_free_port(host: str, start_port: int, max_tries: int = 10) -> int:
+    """Dò port rảnh bắt đầu từ start_port, thử tối đa max_tries port liên tiếp.
+
+    Trước đây start_web_server() bind thẳng vào `port` cố định (mặc định
+    8765) không hề kiểm tra trước -- nếu port đó đang bị process KHÁC giữ
+    (vd 1 phiên fw.py cũ chưa thoát sạch, hoặc app khác), OSError EADDRINUSE
+    văng thẳng ra ngoài thành traceback thô, không có xử lý nào bắt lại.
+    Khác với _serve_kill_port_owner() (06_tools_fs.py, dùng cho tool `serve`)
+    -- ở đó CHỦ ĐỘNG kill process lạ vì bối cảnh là dev server người dùng tự
+    chạy, rủi ro thấp -- ở đây KHÔNG tự ý kill bất cứ gì (không biết process
+    giữ port 8765 là gì, kill nhầm có thể mất việc của user), chỉ đơn giản
+    thử port kế tiếp. Bind-test nhanh (bind rồi close ngay) là cách rẻ nhất
+    để biết port có rảnh không, không cần quét /proc.
+    Trả về port đầu tiên rảnh được, hoặc raise OSError với message rõ ràng
+    nếu hết cả dải mà vẫn không tìm được (rất hiếm — nghĩa là 10 port liên
+    tiếp đều bận, gần như chắc chắn có vấn đề khác đáng chú ý hơn).
+    """
+    for candidate in range(start_port, start_port + max_tries):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind((host, candidate))
+            s.close()
+            return candidate
+        except OSError:
+            s.close()
+            continue
+    raise OSError(
+        f"[web] Không tìm được port rảnh trong khoảng {start_port}-"
+        f"{start_port + max_tries - 1} trên {host}. "
+        f"Có thể có nhiều phiên fw.py cũ chưa thoát hẳn — thử đóng chúng "
+        f"rồi chạy lại /web."
+    )
+
+
 def start_web_server(fw_path: str, host: str = "127.0.0.1", port: int = 8765):
     """Khởi động server local phục vụ trang web + WS bridge tới PTY chạy fw.py.
     Gọi từ lệnh /web trong 10_main.py. An toàn gọi nhiều lần — nếu đã chạy,
@@ -535,7 +570,21 @@ def start_web_server(fw_path: str, host: str = "127.0.0.1", port: int = 8765):
         _STATIC_INDEX = "<html><body>web_index.html not found</body></html>"
 
     _Handler.fw_path = fw_path
-    _server_instance = _ThreadingHTTPServer((host, port), _Handler)
+    # Dò port rảnh trước khi bind thật -- nếu `port` mặc định đang bị process
+    # KHÁC giữ (phiên fw.py cũ chưa thoát hẳn, app khác...), tự động thử vài
+    # port kế tiếp thay vì để OSError EADDRINUSE văng thẳng ra ngoài (bug cũ,
+    # traceback thô không ai đọc được trên CLI). Xem _find_free_port() ở trên.
+    port = _find_free_port(host, port)
+    try:
+        _server_instance = _ThreadingHTTPServer((host, port), _Handler)
+    except OSError as e:
+        # Race hiếm: port vừa test rảnh xong lại bị process khác chiếm ngay
+        # trước khi bind thật (cửa sổ rất hẹp, nhưng không phải 0). Báo lỗi
+        # rõ ràng thay vì để traceback thô văng ra như trước.
+        raise OSError(
+            f"[web] Không bind được port {port} trên {host}: {e}. "
+            f"Thử lại /web — nếu vẫn lỗi, có process khác đang chiếm liên tục."
+        ) from e
     _server_thread = threading.Thread(target=_server_instance.serve_forever, daemon=True)
     _server_thread.start()
     _server_addr = (host, port)

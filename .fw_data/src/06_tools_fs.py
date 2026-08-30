@@ -763,10 +763,33 @@ def _dir_tree(path: Path, prefix="", depth=0, max_depth=4, max_entries=200, _cou
 
 # ── Tool output limits ───────────────────────────────────────────────────────
 # Model sees this much per tool call. Head+tail strategy like openai/codex.
-TOOL_OUTPUT_MAX_CHARS   = 12_000   # ~3k tokens — what model sees live
-TOOL_HISTORY_MAX_CHARS  = 3_000    # ~500 tokens — what stays in context forever
+# (Tham khảo openai/codex issue #6426: line-based cap không phản ánh đúng áp
+# lực token thật — 2 lần đọc cùng số dòng có thể lệch token vài lần tùy độ
+# dày file. Codex đã chuyển sang cap theo ước lượng token/byte thực tế thay
+# vì 1 số dòng cố định. Áp dụng tương tự ở đây cho riêng `read`: cap ký tự
+# co giãn theo `limit` dòng model thực sự xin, thay vì 1 hằng số tĩnh chung
+# cho mọi tool — tránh 2 lỗi đối lập: đọc ít dòng vẫn bị buộc chung 1 ngưỡng
+# lớn (lãng phí context), hoặc đọc nhiều dòng bị cắt giữa oan dù đã qua gate
+# hard-block riêng của `read`.)
+TOOL_OUTPUT_MAX_CHARS   = 12_000   # ~3k tokens — cap CHUNG cho tool khác (bash/grep/glob/...), không đổi
+TOOL_HISTORY_MAX_CHARS  = 3_000    # ~500 tokens — what stays in context forever (không đổi, không liên quan limit đọc)
 TOOL_KEEP_FULL_TURNS    = 4        # giữ tool_result đầy đủ cho N turn gần nhất
 READ_DEFAULT_LIMIT      = 80       # lines, down from 200
+READ_LIMIT_MAX          = 700      # hard-block cứng cho tool `read` (xem tool_read)
+READ_CHARS_PER_LINE_EST = 90       # ước lượng ký tự/dòng kèm overhead (số dòng + tab + code) — đo thực nghiệm trên codebase thật (avg ~54 chars/line nội dung thô + prefix "N\t") rồi làm tròn lên cho biên an toàn
+READ_OUTPUT_MIN_CHARS   = TOOL_OUTPUT_MAX_CHARS  # sàn: không bao giờ thấp hơn cap chung, kể cả khi limit nhỏ
+READ_OUTPUT_MAX_CHARS   = 90_000   # ~22k tokens — trần an toàn tuyệt đối cho read, kể cả limit=700 trên file dòng cực dài
+
+def _read_output_cap(limit: int) -> int:
+    """Cap ký tự cho output của `read`, co giãn theo số dòng thực xin.
+
+    Không dùng 1 hằng số tĩnh cho mọi lần gọi (đọc 20 dòng và đọc 700 dòng
+    không nên chịu chung ngưỡng) — nhưng vẫn có sàn (không thấp hơn cap tool
+    thường) và trần (không vượt READ_OUTPUT_MAX_CHARS dù limit=700 trên file
+    toàn dòng cực dài, ví dụ minified/generated code).
+    """
+    est = int(limit) * READ_CHARS_PER_LINE_EST
+    return max(READ_OUTPUT_MIN_CHARS, min(est, READ_OUTPUT_MAX_CHARS))
 
 def _head_tail(text: str, max_chars: int, label="tool output") -> str:
     """Keep head + tail, drop middle. Model knows exactly what was cut."""
@@ -785,7 +808,7 @@ def _history_tool_call_key(name: str, args: dict) -> tuple | None:
     at different offsets, grep calls with different patterns, and different
     symbols in one file are distinct evidence and must remain distinct.
     """
-    if name not in {"read", "grep", "glob", "view_symbol"}:
+    if name not in {"read", "grep", "glob", "view_symbol", "delegate"}:
         return None
     try:
         normalized = dict(args)
@@ -804,6 +827,18 @@ def _history_tool_call_key(name: str, args: dict) -> tuple | None:
             }
             for field, value in defaults.items():
                 normalized.setdefault(field, value)
+        elif name == "delegate":
+            # Dedup theo task_type + target — CỐ Ý không đưa "instruction"
+            # hay "expected_output" vào canonical key: 2 cách diễn đạt khác
+            # nhau cho CÙNG 1 target vẫn nên coi là việc trùng lặp (agent
+            # chính giao lại việc gần giống, chỉ đổi câu chữ) — nếu đưa
+            # instruction vào, dedup sẽ gần như không bao giờ khớp vì text
+            # tự do hiếm khi giống hệt nhau, làm dedup mất tác dụng thật.
+            normalized = {
+                "task_type": normalized.get("task_type"),
+                "target_files": sorted(normalized.get("target_files") or []),
+                "target_location": normalized.get("target_location") or "",
+            }
         canonical = json.dumps(normalized, sort_keys=True, separators=(",", ":"),
                                ensure_ascii=False)
     except (TypeError, ValueError):
@@ -996,6 +1031,77 @@ def _prune_tool_results(messages: list, keep_full_turns: int | None = None) -> l
         stripped_result.append(m)
 
     return stripped_result
+
+
+# ── delegate: nén sớm hơn cho kết quả "delegate" trong context AGENT CHÍNH ──
+# _prune_tool_results ở trên xử lý keep_full_turns THEO TOÀN BỘ mảng messages
+# 1 lượt — không có chỗ để "1 tool cụ thể có ngưỡng tuổi riêng" trong chính
+# hàm đó (group = 1 assistant tool_calls + mọi tool_result theo sau nó, bất
+# kể tool gì trong group). Không sửa hàm gốc (dùng chung cho MỌI tool, rủi ro
+# cao); thay vào đó, hàm RIÊNG này chạy SAU _prune_tool_results, chỉ quét các
+# message role="tool" mà content bắt đầu bằng "[delegate:" (output contract
+# ép ở _tool_delegate_inner, 08_undo_dispatch.py — luôn đúng prefix nhờ lớp
+# bảo hiểm ở đó) và áp ngưỡng tuổi RIÊNG, ngắn hơn mặc định — vì bản chất
+# việc "delegate" giao đã CHỐT xong khi model chính đọc lần đầu, không cần
+# tra lại nhiều lần như đọc file.
+DELEGATE_KEEP_FULL_TURNS = 2   # ngắn hơn TOOL_KEEP_FULL_TURNS=4 mặc định
+
+def _prune_delegate_results(messages: list, keep_full_turns: int | None = None) -> list:
+    """Stub các tool_result của "delegate" cũ hơn keep_full_turns GROUP gần
+    nhất (group tính theo đúng định nghĩa ở _prune_tool_results: 1 assistant
+    tool_calls + các tool_result theo sau). Không đụng tool_result của tool
+    khác trong CÙNG group đó — chỉ message nào thật sự có content bắt đầu
+    bằng "[delegate:" mới bị stub."""
+    if keep_full_turns is None:
+        keep_full_turns = DELEGATE_KEEP_FULL_TURNS
+    keep_full_turns = max(0, int(keep_full_turns))
+
+    # Xác định group theo đúng logic bước 1 của _prune_tool_results, nhưng
+    # chỉ đếm group nào CHỨA ít nhất 1 tool_result "delegate" — 1 group toàn
+    # đọc file/grep không tính vào "N group delegate gần nhất".
+    delegate_groups = []  # list[(start, end)] các group có >=1 message delegate
+    i = 0
+    while i < len(messages):
+        m = messages[i]
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            j = i + 1
+            while j < len(messages) and messages[j].get("role") == "tool":
+                j += 1
+            if j > i + 1:
+                has_delegate = any(
+                    str(messages[k].get("content", "")).startswith("[delegate:")
+                    for k in range(i + 1, j)
+                )
+                if has_delegate:
+                    delegate_groups.append((i + 1, j - 1))
+            i = j
+        else:
+            i += 1
+
+    old_delegate_groups = (delegate_groups[:-keep_full_turns]
+                            if len(delegate_groups) > keep_full_turns else [])
+    if keep_full_turns == 0:
+        old_delegate_groups = delegate_groups
+    if not old_delegate_groups:
+        return messages
+
+    stub_indices = set()
+    for start, end in old_delegate_groups:
+        for idx in range(start, end + 1):
+            if str(messages[idx].get("content", "")).startswith("[delegate:"):
+                stub_indices.add(idx)
+
+    result = []
+    for idx, m in enumerate(messages):
+        if idx in stub_indices:
+            c = m.get("content", "")
+            half = TOOL_HISTORY_MAX_CHARS // 2
+            stub = (c[:half] + "\n…\n" + c[-half:]) if len(c) > TOOL_HISTORY_MAX_CHARS else c
+            result.append({**m, "content": stub})
+        else:
+            result.append(m)
+    return result
+
 
 # ── Per-session file index ───────────────────────────────────────────────────
 def _index_key() -> str:
@@ -1316,99 +1422,42 @@ def tool_read(path, offset=1, limit=READ_DEFAULT_LIMIT, depth=4, state=None):
         all_lines = p.read_text(errors="replace").splitlines()
         total     = len(all_lines)
 
-        # BUG FIX (đã verify bằng test thật): thứ tự cũ chạy nhánh "large-file"
-        # TRƯỚC 2 gate limit>150/limit>135. Nhánh large-file kích hoạt bất cứ
-        # khi nào offset==1 và limit>=total (đúng lúc model đọc hết file lớn —
-        # chính là trường hợp 2 gate kia được sinh ra để bắt), và nó âm thầm
-        # ghi đè limit=80 TRƯỚC KHI 2 gate kịp thấy giá trị limit thật model
-        # truyền vào. Hệ quả: hard-block (>150) và verify-ask (>135) chết hẳn
-        # bất cứ khi nào offset==1 — tức đường gọi tự nhiên nhất. Test xác nhận
-        # chỉ cần đổi offset=1→2 (cùng limit, cùng file) là gate hoạt động lại
-        # đúng ngay, chứng minh đây là bug thứ tự chứ không phải bug logic gate.
-        # Fix: đánh giá 2 gate TRƯỚC, trên limit GỐC model truyền vào (không
+        # BUG FIX (đã verify bằng test thật, lịch sử): thứ tự cũ từng chạy
+        # nhánh "large-file" TRƯỚC gate hard-block. Nhánh large-file kích
+        # hoạt bất cứ khi nào offset==1 và limit>=total (đúng lúc model đọc
+        # hết file lớn — chính là trường hợp gate được sinh ra để bắt), và nó
+        # âm thầm ghi đè limit=80 TRƯỚC KHI gate kịp thấy giá trị limit thật
+        # model truyền vào. Hệ quả: hard-block chết hẳn bất cứ khi nào
+        # offset==1 — tức đường gọi tự nhiên nhất. Test xác nhận chỉ cần đổi
+        # offset=1→2 (cùng limit, cùng file) là gate hoạt động lại đúng ngay,
+        # chứng minh đây là bug thứ tự chứ không phải bug logic gate.
+        # Fix: đánh giá gate TRƯỚC, trên limit GỐC model truyền vào (không
         # phụ thuộc offset/total) — đây là ý muốn tường minh của model, luôn
         # phải qua gate. Nhánh large-file chỉ còn xử lý phần CÒN LẠI: limit đã
-        # qua gate (tức ≤150) nhưng vẫn đọc-hết-file (offset=1, limit>=total)
+        # qua gate (tức ≤700) nhưng vẫn đọc-hết-file (offset=1, limit>=total)
         # thì mới cảnh báo + cắt xuống threshold để tiết kiệm token.
+        # (Update: verify-gate hỏi user khi limit>135 đã bị bỏ hoàn toàn —
+        # gây phiền, không phù hợp luồng agent tự động. Giờ chỉ còn 1 ngưỡng
+        # hard-block duy nhất = 700, không hỏi, không credit.)
         orig_limit = int(limit)
         warn = ""
 
-        # Hard block: AI tự ghi limit > 150 mà không qua verify gate
-        if orig_limit > 150:
+        # Hard block: AI tự ghi limit > READ_LIMIT_MAX (không còn verify-gate
+        # hỏi user — đã bỏ theo yêu cầu, vì luồng hỏi/credit cũ gây phiền.
+        # Giờ chỉ có 1 ngưỡng cứng duy nhất, vượt là từ chối thẳng, không hỏi lại.)
+        if orig_limit > READ_LIMIT_MAX:
             return (
-                f"[policy] limit={orig_limit} quá lớn (tối đa 150).\n"
+                f"[policy] limit={orig_limit} quá lớn (tối đa {READ_LIMIT_MAX}).\n"
                 f"Dùng grep/view_symbol để tìm chính xác vị trí, "
-                f"rồi read với limit ≤ 150 quanh dòng đó.\n"
+                f"rồi read với limit ≤ {READ_LIMIT_MAX} quanh dòng đó.\n"
                 f"Ví dụ: grep('keyword') → read(path, offset=N-5, limit=60)"
             )
 
-        # Verify gate: limit > 135 → hỏi user (trừ khi còn credit)
-        if orig_limit > 135:
-            global _large_read_credits
-            if _large_read_credits > 0:
-                _large_read_credits -= 1
-                limit = 500
-            else:
-                # BUG FIX (cùng loại đã sửa ở tool_question/tool_verify):
-                # trước đây luôn dùng input()/print() thẳng ra CLI, kể cả
-                # khi đang chạy /web -- câu hỏi "Cho phép đọc nhiều?" không
-                # hề hiện trên web UI, luôn rơi ra cửa sổ CLI phía sau. Sửa
-                # theo đúng pattern permission-ask/tool_verify: có state
-                # (tham số hoặc fallback qua current_state() nếu gọi nội bộ
-                # không truyền tay, vd từ tool_verify) -> state.ask() (web
-                # trả lời qua WS); không có state nào cả -> giữ input() cũ.
-                _st = state if state is not None else current_state()
-                if _st is not None:
-                    _st.emit(EV_INFO,
-                        text=f"⚠ AI muốn đọc {limit} dòng từ '{path}' — có thể dùng grep để thu hẹp trước.")
-                    ans = _st.ask(
-                        prompt=f"Cho phép đọc {limit} dòng? Sẽ đọc tối đa 500 dòng, 2 lần.",
-                        kind="confirm",
-                        default="n",
-                    ) or "n"
-                    ans = str(ans).strip().lower()
-                else:
-                    print(f"\n{YELLOW}⚠ AI muốn đọc {limit} dòng từ '{path}'{R}")
-                    print(f"{DIM}  Đây là đoạn dài — thường có thể dùng grep để thu hẹp trước.{R}")
-                    print(f"{DIM}  Cho phép sẽ đọc tối đa 500 dòng 2 lần.{R}")
-                    try:
-                        ans = input(f"  {CYAN}Cho phép đọc nhiều? [y/N]: {R}").strip().lower()
-                    except (EOFError, KeyboardInterrupt):
-                        ans = "n"
-                if ans in ("y", "yes"):
-                    _large_read_credits = 1  # lần này + 1 lần nữa = 2 tổng
-                    limit = 500
-                    if _st is not None:
-                        _st.emit(EV_INFO, text="✓ Cho phép đọc tối đa 500 dòng 2 lần.")
-                    else:
-                        print(f"  {GREEN}✓ Cho phép đọc tối đa 500 dòng 2 lần.{R}")
-                else:
-                    # BUG FIX: trước đây trả về tay không kèm hướng dẫn "gọi
-                    # lại với limit≤135" — nếu AI cứ thử lại đúng limit cũ
-                    # (hoặc user vô tình Enter trống ở prompt confirm, luôn
-                    # rơi vào default="n"), nó bị từ chối lặp lại y hệt,
-                    # nhìn giống "đọc qua lại liên tục, bị cắt mất liên tục".
-                    # Sửa: fallback NGAY trong lần gọi này — đọc thẳng 135
-                    # dòng đầu (mức tối đa không cần hỏi) thay vì bắt AI
-                    # phải tự gọi lại lần nữa cho cùng 1 file.
-                    limit = 135
-                    warn = (
-                        f"[verify] User từ chối đọc {orig_limit} dòng — "
-                        f"đã tự động đọc {limit} dòng đầu thay thế (không cần gọi lại).\n"
-                        f"Nếu cần phần xa hơn, dùng grep/view_symbol để tìm đúng vị trí "
-                        f"rồi read với offset+limit hẹp quanh đó.\n"
-                    )
-
-
-        # Large-file soft warning: chỉ áp dụng SAU khi limit đã qua gate ở trên
-        # (tức limit hiện tại ≤135, hoặc =500 nếu user/credit đã cho phép rõ
-        # ràng). Nếu limit hiện tại vẫn >= total và offset=1 → đúng là đọc hết
-        # file lớn không cần thiết, cắt xuống threshold để tiết kiệm token.
-        # Không áp dụng khi limit=500 (đã được user cho phép tường minh ở gate
-        # trên — không nên lại âm thầm cắt xuống 80 sau khi vừa hỏi và được y).
+        # Large-file soft warning: nếu offset=1 và limit>=total (tức đọc hết
+        # file lớn không cần thiết) → cắt xuống threshold để tiết kiệm token.
         _READ_LARGE_FILE_THRESHOLD = 80  # lines
         if (total > _READ_LARGE_FILE_THRESHOLD and int(offset) == 1
-                and int(limit) >= total and int(limit) != 500):
+                and int(limit) >= total):
             warn += (
                 f"[policy] File '{path}' có {total} dòng. "
                 f"Đọc toàn bộ file lãng phí token.\n"

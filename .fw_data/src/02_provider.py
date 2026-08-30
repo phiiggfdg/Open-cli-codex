@@ -935,5 +935,68 @@ def choose_provider() -> str:
             # ở đây luôn có nghĩa "người dùng CLI thật muốn thoát".
             print(f"\n  {DIM}Bye.{R}"); sys.exit(0)
 
+# ── Provider picker cho /delegate-model — KHÔNG đổi _active_provider global ──
+# choose_provider() ở trên chỉ dùng lúc startup: luôn set _active_provider
+# (global) và sys.exit(0) khi Ctrl-C, đúng cho ngữ cảnh "chọn xong app mới
+# chạy tiếp". /delegate-model cần khác hẳn: chọn provider RIÊNG cho tool
+# "delegate" trong khi agent chính vẫn đang chạy trên _active_provider của
+# nó — không được đổi global (sẽ ảnh hưởng mọi request khác đang/sắp chạy,
+# kể cả background thread _auto_rename_session, xem 08_undo_dispatch.py:
+# _tool_delegate_inner nơi việc swap tạm có kiểm soát bằng _pool_lock thật
+# sự diễn ra). Hàm này CHỈ hỏi + trả về key, không side-effect gì lên
+# _active_provider. Hỗ trợ hủy (q/0/Ctrl-C) — khác choose_provider() vốn
+# không có đường hủy vì startup bắt buộc phải chọn 1 provider.
+def _choose_provider_key_for_delegate() -> "str | None":
+    """Hiện menu chọn provider cho riêng tool delegate. Trả về provider key,
+    hoặc None nếu người dùng hủy. KHÔNG đổi _active_provider."""
+    for k, v in _load_custom_providers().items():
+        if k not in PROVIDERS:
+            PROVIDERS[k] = _rebuild_custom_parse(dict(v))
+
+    w = shutil.get_terminal_size((80, 20)).columns
+    box_w = min(w - 2, 60)
+
+    def _print_menu():
+        keys = list(PROVIDERS.keys())
+        print()
+        print(f"  {CYAN}{BOLD}Delegate provider{R}  {DIM}— provider riêng cho tool \"delegate\"{R}")
+        print(f"  {DIM}{'─' * box_w}{R}")
+        for i, k in enumerate(keys, 1):
+            p = PROVIDERS[k]
+            tag = f" {DIM}[custom]{R}" if p.get("_custom") else ""
+            cur = f" {GREEN}[đang dùng cho agent chính]{R}" if k == _active_provider else ""
+            env_hint = f"{GRAY}  {p['env_key']}{R}"
+            print(f"  {YELLOW}{BOLD}{i}{R}  {WHITE}{p['name']}{R}{tag}{cur}{env_hint}")
+        print(f"  {DIM}{'─' * box_w}{R}")
+        print(f"  {YELLOW}T{R}{DIM}  Thêm provider OpenAI-compatible mới{R}")
+        print(f"  {YELLOW}q{R}{DIM}  Hủy{R}")
+        print()
+        return keys
+
+    keys = _print_menu()
+    while True:
+        try:
+            n = input(f"  {CYAN}❯{R} ").strip()
+            if n.lower() in ("q", "0"):
+                return None
+            if not n:
+                continue
+            if n.lower() == "t":
+                _add_custom_provider()
+                keys = _print_menu()
+                continue
+            idx = int(n) - 1
+            if 0 <= idx < len(keys):
+                chosen = keys[idx]
+                print(f"  {GREEN}✓{R} {DIM}Delegate provider:{R} {WHITE}{PROVIDERS[chosen]['name']}{R}\n")
+                return chosen
+        except ValueError:
+            print(f"\n  {DIM}Không hợp lệ, thử lại.{R}")
+            keys = _print_menu()
+            continue
+        except (KeyboardInterrupt, EOFError):
+            print()
+            return None
+
 # ── /end PROVIDER ─────────────────────────────────────────────────────────────
 
