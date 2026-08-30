@@ -382,7 +382,7 @@ HELP = f"""
   {CYAN}/sequential{R}          step-by-step mode  {DIM}(safer, more tokens){R}
   {CYAN}/batch{R}               batched tool calls {DIM}(default, faster){R}
   {CYAN}/mode{R}                thinking on/off  {DIM}(if model supports it){R}
-  {CYAN}/thinking{R}            Upstage reasoning_effort {DIM}(none / medium / high){R}
+  {CYAN}/thinking{R}            reasoning effort level {DIM}(mức tuỳ model — gõ /thinking trống để xem bảng gợi ý; Upstage: none/medium/high; N/A cho Anthropic/Bedrock, dùng /mode){R}
 
 {GRAY}Context & Memory{R}
   {CYAN}/tokens{R}              token usage + cost
@@ -540,7 +540,7 @@ def main():
     # và /perm bash ask (xem dưới) chỉ tạo biến local trong main(), không
     # đụng tới biến module-level thật mà tool_bash()/_check_permission() đọc.
     global _input_history, _tool_mode, _thinking_mode, _upstage_thinking_effort, _bash_allow_all
-    global _active_provider
+    global _active_provider, _reasoning_effort
     _input_history = history_load()
     choose_provider()
     api_key = get_api_key()
@@ -549,6 +549,7 @@ def main():
     _tool_mode = "batch"  # mặc định batch, user có thể gõ /sequential để đổi
     _thinking_mode = "on"  # tự bật; /mode chỉ là override request, không chặn việc bắt thinking
     _upstage_thinking_effort = None  # chỉ dùng cho custom provider upstage qua /thinking
+    _reasoning_effort = None  # chỉ dùng cho provider ngoài Upstage/Anthropic/Bedrock qua /thinking
 
     session, model, messages = pick_session(conn, api_key)
     sid    = session["id"]
@@ -1277,32 +1278,96 @@ def main():
                 else:
                     print(text)
 
-            if not _is_upstage_custom_provider():
+            # Nhánh 1: Upstage — GIỮ NGUYÊN 100% hành vi cũ, không đổi gì
+            # (field/lệnh riêng, chỉ 3 mức none/medium/high cố định của
+            # provider này — xem _upstage_normalize_thinking_effort()).
+            if _is_upstage_custom_provider():
+                if not arg:
+                    cur = _upstage_thinking_effort or "unset"
+                    _thinking_out(
+                        f"{GREEN if _upstage_thinking_effort else DIM}Upstage reasoning_effort: {cur}{R}\n"
+                        f"{DIM}  Gõ {CYAN}/thinking none{R}{DIM}, {CYAN}/thinking medium{R}{DIM}, "
+                        f"hoặc {CYAN}/thinking high{R}{DIM}.{R}\n"
+                    )
+                    continue
+
+                effort = _upstage_normalize_thinking_effort(arg)
+                if effort is None:
+                    _thinking_out(
+                        f"{YELLOW}⚠ Giá trị không hợp lệ: {arg}{R}\n"
+                        f"{DIM}  Upstage hỗ trợ: none, medium, high.{R}\n"
+                    )
+                    continue
+
+                _upstage_thinking_effort = effort
+                _thinking_out(f"{GREEN}✓ Upstage reasoning_effort: {effort}{R}\n")
+                continue
+
+            # Nhánh 2: Anthropic/Bedrock — không có khái niệm effort rời rạc
+            # (dùng budget_tokens qua /mode on/off), nên /thinking không áp
+            # dụng — báo rõ và hướng dẫn dùng /mode thay vì im lặng bỏ qua.
+            # _reasoning_effort_capable() là nguồn sự thật DUY NHẤT cho câu
+            # hỏi "provider này có nhận reasoning_effort nhiều mức không" —
+            # dùng lại đúng hàm mà _apply_thinking_param() cũng dựa vào,
+            # tránh viết lại điều kiện format_kind lần thứ 2 dễ lệch nhau.
+            if not _reasoning_effort_capable(model):
                 _thinking_out(
-                    f"{YELLOW}⚠ /thinking chỉ dùng cho custom provider 'upstage'.{R}\n"
-                    f"{DIM}  Provider hiện tại: {_active_provider}. Dùng /model để đổi provider/model nếu cần.{R}\n"
+                    f"{YELLOW}⚠ Model/provider này dùng budget_tokens (Anthropic/Bedrock), "
+                    f"không dùng reasoning_effort.{R}\n"
+                    f"{DIM}  Dùng {CYAN}/mode on{R}{DIM} hoặc {CYAN}/mode off{R}{DIM} để bật/tắt thinking.{R}\n"
                 )
                 continue
 
+            # Nhánh 3: mọi provider còn lại (openai / openai_responses
+            # OpenAI-compat khác — DeepSeek, GLM, Qwen-thinking, GPT reasoning
+            # models qua Responses API, v.v.) — nhiều mức, tuỳ provider.
             if not arg:
-                cur = _upstage_thinking_effort or "unset"
-                _thinking_out(
-                    f"{GREEN if _upstage_thinking_effort else DIM}Upstage reasoning_effort: {cur}{R}\n"
-                    f"{DIM}  Gõ {CYAN}/thinking none{R}{DIM}, {CYAN}/thinking medium{R}{DIM}, "
-                    f"hoặc {CYAN}/thinking high{R}{DIM}.{R}\n"
-                )
+                cur = _reasoning_effort or "unset"
+                _hint = _reasoning_effort_hint_for(model)
+                _lines = [
+                    f"{GREEN if _reasoning_effort else DIM}Reasoning effort: {cur}{R}",
+                ]
+                if _hint:
+                    _label, _levels, _note, _source = _hint
+                    _lines.append(f"{CYAN}Model hiện tại: {_label} → {_levels}{R}")
+                    if _note:
+                        _lines.append(f"{DIM}  ({_note}){R}")
+                    _lines.append(f"{DIM}  Nguồn: {_source}{R}")
+                    _lines.append("")
+                _lines.append(f"{DIM}Bảng gợi ý theo họ model {R}"
+                               f"{DIM}(tĩnh, có thể lỗi thời — kiểm tra docs provider nếu chưa chắc):{R}")
+                # Căn cột theo độ dài nhãn dài nhất trong bảng — giữ mức ở
+                # cột riêng, KHÔNG nhét ghi chú dài vào cùng dòng (đó là lý
+                # do bản trước bị vỡ layout trên terminal hẹp).
+                _label_w = max(len(l) for _, l, _, _, _ in _REASONING_EFFORT_HINTS)
+                for _needle, _label, _levels, _note, _source in _REASONING_EFFORT_HINTS:
+                    _lines.append(f"{DIM}  {_label:<{_label_w}}  {R}{_levels}")
+                _lines.append("")
+                _lines.append(f"{DIM}Gõ {CYAN}/thinking <mức>{R}{DIM} để chọn, hoặc "
+                               f"{CYAN}/thinking none{R}{DIM} để tắt. Cần {CYAN}/mode on{R}{DIM} trước "
+                               f"để bật thinking — /thinking chỉ chọn MỨC, không tự bật.{R}")
+                _thinking_out("\n".join(_lines) + "\n")
                 continue
 
-            effort = _upstage_normalize_thinking_effort(arg)
+            effort = _normalize_reasoning_effort(arg)
             if effort is None:
                 _thinking_out(
                     f"{YELLOW}⚠ Giá trị không hợp lệ: {arg}{R}\n"
-                    f"{DIM}  Upstage hỗ trợ: none, medium, high.{R}\n"
+                    f"{DIM}  Hỗ trợ: none, minimal, low, medium, high, xhigh, max "
+                    f"(tuỳ provider chỉ chấp nhận 1 phần trong số này).{R}\n"
                 )
                 continue
 
-            _upstage_thinking_effort = effort
-            _thinking_out(f"{GREEN}✓ Upstage reasoning_effort: {effort}{R}\n")
+            _reasoning_effort = effort
+            _extra_note = ""
+            if effort != "none" and _thinking_mode != "on":
+                _extra_note = (f"\n{DIM}  Lưu ý: thinking đang tắt ({CYAN}/mode off{R}{DIM}) — "
+                                f"gõ {CYAN}/mode on{R}{DIM} để mức này có tác dụng.{R}")
+            _thinking_out(
+                f"{GREEN}✓ Reasoning effort: {effort}{R}\n"
+                f"{DIM}  Nếu provider không hỗ trợ mức này, request sẽ báo lỗi 400 — "
+                f"gõ {CYAN}/thinking{R}{DIM} lại để đổi mức khác nếu gặp lỗi.{R}{_extra_note}\n"
+            )
             continue
 
         if user.lower() == "/clear":

@@ -1077,6 +1077,12 @@ def _run_subagent_loop(sub_messages, sub_sys, allowed, model, api_key, conn, sid
                 payload["thinking"] = {"type": "enabled", "budget_tokens": 8000}
             else:
                 payload["thinking"] = {"type": "enabled"}
+                # Đồng bộ với _apply_thinking_param() (09_api_system.py):
+                # subagent kế thừa mức reasoning_effort của agent chính nếu
+                # người dùng đã chọn qua /thinking (không hỏi lại riêng cho
+                # subagent — dùng chung state 1 phiên).
+                if _reasoning_effort and _reasoning_effort != "none":
+                    payload["reasoning_effort"] = _reasoning_effort
 
         try:
             text, tool_calls = _sub_urlopen(payload)
@@ -1208,6 +1214,10 @@ def _run_subagent_loop(sub_messages, sub_sys, allowed, model, api_key, conn, sid
                     p["thinking"] = {"type": "enabled", "budget_tokens": 8000}
                 else:
                     p["thinking"] = {"type": "enabled"}
+                    # Đồng bộ với _apply_thinking_param() — xem giải thích ở
+                    # nhánh subagent phía trên (agent_turn subagent chính).
+                    if _reasoning_effort and _reasoning_effort != "none":
+                        p["reasoning_effort"] = _reasoning_effort
             return p
 
         def _try_wrap_call(nudge_content: str) -> str:

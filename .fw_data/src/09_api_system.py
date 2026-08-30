@@ -1316,7 +1316,8 @@ def _sanitize_tool_turns(messages: list) -> list:
 # không" thì lưu xuống config.json (xem _thinking_support_get/_set) để lần
 # mở app sau khỏi phải dò lại — tránh tốn token / lỗi vô ích cho mọi turn.
 _thinking_mode: str = "off"   # "off" hoặc "on" — set qua lệnh /mode
-_upstage_thinking_effort: str | None = None  # None|none|medium|high — set qua /thinking
+_upstage_thinking_effort: str | None = None  # None|none|medium|high — set qua /thinking (Upstage only)
+_reasoning_effort: str | None = None  # None|none|low|medium|high|max — set qua /thinking (mọi provider khác Upstage/Anthropic/Bedrock)
 
 # Cờ in-memory (KHÔNG persist) — chỉ cảnh báo leak runtime (mode off nhưng
 # provider vẫn trả thinking) 1 lần mỗi phiên chạy app, tránh spam mỗi turn
@@ -1362,6 +1363,108 @@ def _upstage_normalize_thinking_effort(value: str) -> str | None:
     elif val == "off":
         val = "none"
     return val if val in ("none", "medium", "high") else None
+
+# ── Reasoning effort nhiều mức cho provider ngoài Upstage (/thinking) ───────
+# Khác Upstage (chỉ none/medium/high, field riêng của custom provider này),
+# đây là field "reasoning_effort" chuẩn OpenAI o-series mà nhiều provider
+# OpenAI-compat khác (DeepSeek, GLM, Qwen-thinking, Groq, Fireworks,
+# OpenRouter...) đã theo cùng quy ước để tương thích. KHÔNG áp dụng cho
+# Anthropic/Bedrock (dùng budget_tokens, cơ chế đo khác hẳn — token count
+# vs effort rời rạc, không có công thức quy đổi chuẩn) và KHÔNG áp dụng cho
+# Upstage (đã có field/lệnh riêng ở trên, giữ nguyên không đổi).
+#
+# QUAN TRỌNG — không có 1 whitelist mức nào dùng chung an toàn cho mọi
+# provider: mỗi hãng hỗ trợ 1 tập con khác nhau, và gửi mức KHÔNG được hỗ
+# trợ trả lỗi 400 thẳng từ phía provider (đã xác nhận qua nhiều nguồn thật:
+# OpenAI GPT-5.2 không có "max"; DeepSeek V4 chỉ có low/high/max — không có
+# "medium"; GLM-5.3 chỉ có low/high/max; Qwen3.8-max chỉ có low/medium/
+# xhigh — không có "high"; GLM-5.2 dùng đủ none/minimal/low/medium/high/
+# xhigh/max). KHÔNG giống field "thinking" bật/tắt (chỉ 2 giá trị, mọi nơi
+# đều hiểu), field "reasoning_effort" KHÔNG được validate cứng theo 1
+# whitelist nhỏ ở đây — union toàn bộ tên mức đã xác nhận tồn tại ở ít nhất
+# 1 provider thật, để lệnh /thinking không tự chặn nhầm giá trị hợp lệ cho
+# provider của người dùng. Việc mức đó có ĐÚNG với provider hiện tại hay
+# không là trách nhiệm của người dùng (họ biết mình đang dùng model nào) —
+# giống hệt cách app này không tự validate model ID có tồn tại hay không.
+_REASONING_EFFORT_LEVELS = ("minimal", "low", "medium", "high", "xhigh", "max")
+
+# ── Bảng gợi ý mức theo họ model — CHỈ để hiển thị ở /thinking (help text),
+# KHÔNG dùng để validate/chặn input. Dữ liệu tĩnh (hardcode), xác nhận qua
+# docs chính chủ tại thời điểm viết — CHẮC CHẮN sẽ lỗi thời khi các hãng ra
+# bản mới hoặc đổi tập mức hỗ trợ (đã thấy thực tế: GPT-5 → 5.6 đổi tập mức
+# gần như mỗi bản). Vì vậy:
+#   - Không convert thành whitelist chặn cứng — _normalize_reasoning_effort()
+#     vẫn nhận MỌI giá trị trong _REASONING_EFFORT_LEVELS bất kể model nào,
+#     để không tự chặn nhầm khi bảng dưới đây đã lỗi thời.
+#   - Key là HỌ model tổng quát (khớp theo chuỗi con trong tên model), không
+#     chốt theo từng phiên bản lẻ (GPT-5.2 vs 5.5 vs 5.6...) — chốt lẻ sẽ
+#     phải sửa liên tục mỗi khi hãng ra bản mới, không thực tế để bảo trì.
+#   - Luôn có dòng "kiểm tra docs mới nhất" kèm theo khi in ra — không để
+#     người dùng tưởng bảng này là tuyệt đối đúng.
+_REASONING_EFFORT_HINTS = [
+    # (chuỗi con khớp trong tên model, nhãn hiển thị, mức NGẮN GỌN cho cột
+    # bảng, ghi chú thêm/version khác (None nếu không có), nguồn)
+    ("gpt-5",    "GPT-5.x (Responses API)",
+     "none/minimal/low/medium/high",
+     "bản mới hơn (5.4+) có thêm xhigh/max",
+     "developers.openai.com/api/docs/guides/reasoning"),
+    ("deepseek", "DeepSeek V4",
+     "low/high/max",
+     "không có medium",
+     "api-docs.deepseek.com/guides/thinking_mode"),
+    ("glm",      "GLM-5.x / GLM-4.x (Z.AI)",
+     "low/high/max",
+     "bản GLM-5.2 có thêm minimal/medium/xhigh/none",
+     "docs.z.ai/guides/capabilities/thinking"),
+    ("qwen",     "Qwen3.x (thinking)",
+     "low/medium/xhigh",
+     "không có high",
+     "QwenCloud/DashScope docs"),
+]
+
+def _reasoning_effort_capable(model: str) -> bool:
+    """True nếu model/provider hiện tại nên nhận field "reasoning_effort"
+    nhiều mức (thay vì chỉ on/off nhị phân qua field "thinking"). Loại trừ:
+      - Upstage: có lệnh /thinking + field riêng của nó rồi (3 mức cố định).
+      - Anthropic/Bedrock: dùng budget_tokens, không dùng effort.
+    Còn lại (openai / openai_responses OpenAI-compat khác) đều nhận được."""
+    if _is_upstage_custom_provider():
+        return False
+    _fmt_kind = _format_kind_for(model or "")
+    if _fmt_kind == "anthropic" or _active_provider == "aws_bedrock":
+        return False
+    return True
+
+def _reasoning_effort_hint_for(model: str) -> tuple[str, str, str | None, str] | None:
+    """Tra bảng gợi ý tĩnh (_REASONING_EFFORT_HINTS) theo tên model hiện tại,
+    khớp chuỗi con không phân biệt hoa thường. Trả (nhãn, mức gợi ý ngắn,
+    ghi chú thêm hoặc None, nguồn) nếu khớp được 1 dòng trong bảng, None
+    nếu model không nằm trong danh sách quen thuộc (model lạ/mới — không
+    có gì để gợi ý, không suy đoán)."""
+    m = (model or "").lower()
+    for needle, label, levels, note, source in _REASONING_EFFORT_HINTS:
+        if needle in m:
+            return (label, levels, note, source)
+    return None
+
+def _normalize_reasoning_effort(value: str) -> str | None:
+    """Chuẩn hoá input người dùng gõ ở /thinking (cho provider ngoài Upstage)
+    thành 1 trong các mức đã biết (xem _REASONING_EFFORT_LEVELS), hoặc
+    "none" để tắt. Giá trị được gửi THẲNG làm field "reasoning_effort" —
+    KHÔNG giới hạn thêm theo model cụ thể (xem _REASONING_EFFORT_HINTS —
+    bảng đó chỉ để HIỂN THỊ gợi ý, không dùng để chặn ở đây, vì bảng tĩnh
+    dễ lỗi thời còn validate cứng theo bảng lỗi thời sẽ chặn nhầm giá trị
+    đúng của model mới). Nếu người dùng gõ mức mà provider hiện tại không
+    hỗ trợ, provider sẽ trả lỗi 400 — xem cảnh báo in ra ở lệnh /thinking
+    (10_main.py) nhắc rõ điều này thay vì im lặng để user tự đoán."""
+    val = (value or "").strip().lower()
+    if val == "on":
+        val = "medium"
+    elif val == "off":
+        val = "none"
+    if val in _REASONING_EFFORT_LEVELS or val == "none":
+        return val
+    return None
 
 # Cache riêng: model CÓ support thinking (xác nhận ở _thinking_support_*
 # bên trên) NHƯNG gửi {"type": "disabled"} có thực sự tắt được không.
@@ -1824,6 +1927,20 @@ def _apply_thinking_param(payload: dict, model: str):
     budget_tokens vì Responses dùng effort rời rạc, không dùng token count)
     nên gộp chung điều kiện với nhánh Anthropic/Bedrock ở dưới, KHÔNG viết
     nhánh riêng — tránh trùng lặp code cho cùng 1 schema trung gian.
+
+    MỞ RỘNG (reasoning_effort nhiều mức cho OpenAI-compat khác Upstage):
+    trước đây nhánh "else" (DeepSeek/GLM/Qwen-thinking...) chỉ có on/off
+    nhị phân qua field "thinking". Giờ nếu người dùng đã chọn 1 mức cụ thể
+    qua /thinking (biến _reasoning_effort, khác _upstage_thinking_effort —
+    xem _reasoning_effort_capable() để biết provider nào vào nhánh này),
+    gửi THÊM field "reasoning_effort" chuẩn OpenAI o-series song song với
+    "thinking" — không thay thế "thinking", vì 1 số backend OpenAI-compat
+    (vd DeepSeek) chỉ nhận diện "thinking" để bật cơ chế, còn provider nào
+    đọc được "reasoning_effort" thì tận dụng thêm field đó để chọn mức.
+    Gửi thừa 1 field lạ mà provider không hiểu thường bị bỏ qua an toàn
+    (khác việc thiếu field bắt buộc), nên gửi cả 2 không rủi ro hơn so với
+    hành vi cũ. Nhánh này KHÔNG chạm tới Anthropic/Bedrock/openai_responses
+    ở trên — _reasoning_effort_capable() đã loại trừ rõ 3 format đó.
     """
     if _is_upstage_custom_provider():
         payload["reasoning_effort"] = _upstage_thinking_effort or "medium"
@@ -1842,7 +1959,10 @@ def _apply_thinking_param(payload: dict, model: str):
         # ý nghĩa với Anthropic/Bedrock — _to_responses_payload() bỏ qua
         # field này khi dịch sang "reasoning.effort" (không đọc
         # budget_tokens), nên gửi thừa vô hại, không cần if/else tách theo
-        # từng format ở đây.
+        # từng format ở đây. Mức effort cho openai_responses được đọc riêng
+        # trong _to_responses_payload() (01e_openai_responses.py) từ cùng
+        # biến _reasoning_effort này — KHÔNG set ở đây để không phá luồng
+        # budget_tokens/Anthropic đang hoạt động đúng.
         if _thinking_mode == "on":
             payload["thinking"] = {"type": "enabled", "budget_tokens": 8000}
         else:
@@ -1855,6 +1975,11 @@ def _apply_thinking_param(payload: dict, model: str):
             payload["thinking"] = {"type": "enabled"}
         else:
             payload["thinking"] = {"type": "disabled"}
+        # Mức cụ thể (low/medium/high/max), nếu người dùng đã chọn qua
+        # /thinking cho provider này — xem docstring ở trên. Chỉ gửi khi
+        # thinking đang "on"; lúc "off" không có ý nghĩa gửi kèm effort.
+        if _thinking_mode == "on" and _reasoning_effort and _reasoning_effort != "none":
+            payload["reasoning_effort"] = _reasoning_effort
 
 def _probe_thinking_support(model: str, api_key: str) -> bool:
     """

@@ -131,7 +131,7 @@ SLASH_DESC = {
     "/model":      "đổi model",
     "/agent":      "đổi agent mode (build/plan)",
     "/mode":       "bật/tắt thinking mode (nếu model hỗ trợ)",
-    "/thinking":   "đặt reasoning_effort cho Upstage custom",
+    "/thinking":   "đặt mức reasoning effort (tuỳ model — /thinking trống để xem bảng gợi ý; Upstage: none/medium/high)",
     "/session":    "info session hiện tại",
     "/sessions":   "switch/tạo session",
     "/todos":      "xem todo list",

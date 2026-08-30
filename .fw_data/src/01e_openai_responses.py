@@ -206,9 +206,15 @@ def _to_responses_payload(payload: dict) -> dict:
     # (developers.openai.com/api/docs/guides/reasoning, mục ví dụ curl có
     # "reasoning": {"effort": "medium"}).
     #
-    # on  → effort="medium" (mức cân bằng, KHÔNG suy ra từ budget_tokens
-    #       của Anthropic vì 2 hệ đo hoàn toàn khác nhau — token count vs
-    #       effort level rời rạc, không có công thức quy đổi chuẩn nào).
+    # on  → effort mặc định "medium" nếu người dùng chưa chọn mức cụ thể
+    #       qua /thinking (biến toàn cục _reasoning_effort, cùng namespace
+    #       exec với 09_api_system.py — xem fw.py:_load_modules). Trước đây
+    #       hardcode "medium" luôn, không đọc mức người dùng chọn — giờ ưu
+    #       tiên _reasoning_effort nếu đã set (và != "none", "none" nghĩa
+    #       là user đang muốn tắt qua /thinking chứ không phải on).
+    #       KHÔNG suy ra effort từ budget_tokens của Anthropic vì 2 hệ đo
+    #       hoàn toàn khác nhau — token count vs effort level rời rạc,
+    #       không có công thức quy đổi chuẩn nào.
     #       summary="auto" là điều kiện BẮT BUỘC để server trả text đọc
     #       được (response.reasoning_summary_text.delta) — thiếu field này,
     #       response KHÔNG bao giờ có event reasoning nào cả (đã xác nhận
@@ -227,7 +233,14 @@ def _to_responses_payload(payload: dict) -> dict:
     # làm sau này.
     thinking = payload.get("thinking")
     if thinking and thinking.get("type") == "enabled":
-        out["reasoning"] = {"effort": "medium", "summary": "auto"}
+        try:
+            _effort = _reasoning_effort if (_reasoning_effort and _reasoning_effort != "none") else "medium"
+        except NameError:
+            # Fallback an toàn nếu module này được load trước 09_api_system.py
+            # (không nên xảy ra theo thứ tự load hiện tại — xem fw.py — nhưng
+            # tránh crash NameError nếu thứ tự đổi trong tương lai).
+            _effort = "medium"
+        out["reasoning"] = {"effort": _effort, "summary": "auto"}
     elif thinking and thinking.get("type") == "disabled":
         out["reasoning"] = {"effort": "none"}
 
