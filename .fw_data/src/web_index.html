@@ -46,15 +46,28 @@ body { font-family: "Inter", -apple-system, "Segoe UI", sans-serif; color: var(-
    2. LAYOUT
    ═══════════════════════════════════════════════════════════════════════ */
 #wrap { display: flex; flex-direction: column; height: 100vh; height: 100dvh; }
-#mainSplit { flex: 1 1 auto; display: flex; flex-direction: row; min-height: 0; overflow: hidden; }
+#mainSplit { flex: 1 1 auto; display: flex; flex-direction: row; min-height: 30vh; overflow: hidden; }
 #logScroll {
   flex: 0 1 100%; overflow-y: auto; -webkit-overflow-scrolling: touch;
-  scroll-behavior: smooth; transition: flex-basis .3s ease;
+  position: relative; transition: flex-basis .3s ease;
 }
 #log {
   padding: 12px; display: flex; flex-direction: column; gap: 8px;
   min-width: 0; min-height: 100%; font-size: 15px; line-height: 1.6;
 }
+
+/* Nút "cuộn xuống tin mới" — hiện khi người dùng đang xem lại (đã kéo lên) */
+#jumpToBottomBtn {
+  position: absolute; left: 50%; bottom: 14px; transform: translateX(-50%) translateY(8px);
+  display: flex; align-items: center; gap: 6px;
+  background: var(--bg-card); color: var(--text); border: 1px solid var(--border);
+  border-radius: 999px; padding: 7px 14px 7px 12px; font-size: 12.5px; font-weight: 600;
+  box-shadow: var(--shadow-lg); cursor: pointer; z-index: 5;
+  opacity: 0; pointer-events: none; transition: opacity .18s ease, transform .18s ease;
+}
+#jumpToBottomBtn.show { opacity: 1; pointer-events: auto; transform: translateX(-50%) translateY(0); }
+#jumpToBottomBtn:active { transform: translateX(-50%) translateY(0) scale(0.96); }
+#jumpToBottomBtn svg { flex: 0 0 auto; }
 
 /* ═══════════════════════════════════════════════════════════════════════
    3. HEADER BAR
@@ -119,6 +132,8 @@ body { font-family: "Inter", -apple-system, "Segoe UI", sans-serif; color: var(-
   content: ""; display: inline-block; width: 2px; height: 1em; margin-left: 2px;
   background: var(--accent); vertical-align: -2px; animation: blink 1s steps(1) infinite;
 }
+@keyframes streamFadeIn { from{opacity:0;transform:translateY(3px)} to{opacity:1;transform:translateY(0)} }
+.ai-body.streaming { animation: streamFadeIn .18s ease-out; }
 
 /* Links in bubbles */
 a.cw-chat-link { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; word-break: break-all; }
@@ -128,6 +143,99 @@ a.cw-chat-link:active { opacity: .7; }
 /* Image thumbnails in bubbles */
 .bubble-img-row { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
 .bubble-img-thumb { width: 80px; height: 80px; object-fit: cover; border-radius: var(--r-sm); border: 1px solid var(--border); }
+
+/* ═══════════════════════════════════════════════════════════════════════
+   MARKDOWN RENDERING (bubble AI)
+   ═══════════════════════════════════════════════════════════════════════ */
+.bubble.ai { white-space: normal; }
+.bubble.ai .md-p { margin: 0 0 8px; white-space: pre-wrap; word-break: break-word; }
+.bubble.ai .md-p:last-child { margin-bottom: 0; }
+.bubble.ai .md-h { margin: 14px 0 8px; line-height: 1.3; font-weight: 700; }
+.bubble.ai .md-h:first-child { margin-top: 0; }
+.bubble.ai h1.md-h { font-size: 1.25em; }
+.bubble.ai h2.md-h { font-size: 1.15em; }
+.bubble.ai h3.md-h { font-size: 1.06em; }
+.bubble.ai h4.md-h, .bubble.ai h5.md-h, .bubble.ai h6.md-h { font-size: 1em; color: var(--text-dim); }
+.bubble.ai .md-list { margin: 0 0 8px; padding-left: 22px; }
+.bubble.ai .md-list:last-child { margin-bottom: 0; }
+.bubble.ai .md-list li { margin: 3px 0; white-space: pre-wrap; word-break: break-word; }
+.bubble.ai .md-quote {
+  margin: 0 0 8px; padding: 6px 12px; border-left: 3px solid var(--accent);
+  background: var(--accent-light); color: var(--text-dim); border-radius: 0 var(--r-xs) var(--r-xs) 0;
+  white-space: pre-wrap;
+}
+.bubble.ai .md-hr { border: none; border-top: 1px solid var(--border); margin: 10px 0; }
+.bubble.ai code.inline-code {
+  font-family: "JetBrains Mono", monospace; font-size: 0.88em;
+  background: var(--bg-sunken); border: 1px solid var(--border-light);
+  padding: 1px 6px; border-radius: 5px; white-space: pre-wrap; word-break: break-word;
+}
+.bubble.ai .code-block {
+  margin: 4px 0 10px; border-radius: var(--r-sm); overflow: hidden;
+  border: 1px solid var(--border); background: #232016;
+}
+.bubble.ai .code-block:last-child { margin-bottom: 0; }
+.bubble.ai .code-block-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 6px 10px; background: #2c2818; border-bottom: 1px solid rgba(255,255,255,0.08);
+  user-select: none; -webkit-user-select: none;
+}
+.bubble.ai .code-lang {
+  font-family: "JetBrains Mono", monospace; font-size: 11px; letter-spacing: .02em;
+  color: #b9b19a; text-transform: lowercase;
+}
+.bubble.ai .code-copy-btn {
+  font-family: "Inter", sans-serif; font-size: 11px; font-weight: 600;
+  color: #d8d2c2; background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.12);
+  border-radius: var(--r-xs); padding: 3px 9px; cursor: pointer; transition: background .15s;
+}
+.bubble.ai .code-copy-btn:active { background: rgba(255,255,255,0.18); }
+.bubble.ai .code-copy-btn.copied { color: #d7e8c9; border-color: rgba(139,182,110,0.4); }
+.bubble.ai .code-block pre {
+  margin: 0; padding: 12px; overflow-x: auto; -webkit-overflow-scrolling: touch;
+}
+.bubble.ai .code-block code {
+  font-family: "JetBrains Mono", monospace; font-size: 12.5px; line-height: 1.55;
+  color: #eae5d6; white-space: pre;
+}
+.bubble.ai strong { font-weight: 700; }
+.bubble.ai em { font-style: italic; }
+.bubble.ai del { opacity: .6; text-decoration: line-through; }
+
+/* Task list (checkbox) */
+.bubble.ai .task-list { list-style: none; padding-left: 4px; }
+.bubble.ai .task-item { display: flex; align-items: flex-start; gap: 8px; list-style: none; }
+.bubble.ai .task-box {
+  flex: 0 0 auto; width: 16px; height: 16px; margin-top: 2px; border-radius: 4px;
+  border: 1.5px solid var(--border); display: inline-flex; align-items: center; justify-content: center;
+  font-size: 11px; line-height: 1; color: #fff; background: var(--bg-sunken);
+}
+.bubble.ai .task-box.checked { background: var(--accent); border-color: var(--accent); }
+.bubble.ai .task-done { text-decoration: line-through; color: var(--text-dim); }
+
+/* Nested lists */
+.bubble.ai .md-list .md-list { margin: 4px 0 0; }
+
+/* Bảng markdown */
+.bubble.ai .md-table-wrap {
+  margin: 4px 0 10px; overflow-x: auto; -webkit-overflow-scrolling: touch;
+  border: 1px solid var(--border); border-radius: var(--r-sm);
+}
+.bubble.ai .md-table-wrap:last-child { margin-bottom: 0; }
+.bubble.ai table.md-table {
+  border-collapse: collapse; width: 100%; font-size: 13.5px; min-width: max-content;
+}
+.bubble.ai table.md-table th, .bubble.ai table.md-table td {
+  padding: 7px 12px; border-bottom: 1px solid var(--border-light); text-align: left;
+  white-space: normal; word-break: break-word;
+}
+.bubble.ai table.md-table th {
+  background: var(--bg-sunken); font-weight: 700; color: var(--text);
+  border-bottom: 1px solid var(--border);
+}
+.bubble.ai table.md-table tr:last-child td { border-bottom: none; }
+.bubble.ai table.md-table tbody tr:nth-child(even) { background: rgba(0,0,0,0.015); }
+
 
 /* ═══════════════════════════════════════════════════════════════════════
    5. TOOL GROUPS & INFO CARDS
@@ -184,9 +292,33 @@ a.cw-chat-link:active { opacity: .7; }
 .info-card.think {
   background: var(--bg-sunken); border-left: 3px solid var(--accent-gold);
   color: var(--text-dim); font-style: italic;
+  padding: 10px 14px 8px;
 }
-.info-card.think .think-label { font-style: normal; font-weight: 600; color: var(--accent-gold); font-family: "JetBrains Mono", monospace; font-size: 12px; }
-.info-card.think .think-body { white-space: pre-wrap; }
+.info-card.think .think-label {
+  display: flex; align-items: center; gap: 6px;
+  font-style: normal; font-weight: 600; color: var(--accent-gold);
+  font-family: "JetBrains Mono", monospace; font-size: 12px; margin-bottom: 4px;
+}
+.think-viewport {
+  position: relative; max-height: 4.8em; overflow: hidden;
+  transition: max-height .25s ease; scroll-behavior: smooth;
+}
+.think-viewport::before {
+  content: ""; position: absolute; top: 0; left: 0; right: 0; height: 1.6em;
+  background: linear-gradient(to bottom, var(--bg-sunken) 15%, transparent 100%);
+  pointer-events: none; z-index: 1; opacity: 0; transition: opacity .2s ease;
+}
+.info-card.think.has-overflow .think-viewport::before { opacity: 1; }
+.info-card.think.expanded .think-viewport { max-height: none; }
+.info-card.think.expanded .think-viewport::before { opacity: 0; }
+.think-body { white-space: pre-wrap; line-height: 1.6; }
+.think-toggle {
+  display: none; margin-top: 6px; background: none; border: none; padding: 0;
+  font-family: "Inter", sans-serif; font-style: normal; font-size: 11px; font-weight: 600;
+  color: var(--accent-gold); cursor: pointer; opacity: .85;
+}
+.info-card.think.has-overflow .think-toggle { display: inline-block; }
+.think-toggle:active { opacity: .6; }
 
 /* ═══════════════════════════════════════════════════════════════════════
    6. ASK BOXES & MODEL PICKER
@@ -265,16 +397,17 @@ a.cw-chat-link:active { opacity: .7; }
    7. INPUT BAR & IMAGE PREVIEW
    ═══════════════════════════════════════════════════════════════════════ */
 #inputBar {
-  flex: 0 0 auto; display: flex; align-items: center; gap: 8px;
+  flex: 0 0 auto; display: flex; align-items: flex-end; gap: 8px;
   background: var(--bg-card); border-top: 1px solid var(--border);
   padding: 10px 12px calc(10px + env(safe-area-inset-bottom, 0px));
   position: relative;
 }
 #inputField {
   flex: 1; min-width: 0; background: var(--bg-input);
-  border: 1px solid var(--border); border-radius: 24px; outline: none;
-  color: var(--text); font-family: inherit; font-size: 16px;
-  padding: 12px 18px; height: 48px;
+  border: 1px solid var(--border); border-radius: 22px; outline: none;
+  color: var(--text); font-family: inherit; font-size: 16px; line-height: 1.4;
+  padding: 12px 18px; min-height: 48px; max-height: min(9.8em, 32vh);
+  resize: none; overflow-y: auto; -webkit-overflow-scrolling: touch;
   transition: border-color .15s, box-shadow .15s;
 }
 #inputField:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-light); }
@@ -529,7 +662,7 @@ body.codeweb-mode #inputBar {
   background: var(--bg-card); border: 1px solid var(--border);
   border-radius: 24px; box-shadow: var(--shadow-lg);
 }
-body.codeweb-mode #inputField { grid-column: 1/-1; grid-row: 1; height: 42px; padding: 7px 9px; border: 0; border-radius: 12px; background: transparent; box-shadow: none; }
+body.codeweb-mode #inputField { grid-column: 1/-1; grid-row: 1; min-height: 42px; max-height: min(8em, 26vh); padding: 7px 9px; border: 0; border-radius: 12px; background: transparent; box-shadow: none; }
 body.codeweb-mode #inputField:focus { border: 0; box-shadow: none; }
 body.codeweb-mode #ctrlBtn { grid-column: 1; grid-row: 2; }
 body.codeweb-mode #imgBtn { grid-column: 2; grid-row: 2; }
@@ -587,7 +720,12 @@ body.codeweb-mode #imgPreviewBar {
     <div id="meta"></div>
   </div>
   <div id="mainSplit">
-    <div id="logScroll"><div id="log"></div></div>
+    <div id="logScroll"><div id="log"></div>
+      <button id="jumpToBottomBtn" type="button" title="Xuống tin nhắn mới nhất">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12l7 7 7-7"/></svg>
+        Tin mới
+      </button>
+    </div>
     <div id="codewebResizer" title="Kéo để đổi tỉ lệ"><div id="codewebResizerGrip"></div></div>
     <div id="codewebPane">
       <div id="codewebToolbar">
@@ -627,8 +765,8 @@ body.codeweb-mode #imgPreviewBar {
         <rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/>
       </svg>
     </button>
-    <input id="inputField" autocomplete="off" autocapitalize="off" autocorrect="off"
-           spellcheck="false" placeholder="Gõ lệnh hoặc tin nhắn…" />
+    <textarea id="inputField" autocomplete="off" autocapitalize="off" autocorrect="off"
+           spellcheck="false" rows="1" placeholder="Gõ lệnh hoặc tin nhắn…"></textarea>
     <button id="sendBtn" title="Gửi" aria-label="Gửi">
       <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
     </button>
@@ -649,6 +787,7 @@ body.codeweb-mode #imgPreviewBar {
    ═══════════════════════════════════════════════════════════════════════ */
 const logEl = document.getElementById("log");
 const scrollEl = document.getElementById("logScroll");
+const jumpBtn = document.getElementById("jumpToBottomBtn");
 const dot = document.getElementById("dot");
 const statusText = document.getElementById("statusText");
 const metaEl = document.getElementById("meta");
@@ -693,14 +832,13 @@ let currentGroup = null;
 let curTextRow = null;
 let curThinkRow = null;
 let curTextRaw = "";
+let curThinkRaw = "";
+let curTextRaf = null, curTextDirty = false;
+let curThinkRaf = null, curThinkDirty = false;
 
 let busyRow = null;
 let isBusy = false;
 let modelPickerLocked = false;
-
-let scrollRaf = null;
-let _autoScrolling = false;
-let _autoScrollSettleTimer = null;
 
 // Live slot
 const MIN_LIVE_MS = 550;
@@ -757,13 +895,271 @@ function linkifyHtml(escapedText) {
   });
 }
 
+// Markdown mở rộng (không phụ thuộc thư viện ngoài) → HTML cho tin nhắn AI
+// Hỗ trợ đủ kiểu output khác nhau của Solar / DeepSeek / Qwen / GLM / GPT / Gemini / model nhỏ khác:
+// bold/italic/strike, inline code, heading, ul/ol lồng nhau, task list, blockquote,
+// bảng, code fence (kể cả chưa đóng do đang stream), code thụt lề 4 space, hr, link, <br> thô.
+function mdInlineToHtml(escapedText) {
+  let s = escapedText;
+  // inline code `code` (ưu tiên trước để không bị bold/italic ăn vào bên trong)
+  s = s.replace(/`([^`\n]+)`/g, (_, code) => `<code class="inline-code">${code}</code>`);
+  // bold+italic ***text*** hoặc ___text___
+  s = s.replace(/\*\*\*([^*\n]+)\*\*\*/g, "<strong><em>$1</em></strong>");
+  s = s.replace(/___([^_\n]+)___/g, "<strong><em>$1</em></strong>");
+  // bold **text** hoặc __text__
+  s = s.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
+  s = s.replace(/__([^_\n]+)__/g, "<strong>$1</strong>");
+  // strikethrough ~~text~~
+  s = s.replace(/~~([^~\n]+)~~/g, "<del>$1</del>");
+  // italic *text* hoặc _text_ (tránh đụng bullet "* " hoặc "**")
+  s = s.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, "$1<em>$2</em>");
+  s = s.replace(/(^|[^_a-zA-Z0-9])_([^_\n]+)_(?!_)/g, "$1<em>$2</em>");
+  // <br> thô mà model đôi khi chèn thẳng (đã escape thành &lt;br&gt;) → xuống dòng thật
+  s = s.replace(/&lt;br\s*\/?&gt;/gi, "<br/>");
+  return linkifyHtml(s);
+}
+
+function escLangClass(lang) {
+  return String(lang || "").toLowerCase().replace(/[^a-z0-9+#-]/g, "");
+}
+
+// Nhãn hiển thị đẹp cho vài ngôn ngữ hay gặp
+const LANG_DISPLAY = {
+  js: "javascript", ts: "typescript", py: "python", sh: "bash", shell: "bash",
+  yml: "yaml", md: "markdown", "c++": "cpp", "c#": "csharp", jsx: "jsx", tsx: "tsx",
+};
+function langDisplayName(lang) {
+  const l = String(lang || "").trim().toLowerCase();
+  if (!l) return "code";
+  return LANG_DISPLAY[l] || l;
+}
+
+function renderCodeBlock(lang, code) {
+  code = code.replace(/\n$/, "");
+  const langClass = escLangClass(lang);
+  const codeEsc = escapeHtml(code);
+  return `<div class="code-block${langClass ? " lang-" + langClass : ""}">` +
+         `<div class="code-block-head"><span class="code-lang">${escapeHtml(langDisplayName(lang))}</span>` +
+         `<button type="button" class="code-copy-btn" onclick="cwCopyCode(this)">Copy</button></div>` +
+         `<pre class="mono"><code>${codeEsc}</code></pre></div>`;
+}
+
+// Parse một bảng markdown bắt đầu tại lines[startIdx]. Trả về {html, nextIdx} hoặc null nếu không phải bảng.
+function tryParseTable(lines, startIdx) {
+  const isRow = (l) => /^\s*\|.*\|\s*$/.test(l) || (l.includes("|") && l.trim() !== "");
+  const headerLine = lines[startIdx];
+  const sepLine = lines[startIdx + 1];
+  if (!headerLine || !sepLine) return null;
+  if (!headerLine.includes("|")) return null;
+  if (!/^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/.test(sepLine)) return null;
+
+  const splitRow = (l) => {
+    let t = l.trim();
+    if (t.startsWith("|")) t = t.slice(1);
+    if (t.endsWith("|")) t = t.slice(0, -1);
+    return t.split("|").map(c => c.trim());
+  };
+  const aligns = splitRow(sepLine).map(c => {
+    const left = c.startsWith(":"), right = c.endsWith(":");
+    if (left && right) return "center"; if (right) return "right"; if (left) return "left"; return "";
+  });
+  const headers = splitRow(headerLine);
+  let idx = startIdx + 2;
+  const rows = [];
+  while (idx < lines.length && isRow(lines[idx]) && lines[idx].trim() !== "") {
+    rows.push(splitRow(lines[idx])); idx++;
+  }
+  let html = '<div class="md-table-wrap"><table class="md-table"><thead><tr>';
+  headers.forEach((h, i) => {
+    const al = aligns[i] ? ` style="text-align:${aligns[i]}"` : "";
+    html += `<th${al}>${mdInlineToHtml(escapeHtml(h))}</th>`;
+  });
+  html += "</tr></thead><tbody>";
+  rows.forEach(r => {
+    html += "<tr>";
+    headers.forEach((_, i) => {
+      const al = aligns[i] ? ` style="text-align:${aligns[i]}"` : "";
+      html += `<td${al}>${mdInlineToHtml(escapeHtml(r[i] ?? ""))}</td>`;
+    });
+    html += "</tr>";
+  });
+  html += "</tbody></table></div>";
+  return { html, nextIdx: idx };
+}
+
+function markdownToHtml(raw) {
+  const src = String(raw ?? "");
+  // Tách theo code fence ``` hoặc ~~~ trước, để không markdown-hoá bên trong code block.
+  // Regex bắt cả fence chưa đóng (model đang stream dở) nhờ nhóm cuối optional.
+  const FENCE_RE = /(?:```|~~~)([^\n]*)\n([\s\S]*?)(?:```|~~~|$)/g;
+  let out = "";
+  let lastIndex = 0;
+  let m;
+  while ((m = FENCE_RE.exec(src)) !== null) {
+    const before = src.slice(lastIndex, m.index);
+    out += renderMdBlocks(before);
+    out += renderCodeBlock(m[1], m[2]);
+    lastIndex = FENCE_RE.lastIndex;
+  }
+  out += renderMdBlocks(src.slice(lastIndex));
+  return out;
+}
+
+function renderMdBlocks(text) {
+  const lines = text.split("\n");
+  let html = "";
+  let quoteBuf = [];
+  let paraBuf = [];
+
+  function flushQuote() {
+    if (quoteBuf.length) {
+      html += `<blockquote class="md-quote">${mdInlineToHtml(escapeHtml(quoteBuf.join(" ")))}</blockquote>`;
+      quoteBuf = [];
+    }
+  }
+  function flushPara() {
+    if (paraBuf.length) {
+      html += `<p class="md-p">${mdInlineToHtml(escapeHtml(paraBuf.join("\n")))}</p>`;
+      paraBuf = [];
+    }
+  }
+
+  // Gom một khối list (thường + task, có thể lồng nhau qua thụt lề) thành cây rồi render đúng chuẩn HTML
+  function isListLine(l) {
+    return /^(\s*)\d+[.)]\s+.*$/.test(l) || /^(\s*)[-*+]\s+.*$/.test(l);
+  }
+  function parseListItem(l) {
+    let m = l.match(/^(\s*)[-*+]\s+\[( |x|X)\]\s+(.*)$/);
+    if (m) return { indent: m[1].length, type: "ul", task: true, checked: /x/i.test(m[2]), content: m[3] };
+    m = l.match(/^(\s*)\d+[.)]\s+(.*)$/);
+    if (m) return { indent: m[1].length, type: "ol", task: false, content: m[2] };
+    m = l.match(/^(\s*)[-*+]\s+(.*)$/);
+    if (m) return { indent: m[1].length, type: "ul", task: false, content: m[2] };
+    return null;
+  }
+  function renderListItems(items) {
+    // items: flat array with .indent, builds nested <ul>/<ol> using a stack-based tree
+    let out = "";
+    let stack = []; // {type, indent, hasTask}
+    for (let k = 0; k < items.length; k++) {
+      const it = items[k];
+      while (stack.length && it.indent < stack[stack.length - 1].indent) {
+        out += "</li>"; out += stack.pop().type === "ol" ? "</ol>" : "</ul>";
+      }
+      if (!stack.length || it.indent > stack[stack.length - 1].indent) {
+        out += it.type === "ol" ? '<ol class="md-list">' : `<ul class="md-list${it.task ? " task-list" : ""}">`;
+        stack.push({ type: it.type, indent: it.indent });
+      } else if (it.indent === stack[stack.length - 1].indent) {
+        if (stack[stack.length - 1].type !== it.type) {
+          out += "</" + (stack.pop().type === "ol" ? "ol" : "ul") + ">";
+          out += it.type === "ol" ? '<ol class="md-list">' : `<ul class="md-list${it.task ? " task-list" : ""}">`;
+          stack.push({ type: it.type, indent: it.indent });
+        } else {
+          out += "</li>";
+        }
+      }
+      if (it.task) {
+        out += `<li class="task-item"><span class="task-box${it.checked ? " checked" : ""}">${it.checked ? "✓" : ""}</span><span class="${it.checked ? "task-done" : ""}">${mdInlineToHtml(escapeHtml(it.content))}</span>`;
+      } else {
+        out += `<li>${mdInlineToHtml(escapeHtml(it.content))}`;
+      }
+    }
+    while (stack.length) { out += "</li>"; out += stack.pop().type === "ol" ? "</ol>" : "</ul>"; }
+    return out;
+  }
+
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+
+    // Bảng markdown
+    const table = tryParseTable(lines, i);
+    if (table) {
+      flushPara(); flushQuote();
+      html += table.html; i = table.nextIdx; continue;
+    }
+
+    // Khối list liên tiếp (kể cả lồng nhau qua thụt lề) → gom hết rồi render 1 lần
+    if (isListLine(line)) {
+      flushPara(); flushQuote();
+      const items = [];
+      let j = i;
+      while (j < lines.length && (isListLine(lines[j]) || (lines[j].trim() !== "" && /^\s+/.test(lines[j]) && items.length))) {
+        const item = parseListItem(lines[j]);
+        if (item) { items.push(item); j++; }
+        else break;
+      }
+      html += renderListItems(items);
+      i = j; continue;
+    }
+
+    const heading = line.match(/^(#{1,6})\s+(.*)$/);
+    const hr = line.match(/^\s*([-*_])\s*(?:\1\s*){2,}$/);
+    const indentedCode = line.match(/^(?: {4}|\t)(.*)$/);
+
+    if (heading) {
+      flushPara(); flushQuote();
+      const level = Math.min(heading[1].length, 6);
+      html += `<h${level} class="md-h">${mdInlineToHtml(escapeHtml(heading[2]))}</h${level}>`;
+      i++; continue;
+    }
+    if (hr) {
+      flushPara(); flushQuote();
+      html += `<hr class="md-hr"/>`;
+      i++; continue;
+    }
+    const quote = line.match(/^\s*>\s?(.*)$/);
+    if (quote) {
+      flushPara();
+      quoteBuf.push(quote[1]);
+      i++; continue;
+    }
+    if (indentedCode && paraBuf.length === 0) {
+      // Block code thụt lề 4 space (không có ```), gom các dòng liên tiếp
+      flushQuote();
+      const codeLines = [indentedCode[1]];
+      let j = i + 1;
+      while (j < lines.length && /^(?: {4}|\t)/.test(lines[j])) {
+        codeLines.push(lines[j].replace(/^(?: {4}|\t)/, "")); j++;
+      }
+      html += renderCodeBlock("", codeLines.join("\n"));
+      i = j; continue;
+    }
+    if (line.trim() === "") {
+      flushPara(); flushQuote();
+      i++; continue;
+    }
+    // dòng văn bản thường → gom vào đoạn văn hiện tại
+    flushQuote();
+    paraBuf.push(line);
+    i++;
+  }
+  flushPara(); flushQuote();
+  return html;
+}
+
+function cwCopyCode(btn) {
+  const block = btn.closest(".code-block");
+  const codeEl = block && block.querySelector("code");
+  if (!codeEl) return;
+  const text = codeEl.textContent;
+  const done = () => { const old = btn.textContent; btn.textContent = "Copied!"; btn.classList.add("copied"); setTimeout(() => { btn.textContent = old; btn.classList.remove("copied"); }, 1200); };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(done).catch(done);
+  } else {
+    const ta = document.createElement("textarea"); ta.value = text; document.body.appendChild(ta);
+    ta.select(); try { document.execCommand("copy"); } catch (e) {} document.body.removeChild(ta);
+    done();
+  }
+}
+
 // ANSI → HTML
 function xterm256ToHex(n) {
   n = Number(n);
   if (Number.isNaN(n)) return null;
   if (n < 16) {
-    const basic = ["#000000","#800000","#008000","#808000","#000080","#800080","#008080","#c0c0c0",
-                    "#808080","#ff0000","#00ff00","#ffff00","#0000ff","#ff00ff","#00ffff","#ffffff"];
+    const basic = ["#000000","#800000","#008000","#808000","#4a5a72","#800080","#008080","#c0c0c0",
+                    "#808080","#ff0000","#00ff00","#ffff00","#6b85a8","#ff00ff","#00ffff","#ffffff"];
     return basic[n];
   }
   if (n <= 231) {
@@ -825,21 +1221,71 @@ function isNearBottom() {
   return scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight < 120;
 }
 
-function scrollToBottom(opts) {
-  const force = opts && opts.force;
-  const smooth = !opts || opts.smooth !== false;
-  if (!force && !_autoScrolling && !isNearBottom()) return;
-  _autoScrolling = true;
-  if (scrollRaf) cancelAnimationFrame(scrollRaf);
-  if (_autoScrollSettleTimer) clearTimeout(_autoScrollSettleTimer);
-  scrollRaf = requestAnimationFrame(() => {
-    scrollEl.scrollTo({ top: scrollEl.scrollHeight, behavior: smooth ? "smooth" : "auto" });
-  });
-  _autoScrollSettleTimer = setTimeout(() => { _autoScrolling = false; }, 500);
+// ── Auto-scroll "pinned to bottom" ──────────────────────────────────────
+// Nguyên tắc: chỉ tự cuộn khi có DÒNG MỚI thật sự (chiều cao nội dung tăng),
+// không cuộn theo từng ký tự delta. Nếu người dùng đã tự kéo lên xem lại,
+// ngưng hẳn auto-scroll cho tới khi họ tự kéo về gần đáy hoặc bấm nút "↓ mới".
+let isPinned = true;
+let lastScrollHeight = 0;
+let scrollAnimId = null;
+
+function animateScrollTo(targetTop, duration) {
+  if (scrollAnimId) cancelAnimationFrame(scrollAnimId);
+  const startTop = scrollEl.scrollTop;
+  const delta = targetTop - startTop;
+  if (Math.abs(delta) < 1) return;
+  const startTime = performance.now();
+  function step(now) {
+    const t = Math.min(1, (now - startTime) / duration);
+    const eased = 1 - Math.pow(1 - t, 3); // ease-out cubic, mượt và không giật
+    scrollEl.scrollTop = startTop + delta * eased;
+    if (t < 1) { scrollAnimId = requestAnimationFrame(step); }
+    else { scrollAnimId = null; }
+  }
+  scrollAnimId = requestAnimationFrame(step);
 }
 
-scrollEl.addEventListener("wheel", () => { _autoScrolling = false; }, { passive: true });
-scrollEl.addEventListener("touchmove", () => { _autoScrolling = false; }, { passive: true });
+// Gọi khi có nội dung mới được thêm vào log (bubble mới, dòng mới trong stream…).
+// Chỉ thực sự cuộn nếu đang pinned VÀ chiều cao nội dung có tăng (dòng mới thật sự).
+function scrollToBottom(opts) {
+  const force = opts && opts.force;
+  const instant = opts && opts.instant;
+  if (force) isPinned = true;
+  const newHeight = scrollEl.scrollHeight;
+  const grew = newHeight > lastScrollHeight;
+  lastScrollHeight = newHeight;
+  updateJumpToBottomBtn();
+  if (!isPinned) return; // user đang xem lại → không đụng vào scroll của họ
+  if (!grew && !force) return; // không có dòng mới thật sự thì khỏi cuộn
+  const target = scrollEl.scrollHeight - scrollEl.clientHeight;
+  if (instant) { if (scrollAnimId) cancelAnimationFrame(scrollAnimId); scrollEl.scrollTop = target; }
+  else animateScrollTo(target, 220);
+}
+
+function updateJumpToBottomBtn() {
+  if (!jumpBtn) return;
+  jumpBtn.classList.toggle("show", !isPinned);
+}
+
+function jumpToBottom() {
+  isPinned = true;
+  if (scrollAnimId) cancelAnimationFrame(scrollAnimId);
+  scrollEl.scrollTop = scrollEl.scrollHeight - scrollEl.clientHeight;
+  updateJumpToBottomBtn();
+}
+
+// User tự kéo → nếu họ rời khỏi đáy, unpin (ngưng hẳn auto-scroll cho tới khi quay lại đáy)
+let scrollUserIntentTimer = null;
+scrollEl.addEventListener("scroll", () => {
+  if (scrollUserIntentTimer) clearTimeout(scrollUserIntentTimer);
+  scrollUserIntentTimer = setTimeout(() => {
+    isPinned = isNearBottom();
+    updateJumpToBottomBtn();
+  }, 60);
+}, { passive: true });
+scrollEl.addEventListener("wheel", () => { isPinned = false; if (scrollAnimId) cancelAnimationFrame(scrollAnimId); }, { passive: true });
+scrollEl.addEventListener("touchstart", () => { isPinned = false; if (scrollAnimId) cancelAnimationFrame(scrollAnimId); }, { passive: true });
+if (jumpBtn) jumpBtn.addEventListener("click", jumpToBottom);
 
 /* ═══════════════════════════════════════════════════════════════════════
    5. ANIMATION CLEANUP
@@ -891,7 +1337,7 @@ function ensureTurnToggle(logsEl) {
     const open = logsEl.classList.toggle("open");
     btn.classList.toggle("open", open);
     syncTurnToggleLabel(btn);
-    if (open) scrollToBottom();
+    if (open) scrollToBottom({ force: true });
   });
   row.appendChild(btn);
   logEl.appendChild(row);
@@ -1041,15 +1487,29 @@ function resetStreamRows() {
     const body = curTextRow.querySelector(".ai-body");
     if (body) body.classList.remove("streaming");
   }
-  curTextRow = null; curThinkRow = null; curTextRaw = "";
+  if (curTextRaf) { cancelAnimationFrame(curTextRaf); curTextRaf = null; }
+  if (curThinkRaf) { cancelAnimationFrame(curThinkRaf); curThinkRaf = null; }
+  curTextRow = null; curThinkRow = null; curTextRaw = ""; curThinkRaw = "";
+  curTextDirty = false; curThinkDirty = false;
 }
 
 function appendTextDelta(text) {
-  if (!curTextRow) { curTextRow = appendBubble('<span class="ai-body streaming"></span>', "ai"); curTextRaw = ""; }
+  if (!curTextRow) { curTextRow = appendBubble('<span class="ai-body streaming"></span>', "ai"); curTextRaw = ""; curTextDirty = false; }
   curTextRaw += text;
-  const body = curTextRow.querySelector(".ai-body");
-  body.innerHTML = linkifyHtml(escapeHtml(curTextRaw));
-  scrollToBottom({ smooth: false });
+  scheduleTextFlush();
+}
+
+function scheduleTextFlush() {
+  curTextDirty = true;
+  if (curTextRaf) return;
+  curTextRaf = requestAnimationFrame(() => {
+    curTextRaf = null;
+    if (!curTextDirty || !curTextRow) return;
+    curTextDirty = false;
+    const body = curTextRow.querySelector(".ai-body");
+    if (body) body.innerHTML = markdownToHtml(curTextRaw);
+    scrollToBottom();
+  });
 }
 
 function appendThinkingDelta(text) {
@@ -1057,11 +1517,46 @@ function appendThinkingDelta(text) {
     currentGroup = null;
     const div = document.createElement("div");
     div.className = "row info-card think";
-    div.innerHTML = '<span class="think-label">[thinking] </span><span class="think-body"></span>';
+    div.innerHTML = '<div class="think-label"><span>[thinking]</span></div>'
+      + '<div class="think-viewport"><div class="think-body"></div></div>'
+      + '<button type="button" class="think-toggle" onclick="toggleThinkCard(this)">Xem đầy đủ</button>';
     logEl.appendChild(div); scrollToBottom({ force: true }); curThinkRow = div;
   }
-  curThinkRow.querySelector(".think-body").textContent += text;
-  scrollToBottom({ smooth: false });
+  curThinkRaw += text;
+  scheduleThinkFlush();
+}
+
+function scheduleThinkFlush() {
+  curThinkDirty = true;
+  if (curThinkRaf) return;
+  curThinkRaf = requestAnimationFrame(() => {
+    curThinkRaf = null;
+    if (!curThinkDirty || !curThinkRow) return;
+    curThinkDirty = false;
+    const bodyEl = curThinkRow.querySelector(".think-body");
+    if (bodyEl) bodyEl.textContent = curThinkRaw;
+    updateThinkOverflow(curThinkRow);
+  });
+}
+
+function updateThinkOverflow(card) {
+  const viewport = card.querySelector(".think-viewport");
+  if (!viewport) return;
+  const overflowing = viewport.scrollHeight > viewport.clientHeight + 1;
+  card.classList.toggle("has-overflow", overflowing);
+  // Luôn giữ dòng mới nhất hiện ra ở đáy khung, trừ khi người dùng đang mở rộng xem toàn bộ
+  if (!card.classList.contains("expanded")) viewport.scrollTop = viewport.scrollHeight;
+}
+
+function toggleThinkCard(btn) {
+  const card = btn.closest(".info-card.think");
+  if (!card) return;
+  const expanded = card.classList.toggle("expanded");
+  btn.textContent = expanded ? "Thu gọn" : "Xem đầy đủ";
+  if (!expanded) {
+    const viewport = card.querySelector(".think-viewport");
+    if (viewport) viewport.scrollTop = viewport.scrollHeight;
+  }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -1163,7 +1658,10 @@ function handleEvent(msg) {
     if (body) body.classList.remove("streaming");
     curTextRow = null;
   }
-  if (t !== "thinking_delta") curThinkRow = null;
+  if (t !== "thinking_delta" && curThinkRow) {
+    if (curThinkRaf) { cancelAnimationFrame(curThinkRaf); curThinkRaf = null; }
+    curThinkRow = null; curThinkRaw = ""; curThinkDirty = false;
+  }
 
   switch (t) {
     case "session_init":
@@ -1266,7 +1764,7 @@ function renderHistory(messages) {
       if (content.startsWith("[")) continue;
       appendBubble(linkifyHtml(escapeHtml(content)), "user");
     } else if (m.role === "assistant") {
-      appendBubble(linkifyHtml(escapeHtml(content)), "ai");
+      appendBubble(markdownToHtml(content), "ai");
     }
   }
 }
@@ -1445,7 +1943,7 @@ function renderSlashHint() {
 
 function applySlashChoice(cmd) {
   inputField.value = cmd.includes(" ") ? cmd : cmd + " ";
-  closeSlashHint(); inputField.focus();
+  closeSlashHint(); inputField.focus(); autoResizeInput();
 }
 
 function closeSlashHint() { slashMatches = []; slashActiveIdx = -1; renderSlashHint(); }
@@ -2112,7 +2610,7 @@ function sendLine() {
   if (isBusy || modelPickerLocked) return;
   const val = inputField.value, images = pendingImages;
   if (!val && images.length === 0) return;
-  inputField.value = ""; closeSlashHint();
+  inputField.value = ""; closeSlashHint(); autoResizeInput();
   let bubbleHtml = escapeHtml(val);
   if (images.length > 0) {
     const thumbs = images.map(img => `<img src="data:${img.mime};base64,${img.data}" class="bubble-img-thumb" alt="image"/>`).join("");
@@ -2122,6 +2620,11 @@ function sendLine() {
   const payload = { type: "input", value: val };
   if (images.length > 0) payload.images = images.map(img => ({ mime: img.mime, data: img.data }));
   sendJson(payload); clearPendingImages();
+}
+
+function autoResizeInput() {
+  inputField.style.height = "auto";
+  inputField.style.height = inputField.scrollHeight + "px";
 }
 
 sendBtn.addEventListener("click", sendLine);
@@ -2134,9 +2637,9 @@ inputField.addEventListener("keydown", (e) => {
     }
     if (e.key === "Escape") { closeSlashHint(); return; }
   }
-  if (e.key === "Enter") { e.preventDefault(); sendLine(); }
+  // Enter luôn xuống dòng như bình thường. Chỉ nút Gửi mới gửi tin nhắn.
 });
-inputField.addEventListener("input", updateSlashHint);
+inputField.addEventListener("input", () => { updateSlashHint(); autoResizeInput(); });
 inputField.addEventListener("blur", () => setTimeout(closeSlashHint, 150));
 ctrlBtn.addEventListener("click", () => sendJson({ type: "interrupt" }));
 
