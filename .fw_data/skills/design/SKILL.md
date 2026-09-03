@@ -1,9 +1,17 @@
 ---
 name: design
-description: Thiết kế visual/UI từ đầu khi chưa có design system sẵn có — chọn palette, typography, layout có chủ đích, tránh rơi vào 3 look mặc định mà AI hay tạo ra. Dùng khi task là tạo landing page, dashboard mới, brand mới, hoặc bất kỳ UI nào cần một identity riêng — không phải khi đang match design system có sẵn (đó là `frontend-work`) hoặc xuất ra Canva/PPTX (đó là `canva`).
+description: Thiết kế hoặc xây dựng UI, gồm 2 nhánh — (1) chưa có design system: chọn palette, typography, layout có chủ đích, tránh 3 look mặc định AI hay tạo ra; (2) đã có design system/component pattern sẵn: match đúng pattern hiện có, không bịa style mới. Dùng khi task là landing page, dashboard, brand mới, hoặc bất kỳ UI/frontend nào — không phải khi xuất ra Canva/PPTX (đó là `canva`).
 ---
 
 # Design
+
+**Trước tiên xác định nhánh**: project đã có design system/component pattern
+sẵn (theme, design tokens, component library đang dùng nhất quán) hay chưa?
+- **Chưa có** → làm theo toàn bộ phần dưới đây (tạo identity mới từ đầu).
+- **Đã có** → bỏ qua phần dưới, dùng ngay mục "Khi đã có design system sẵn
+  (match, không tạo mới)" ở cuối file.
+
+## Khi chưa có design system sẵn (tạo mới)
 
 Tiếp cận như một creative lead ở studio nhỏ, nơi mỗi client nhận một visual
 identity không lẫn với ai khác. Client đã từng từ chối những đề xuất "nhìn
@@ -137,10 +145,24 @@ tông giọng khớp với brand và đối tượng. Mỗi thành phần chỉ 
 — label thì label, ví dụ thì minh họa, không có gì âm thầm làm 2 việc cùng
 lúc.
 
+## Khi đã có design system sẵn (match, không tạo mới)
+
+Khi building hoặc sửa UI trong project đã có design system/component pattern
+riêng:
+- Match đúng design system và component pattern đã có sẵn trước khi bịa
+  style mới.
+- Build màn hình thực sự dùng được, không phải trang marketing, trừ khi
+  được yêu cầu.
+- Đảm bảo layout responsive, không chữ đè nhau, kích thước control ổn định,
+  và độ tương phản đạt chuẩn accessibility.
+- Dùng icon/component library đã có sẵn trong project thay vì tự tạo mới.
+- Verify bằng dev server bình thường của app hoặc bằng cách kiểm tra
+  visual/static hẹp nhất có sẵn (`verify`, xem mục Verification Strategy ở
+  `skill(name="verification")`). Nếu không verify được bằng hình ảnh, nói rõ
+  điều đó.
+
 ## Liên hệ với các skill khác
 
-- Nếu task là **match design system đã có sẵn** trong project thay vì tạo
-  mới → dùng `skill(name="frontend-work")` thay vì skill này.
 - Nếu output cuối cùng cần dạng **Canva-ready hoặc PPTX** → sau khi có
   hướng thiết kế từ skill này, chuyển sang `skill(name="canva")` để tạo
   file thực tế.
