@@ -1,3 +1,8 @@
+---
+name: spec-driven
+description: Bốn câu hỏi làm rõ mục tiêu thật, ranh giới, case biên và cách verify trước khi sửa code trên diện rộng. Dùng khi task đủ lớn/mơ hồ để việc hiểu sai ý định tốn công hơn dừng lại làm rõ trước — task lớn, nhiều module, hoặc phạm vi chưa rõ.
+---
+
 # Spec-driven thinking
 
 Dùng khi task đủ lớn/mơ hồ để việc "hiểu sai ý định" tốn nhiều công hơn việc dừng lại
