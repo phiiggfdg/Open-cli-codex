@@ -236,6 +236,37 @@ a.cw-chat-link:active { opacity: .7; }
 .bubble.ai table.md-table tr:last-child td { border-bottom: none; }
 .bubble.ai table.md-table tbody tr:nth-child(even) { background: rgba(0,0,0,0.015); }
 
+/* Ảnh markdown ![alt](url) */
+.bubble.ai .md-img { max-width: 100%; display: block; margin: 4px 0 8px; border-radius: var(--r-sm); border: 1px solid var(--border); }
+.bubble.ai .md-img:last-child { margin-bottom: 0; }
+
+/* Biểu đồ ```chart``` (bar / line / pie / donut) — tự vẽ SVG, không cần thư viện ngoài */
+.bubble.ai .chart-block {
+  margin: 4px 0 10px; border-radius: var(--r-sm); overflow: hidden;
+  border: 1px solid var(--border); background: #232016;
+}
+.bubble.ai .chart-block:last-child { margin-bottom: 0; }
+.bubble.ai .chart-block-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 6px 10px; background: #2c2818; border-bottom: 1px solid rgba(255,255,255,0.08);
+}
+.bubble.ai .chart-title { font-family: "Inter", sans-serif; font-size: 12px; font-weight: 600; color: #d8d2c2; }
+.bubble.ai .chart-type-badge {
+  font-family: "JetBrains Mono", monospace; font-size: 10px; letter-spacing: .03em;
+  color: #b9b19a; text-transform: uppercase; background: rgba(255,255,255,0.06);
+  padding: 2px 7px; border-radius: 999px;
+}
+.bubble.ai .chart-body { padding: 10px 12px 12px; }
+.bubble.ai .chart-svg { width: 100%; height: auto; display: block; overflow: visible; }
+.bubble.ai .chart-axis-label { font-family: "Inter", sans-serif; font-size: 9.5px; fill: #b9b19a; }
+.bubble.ai .chart-legend { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px; }
+.bubble.ai .chart-legend-item {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-family: "Inter", sans-serif; font-size: 11.5px; color: #d8d2c2;
+}
+.bubble.ai .chart-legend-item i { width: 9px; height: 9px; border-radius: 2px; display: inline-block; }
+.bubble.ai .chart-legend-item b { color: #eae5d6; font-weight: 700; }
+
 
 /* ═══════════════════════════════════════════════════════════════════════
    5. TOOL GROUPS & INFO CARDS
@@ -294,6 +325,9 @@ a.cw-chat-link:active { opacity: .7; }
   color: var(--text-dim); font-style: italic;
   padding: 10px 14px 8px;
 }
+/* Khi nằm trong nhóm gộp (turn-logs), đổi nền để tương phản với nền sunken của khung cha,
+   giống cách .tool-group đã làm — tránh bị "chìm" mất viền khi gộp chung 1 card. */
+.turn-logs-inner .info-card.think { background: var(--bg-card); }
 .info-card.think .think-label {
   display: flex; align-items: center; gap: 6px;
   font-style: normal; font-weight: 600; color: var(--accent-gold);
@@ -885,24 +919,37 @@ function escapeHtml(s) {
 
 const CW_TRAILING_PUNCT_RE = /[.,;:!?)\]}'\"]+$/;
 function linkifyHtml(escapedText) {
-  return String(escapedText ?? "").replace(/https?:\/\/[^\s<>"'`*]+/g, (url) => {
+  // Nhóm ký tự đứng trước để tránh bắt nhầm URL đã nằm trong href="..."/src="..." (do
+  // markdown link/ảnh sinh ra trước đó) — nếu không sẽ lồng thẻ <a> vào trong thuộc tính, vỡ HTML.
+  return String(escapedText ?? "").replace(/(^|[^"])(https?:\/\/[^\s<>"'`*]+)/g, (_, pre, url) => {
     let trailing = "";
     const m = url.match(CW_TRAILING_PUNCT_RE);
     if (m) { trailing = m[0]; url = url.slice(0, -trailing.length); }
-    if (!url) return url + trailing;
+    if (!url) return pre + url + trailing;
     const hrefSafe = url.replace(/"/g, "&quot;");
-    return `<a href="${hrefSafe}" class="cw-chat-link" data-cw-link="1" target="_blank" rel="noopener noreferrer">${url}</a>${trailing}`;
+    return `${pre}<a href="${hrefSafe}" class="cw-chat-link" data-cw-link="1" target="_blank" rel="noopener noreferrer">${url}</a>${trailing}`;
   });
 }
 
 // Markdown mở rộng (không phụ thuộc thư viện ngoài) → HTML cho tin nhắn AI
 // Hỗ trợ đủ kiểu output khác nhau của Solar / DeepSeek / Qwen / GLM / GPT / Gemini / model nhỏ khác:
 // bold/italic/strike, inline code, heading, ul/ol lồng nhau, task list, blockquote,
-// bảng, code fence (kể cả chưa đóng do đang stream), code thụt lề 4 space, hr, link, <br> thô.
+// bảng, code fence (kể cả chưa đóng do đang stream), code thụt lề 4 space, hr,
+// ảnh ![]() , link [text](url), link trần tự nhận diện, <br> thô, và block ```chart``` vẽ biểu đồ.
 function mdInlineToHtml(escapedText) {
   let s = escapedText;
   // inline code `code` (ưu tiên trước để không bị bold/italic ăn vào bên trong)
   s = s.replace(/`([^`\n]+)`/g, (_, code) => `<code class="inline-code">${code}</code>`);
+  // ảnh ![alt](url "title") — bắt trước link vì cùng cú pháp ()[] nhưng có "!" phía trước
+  s = s.replace(/!\[([^\]]*)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g, (_, alt, url) => {
+    const safeUrl = url.replace(/"/g, "&quot;");
+    return `<img src="${safeUrl}" alt="${alt}" class="md-img" loading="lazy" onerror="this.style.display='none'"/>`;
+  });
+  // link [text](url "title") — parse trước bold/italic để không bị "_"/"*" trong URL phá cú pháp
+  s = s.replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g, (_, text, url) => {
+    const safeUrl = url.replace(/"/g, "&quot;");
+    return `<a href="${safeUrl}" class="cw-chat-link" data-cw-link="1" target="_blank" rel="noopener noreferrer">${text}</a>`;
+  });
   // bold+italic ***text*** hoặc ___text___
   s = s.replace(/\*\*\*([^*\n]+)\*\*\*/g, "<strong><em>$1</em></strong>");
   s = s.replace(/___([^_\n]+)___/g, "<strong><em>$1</em></strong>");
@@ -942,6 +989,154 @@ function renderCodeBlock(lang, code) {
          `<div class="code-block-head"><span class="code-lang">${escapeHtml(langDisplayName(lang))}</span>` +
          `<button type="button" class="code-copy-btn" onclick="cwCopyCode(this)">Copy</button></div>` +
          `<pre class="mono"><code>${codeEsc}</code></pre></div>`;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// BIỂU ĐỒ ```chart``` — tự vẽ SVG, không phụ thuộc thư viện ngoài (Chart.js, mermaid...)
+// để dùng được ngay với mọi model (GPT/Gemini/Claude/DeepSeek/Qwen...) kể cả khi offline.
+// Cú pháp lang: chart | chart:bar | chart:line | chart:pie | chart:donut
+// Nội dung: JSON  {"type":"bar","title":"...","labels":[...],"datasets":[{"label":"...","data":[...]}]}
+//   hoặc đơn giản {"labels":[...], "data":[...]}
+//   hoặc fallback từng dòng "Nhãn: giá trị" / "Nhãn, giá trị" nếu model không xuất JSON đúng.
+// ═══════════════════════════════════════════════════════════════════════
+const CHART_PALETTE = ["#8bb66e", "#e0a537", "#5b90c9", "#d3735b", "#9b7bd1", "#4fb8ad", "#c96fa0", "#b0a15a"];
+
+function parseChartData(code, forcedType) {
+  const trimmed = String(code || "").trim();
+  let obj = null;
+  try { obj = JSON.parse(trimmed); } catch (e) { obj = null; }
+  if (obj && typeof obj === "object") {
+    const norm = normalizeChartObj(obj, forcedType);
+    if (norm) return norm;
+  }
+  // Fallback: mỗi dòng "Nhãn: giá trị" / "Nhãn, giá trị" / "Nhãn\tgiá trị"
+  const lines = trimmed.split("\n").map(l => l.trim()).filter(Boolean);
+  const labels = [], values = [];
+  for (const line of lines) {
+    const m = line.match(/^(.+?)[:,\t]\s*(-?\d+(?:\.\d+)?)\s*%?$/);
+    if (m) { labels.push(m[1].trim()); values.push(parseFloat(m[2])); }
+  }
+  if (labels.length) {
+    return { type: forcedType || "bar", title: "", labels, datasets: [{ label: "", data: values }] };
+  }
+  return null;
+}
+
+function normalizeChartObj(obj, forcedType) {
+  let type = String(forcedType || obj.type || "bar").toLowerCase();
+  if (!["bar", "line", "pie", "donut"].includes(type)) type = "bar";
+  let labels = Array.isArray(obj.labels) ? obj.labels.map(String) : null;
+  let datasets = null;
+  if (Array.isArray(obj.datasets) && obj.datasets.length) {
+    datasets = obj.datasets.map(d => ({
+      label: String(d.label || ""), color: d.color || null,
+      data: (Array.isArray(d.data) ? d.data : []).map(Number),
+    }));
+  } else if (Array.isArray(obj.data) && obj.data.length) {
+    if (typeof obj.data[0] === "object" && obj.data[0] !== null) {
+      labels = labels || obj.data.map(d => String(d.label ?? d.name ?? ""));
+      datasets = [{ label: String(obj.label || ""), color: null, data: obj.data.map(d => Number(d.value ?? d.y ?? 0)) }];
+    } else {
+      datasets = [{ label: String(obj.label || ""), color: null, data: obj.data.map(Number) }];
+    }
+  }
+  if (!labels || !datasets || !datasets.length || !labels.length) return null;
+  return { type, title: String(obj.title || ""), labels, datasets };
+}
+
+function chartFormatNum(v) {
+  if (Math.abs(v) >= 1000) return (v / 1000).toFixed(1).replace(/\.0$/, "") + "k";
+  return Number.isInteger(v) ? String(v) : v.toFixed(1);
+}
+function chartTruncateLabel(l) {
+  l = String(l);
+  return l.length > 10 ? l.slice(0, 9) + "…" : l;
+}
+function wrapChartHtml(title, type, inner) {
+  return `<div class="chart-block">` +
+    `<div class="chart-block-head"><span class="chart-title">${escapeHtml(title || "Biểu đồ")}</span>` +
+    `<span class="chart-type-badge">${escapeHtml(type)}</span></div>` +
+    `<div class="chart-body">${inner}</div></div>`;
+}
+
+function renderChartBlock(rawLang, code) {
+  const langLower = String(rawLang || "").trim().toLowerCase();
+  const forced = (langLower.match(/^chart[:\-_]?(bar|line|pie|donut)?$/) || [])[1] || null;
+  const data = parseChartData(code, forced);
+  if (!data) return renderCodeBlock(rawLang, code); // không parse được → fallback về code block bình thường
+  const { type, title, labels, datasets } = data;
+  const W = 560, H = 260, PAD_L = 36, PAD_B = 26, PAD_T = 14, PAD_R = 12;
+  const plotW = W - PAD_L - PAD_R, plotH = H - PAD_T - PAD_B;
+  let svg = "", legend = "";
+
+  if (type === "pie" || type === "donut") {
+    const values = datasets[0].data;
+    const total = values.reduce((a, b) => a + Math.max(b, 0), 0) || 1;
+    const cx = W / 2, cy = H / 2 + 4, r = Math.min(W, H) / 2 - 26;
+    let a0 = -Math.PI / 2;
+    values.forEach((v, idx) => {
+      const frac = Math.max(v, 0) / total;
+      const a1 = a0 + frac * Math.PI * 2;
+      const x1 = cx + r * Math.cos(a0), y1 = cy + r * Math.sin(a0);
+      const x2 = cx + r * Math.cos(a1), y2 = cy + r * Math.sin(a1);
+      const large = (a1 - a0) > Math.PI ? 1 : 0;
+      const color = CHART_PALETTE[idx % CHART_PALETTE.length];
+      svg += `<path d="M${cx},${cy} L${x1.toFixed(2)},${y1.toFixed(2)} A${r},${r} 0 ${large} 1 ${x2.toFixed(2)},${y2.toFixed(2)} Z" fill="${color}" stroke="#232016" stroke-width="1.5"><title>${escapeHtml(labels[idx] || "")}: ${v}</title></path>`;
+      a0 = a1;
+    });
+    if (type === "donut") svg += `<circle cx="${cx}" cy="${cy}" r="${(r * 0.55).toFixed(2)}" fill="#232016"/>`;
+    legend = `<div class="chart-legend">` + labels.map((l, idx) => `<span class="chart-legend-item"><i style="background:${CHART_PALETTE[idx % CHART_PALETTE.length]}"></i>${escapeHtml(l)} <b>${values[idx]}</b></span>`).join("") + `</div>`;
+    return wrapChartHtml(title, type, `<svg viewBox="0 0 ${W} ${H}" class="chart-svg">${svg}</svg>${legend}`);
+  }
+
+  let maxV = -Infinity, minV = Infinity;
+  datasets.forEach(ds => ds.data.forEach(v => { if (v > maxV) maxV = v; if (v < minV) minV = v; }));
+  if (!isFinite(maxV) || !isFinite(minV)) { maxV = 1; minV = 0; }
+  if (minV > 0) minV = 0; // luôn có baseline 0 để dễ đọc, trừ khi có số âm thì giữ minV thật
+  if (maxV === minV) maxV = minV + 1;
+  const range = maxV - minV;
+  const yScale = (v) => PAD_T + plotH - ((v - minV) / range) * plotH;
+  const n = labels.length;
+
+  svg += `<line x1="${PAD_L}" y1="${PAD_T}" x2="${PAD_L}" y2="${PAD_T + plotH}" stroke="rgba(255,255,255,0.15)" stroke-width="1"/>`;
+  svg += `<line x1="${PAD_L}" y1="${PAD_T + plotH}" x2="${PAD_L + plotW}" y2="${PAD_T + plotH}" stroke="rgba(255,255,255,0.15)" stroke-width="1"/>`;
+  [minV, (minV + maxV) / 2, maxV].forEach(v => {
+    const y = yScale(v);
+    svg += `<text x="${PAD_L - 6}" y="${(y + 3).toFixed(1)}" text-anchor="end" class="chart-axis-label">${chartFormatNum(v)}</text>`;
+  });
+
+  if (type === "line") {
+    datasets.forEach((ds, dsi) => {
+      const color = ds.color || CHART_PALETTE[dsi % CHART_PALETTE.length];
+      const pts = ds.data.map((v, i) => {
+        const x = PAD_L + (n > 1 ? (i / (n - 1)) * plotW : plotW / 2);
+        return [x, yScale(v)];
+      });
+      svg += `<polyline points="${pts.map(p => p[0].toFixed(1) + "," + p[1].toFixed(1)).join(" ")}" fill="none" stroke="${color}" stroke-width="2.5"/>`;
+      pts.forEach(([x, y], i) => { svg += `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="3" fill="${color}"><title>${escapeHtml(labels[i] || "")}: ${ds.data[i]}</title></circle>`; });
+    });
+  } else {
+    const groupW = plotW / n, barGap = 6;
+    const barW = Math.max(4, (groupW - barGap) / datasets.length);
+    labels.forEach((_, i) => {
+      datasets.forEach((ds, dsi) => {
+        const v = ds.data[i] ?? 0;
+        const color = ds.color || CHART_PALETTE[dsi % CHART_PALETTE.length];
+        const x = PAD_L + i * groupW + dsi * barW + barGap / 2;
+        const y0 = yScale(0), y1 = yScale(v);
+        const y = Math.min(y0, y1), h = Math.max(1, Math.abs(y1 - y0));
+        svg += `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barW.toFixed(1)}" height="${h.toFixed(1)}" fill="${color}" rx="2"><title>${escapeHtml(labels[i])} ${escapeHtml(ds.label || "")}: ${v}</title></rect>`;
+      });
+    });
+  }
+  labels.forEach((l, i) => {
+    const x = type === "line" ? PAD_L + (n > 1 ? (i / (n - 1)) * plotW : plotW / 2) : PAD_L + i * (plotW / n) + (plotW / n) / 2;
+    svg += `<text x="${x.toFixed(1)}" y="${H - 8}" text-anchor="middle" class="chart-axis-label">${escapeHtml(chartTruncateLabel(l))}</text>`;
+  });
+  if (datasets.length > 1 || datasets[0].label) {
+    legend = `<div class="chart-legend">` + datasets.map((ds, idx) => `<span class="chart-legend-item"><i style="background:${ds.color || CHART_PALETTE[idx % CHART_PALETTE.length]}"></i>${escapeHtml(ds.label || ("Series " + (idx + 1)))}</span>`).join("") + `</div>`;
+  }
+  return wrapChartHtml(title, type, `<svg viewBox="0 0 ${W} ${H}" class="chart-svg">${svg}</svg>${legend}`);
 }
 
 // Parse một bảng markdown bắt đầu tại lines[startIdx]. Trả về {html, nextIdx} hoặc null nếu không phải bảng.
@@ -998,7 +1193,12 @@ function markdownToHtml(raw) {
   while ((m = FENCE_RE.exec(src)) !== null) {
     const before = src.slice(lastIndex, m.index);
     out += renderMdBlocks(before);
-    out += renderCodeBlock(m[1], m[2]);
+    const fenceLang = String(m[1] || "").trim().toLowerCase();
+    if (/^chart([:\-_].*)?$/.test(fenceLang)) {
+      out += renderChartBlock(m[1], m[2]);
+    } else {
+      out += renderCodeBlock(m[1], m[2]);
+    }
     lastIndex = FENCE_RE.lastIndex;
   }
   out += renderMdBlocks(src.slice(lastIndex));
@@ -1520,7 +1720,12 @@ function appendThinkingDelta(text) {
     div.innerHTML = '<div class="think-label"><span>[thinking]</span></div>'
       + '<div class="think-viewport"><div class="think-body"></div></div>'
       + '<button type="button" class="think-toggle" onclick="toggleThinkCard(this)">Xem đầy đủ</button>';
-    logEl.appendChild(div); scrollToBottom({ force: true }); curThinkRow = div;
+    // Gộp chung vào turn-logs (như tool-group) thay vì đứng riêng trên logEl —
+    // để "Xem chi tiết" thu gọn cả thinking + tool call làm 1 card duy nhất.
+    // Live-slot vẫn cho xem real-time qua preview nổi ở đáy màn hình.
+    turnLogTarget().appendChild(div);
+    showLiveSlot(div);
+    scrollToBottom(); curThinkRow = div;
   }
   curThinkRaw += text;
   scheduleThinkFlush();
@@ -1536,6 +1741,7 @@ function scheduleThinkFlush() {
     const bodyEl = curThinkRow.querySelector(".think-body");
     if (bodyEl) bodyEl.textContent = curThinkRaw;
     updateThinkOverflow(curThinkRow);
+    if (liveSourceEl === curThinkRow) showLiveSlot(curThinkRow);
   });
 }
 
