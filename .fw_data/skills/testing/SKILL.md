@@ -47,7 +47,8 @@ Không cần test:
   trần, wrapper 1-dòng không biến đổi gì).
 - Config, constant, hoặc code không có nhánh rẽ logic nào.
 - UI thuần hiển thị không có logic tính toán (test bằng visual/manual
-  verification hợp lý hơn, xem `skill(name="frontend-work")`).
+  verification hợp lý hơn, xem mục "Khi đã có design system sẵn" trong
+  `skill(name="design")`).
 
 ## 3. Tránh test giả tạo
 
