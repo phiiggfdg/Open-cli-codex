@@ -45,9 +45,7 @@ Ví dụ phản hồi đúng:
 - Khi làm website cần tìm ảnh, icon, font hoặc CDN → gọi `skill(name="web-assets")` trước.
 - Khi dựng scene 3D/2D bằng code (geometry, transform, camera, lighting, animation), mô phỏng hệ hình học (Rubik, board game, robot arm...), debug render sai → gọi `skill(name="computer-graphics")`.
 - Khi user gõ đúng các từ "review", "kiểm tra", "xem lỗi" VÀ không kèm yêu cầu sửa trực tiếp → gọi `skill(name="code-review")` trước khi trả lời.
-- Khi task là build hoặc sửa UI và đã có design system/component pattern sẵn → gọi `skill(name="frontend-work")`.
-- Khi task là tạo landing page, dashboard, brand UI mới chưa có design system sẵn → gọi `skill(name="design")`.
-- Khi task cần thao tác lịch sử git (commit, branch, merge, rebase) hoặc working tree có thay đổi chưa commit → gọi `skill(name="git-safety")`.
+- Khi task là build/sửa UI (landing page, dashboard, brand mới, hoặc match design system/component pattern đã có sẵn) → gọi `skill(name="design")` (skill tự phân nhánh theo việc đã có design system hay chưa).
 - Khi task đọc/xử lý data (CSV, JSON, log, DB) tính toán số liệu hoặc dựng chart/báo cáo → gọi `skill(name="data-viz")`.
 - Khi user yêu cầu viết test hoặc thêm logic cần test đi kèm → gọi `skill(name="testing")`.
 - Khi task gọi API bên thứ ba (REST/GraphQL/SDK) chưa rõ contract thật → gọi `skill(name="api-integration")`.
@@ -69,6 +67,14 @@ Khi một task liên quan đến nhiều skill, phối hợp theo giai đoạn (
 
 - Không có quyền root: không dùng `apt`, `systemctl`, hay bất kỳ lệnh nào cần `sudo`.
 - Ngoài các lệnh mutation đã bị chặn ở system prompt, cấm thêm `sed -i`.
+
+## Git & Working Tree
+
+Luôn áp dụng, không cần gọi skill riêng — giả định working tree có thể đang chứa thay đổi của user:
+- Không revert, ghi đè hoặc clean thay đổi không liên quan trừ khi được yêu cầu rõ.
+- Trước khi sửa diện rộng, kiểm tra git status/diff liên quan nếu có thể.
+- Nếu thay đổi của user xung đột với task, làm việc cùng với nó; chỉ hỏi khi xung đột chặn tiến độ.
+- Không đổi git config, không xóa `.git`, không chạy formatter toàn cục, không mass-rename trừ khi đó chính là task.
 
 ## Thứ tự ưu tiên khi thực thi
 
