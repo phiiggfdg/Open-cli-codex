@@ -2312,8 +2312,57 @@ def call_api_stream(messages, model, api_key, tool_choice="auto", session_id=Non
 
             if e.code == 400 and ("max_tokens" in body_lower or "max tokens" in body_lower):
                 if attempt == 0:
-                    m = re.search(r"less than or equal to (\d+)", body_lower)
-                    safe_limit = int(m.group(1)) if m else 8192
+                    # Mỗi provider/gateway diễn đạt lỗi "max_tokens vượt giới
+                    # hạn" theo 1 kiểu câu chữ khác nhau, và số có thể có dấu
+                    # phẩy phân cách hàng nghìn (vd "4,096"). Gom mọi biến thể
+                    # hay gặp (OpenAI/Cohere/Fireworks/OpenRouter/Together/
+                    # Groq/Anthropic-style/virouter...) vào 1 danh sách pattern
+                    # — mỗi pattern bắt buộc có TỪ KHOÁ đứng trước số, để
+                    # tránh vô tình bắt nhầm số max_tokens mà CHÍNH TA vừa gửi
+                    # lên (thường bị provider echo lại trong message, vd
+                    # "max_tokens (8,192) exceeds ..." — "8192" ở đây không
+                    # phải là giới hạn thật, "4096" mới là).
+                    _num = r"([\d,]+)"
+                    _patterns = [
+                        r"less than or equal to " + _num,
+                        r"reduce max_tokens to " + _num,
+                        r"exceeds your plan limit of " + _num,
+                        r"plan limit of " + _num,
+                        r"maximum of " + _num,
+                        r"maximum value is " + _num,
+                        r"max value is " + _num,
+                        r"limit is " + _num,
+                        r"up to " + _num,
+                        r"cannot exceed " + _num,
+                        r"must not exceed " + _num,
+                        r"should not exceed " + _num,
+                        r"can not exceed " + _num,
+                        r"at most " + _num,
+                        r"no more than " + _num,
+                        r"allowed maximum of " + _num,
+                        r"max tokens allowed is " + _num,
+                        r"maximum context length is " + _num,
+                        r"limit of " + _num + r" tokens",
+                        r"supports up to " + _num + r" tokens",
+                        r"cap of " + _num,
+                        r"capped at " + _num,
+                        r"but (?:the )?max(?:imum)? (?:is|of) " + _num,
+                        r"must be <= ?" + _num,
+                        r"must be smaller than " + _num,
+                        r"must be less than " + _num,
+                    ]
+                    # Giá trị max_tokens ta VỪA gửi lên (bị 400) — dùng để lọc
+                    # bỏ những match tình cờ >= giá trị này, vì 1 con số như
+                    # vậy không thể là "giới hạn" gây ra chính lỗi này.
+                    _requested = payload.get("max_tokens") or payload.get("max_completion_tokens")
+                    _found = []
+                    for pat in _patterns:
+                        mm = re.search(pat, body_lower)
+                        if mm:
+                            _val = int(mm.group(1).replace(",", ""))
+                            if not _requested or _val < _requested:
+                                _found.append(_val)
+                    safe_limit = min(_found) if _found else 4096
                     spinner_ref[0].stop()
                     _txt = f"\n{YELLOW}  ⚠ max_tokens quá cao — retry với {safe_limit}...{R}"
                     if state: state.emit(EV_WARN, text=_txt, raw=True)
