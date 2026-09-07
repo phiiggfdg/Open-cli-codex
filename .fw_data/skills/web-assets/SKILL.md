@@ -239,4 +239,31 @@ Không dùng ảnh lệch nội dung chỉ để kết thúc nhanh.
 
 ---
 
-## Chọn ít
+## Chọn ít và tích hợp đúng
+
+- Mỗi asset phải có một vai trò cụ thể; bỏ asset không giúp người dùng hiểu
+  nội dung hoặc thao tác tốt hơn.
+- Ưu tiên một hero image/key visual tốt hơn nhiều ảnh nhỏ không liên quan.
+- Icon cùng một bộ, cùng stroke/fill và cùng kích thước quang học; không trộn
+  nhiều hệ icon nếu project đã có một hệ thống nhất quán.
+- Font/CDN chỉ được thêm khi project thật sự cần. Nếu có thể dùng system font,
+  asset local hoặc dependency sẵn có mà vẫn đạt brief, không thêm request ngoài.
+- Với URL remote, luôn có `alt` phù hợp cho ảnh có nghĩa; ảnh trang trí dùng
+  `alt=""`. Không đặt thông tin bắt buộc chỉ trong ảnh.
+- Giữ tỷ lệ ảnh bằng `object-fit`/kích thước rõ ràng để tránh méo và hạn chế
+  layout shift. Không hotlink asset từ trang không cho phép hoặc URL tạm thời.
+
+## Verify trước khi kết luận
+
+Sau khi tích hợp:
+
+1. Kiểm tra lại URL/source và điều kiện attribution.
+2. Chạy syntax/build check hẹp nhất của project nếu có.
+3. Kiểm tra responsive, crop, fallback, contrast và trạng thái asset lỗi bằng
+   preview/`verify` khi môi trường hỗ trợ.
+4. Không nói đã nhìn thấy hoặc xác nhận chất lượng hình ảnh nếu chỉ kiểm tra
+   được metadata hay mã nguồn.
+
+Khi bàn giao, nêu ngắn gọn asset nào đã dùng, nguồn/attribution cần giữ và phần
+nào chưa thể xác minh trực quan. Minimum asset và minimum dependency giải quyết
+đúng brief; không thêm tài nguyên chỉ để trang trông bận rộn hơn.
