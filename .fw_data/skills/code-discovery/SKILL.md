@@ -21,13 +21,13 @@ lsp(documentSymbol) hoặc grep("##==") (tìm cấu trúc/sections)
 grep (tìm text/pattern có định hướng kèm glob/path)
     ↓ (nếu không biết file nằm ở đâu)
 glob (tìm theo tên file/extension)
-    ↓ (chỉ khi đã định vị được vùng cần đọc)
+    ↓ (sau khi đã định vị được vùng cần đọc)
 read(offset=N, limit=60) (đọc cửa sổ hẹp quanh vị trí)
 ```
 
 ## 2. Quy tắc đọc file lớn (> 80 dòng)
 
-- **Tuyệt đối không đọc toàn bộ file**: Đọc toàn bộ file hàng trăm dòng làm phình context và dễ bị policy limiter chặn.
+- **Tránh đọc toàn bộ file theo mặc định**: Đọc toàn bộ file hàng trăm dòng làm phình context. Chỉ đọc một khối lớn khi nội dung liên tục đó thật sự cần cho kết luận và các cách định vị hẹp hơn không đủ.
 - **Quy trình chuẩn**:
   1. `grep` hoặc `view_symbol` để tìm chính xác số dòng của hàm/class/biến cần quan tâm.
   2. Dùng `read(offset=Line-5, limit=50)` để đọc đoạn code hẹp xung quanh ngữ cảnh đó.
