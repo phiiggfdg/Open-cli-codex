@@ -433,7 +433,7 @@ TOOLS = [
     "name":"skill",
     "description":"Load an existing skill file (SKILL.md) by name. Read-only — never attempt to create or write skill files. Use for domain-specific guidance.",
     "parameters":{"type":"object","properties":{
-      "name":{"type":"string","description":"Skill name or path, e.g. 'python', 'react', 'testing'"}
+      "name":{"type":"string","description":"Skill name or path from the injected available-skill list, e.g. 'testing', 'debugging', 'design'"}
     },"required":["name"]}
   }},
   {"type":"function","function":{
