@@ -156,7 +156,7 @@ def urlopen_smart(req, raw_credentials: str, payload: dict, timeout: int = 180):
         if e.code != 400:
             raise
         try:
-            body = e.read().decode("utf-8", errors="replace")
+            body = e.read(16384).decode("utf-8", errors="replace")
         except Exception:
             body = ""
         if "on-demand throughput" not in body and "inference profile" not in body:

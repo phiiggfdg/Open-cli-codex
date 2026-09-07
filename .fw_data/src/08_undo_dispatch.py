@@ -8,64 +8,139 @@ def _sync_file_state_after_restore(path: "Path", content: str | None) -> None:
             _file_read_time.pop(resolved, None)
             _recent_writes.discard(resolved)
             return
-        _cache_put(str(path), content, _current_sid)
+        _cache_put(str(path), content, _active_session_id())
         _file_read_time[resolved] = time.time()
         _recent_writes.add(resolved)
     except Exception:
         pass
 
+def _snapshot_current_bytes(path: "Path"):
+    return path.read_bytes() if path.exists() else None
+
+def _snapshot_expected_bytes(value):
+    return snapshot_decode(value)
+
+def _snapshot_path(path: str) -> "Path":
+    p = Path(path).expanduser().resolve()
+    root = _workspace_root()
+    try:
+        p.relative_to(root)
+    except ValueError as e:
+        raise ValueError(f"snapshot path is outside current project: {p}") from e
+    return p
+
+def _snapshot_restore(path: "Path", value) -> None:
+    data = _snapshot_expected_bytes(value)
+    if data is None:
+        path.unlink(missing_ok=True)
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_name, path)
+    finally:
+        try:
+            Path(tmp_name).unlink(missing_ok=True)
+        except Exception:
+            pass
+
 def do_undo():
     if not _undo_stack:
         return "Nothing to undo."
-    snap = _undo_stack.pop()
-    p = Path(snap["path"])
+    snap = _undo_stack[-1]
+    group_id = snap.get("group_id")
+    group = [snap]
+    if group_id:
+        i = len(_undo_stack) - 2
+        while i >= 0 and _undo_stack[i].get("group_id") == group_id:
+            group.append(_undo_stack[i]); i -= 1
+    paths, old_states = [], {}
     try:
-        if snap["before"] is None:
-            p.unlink(missing_ok=True)
-            _sync_file_state_after_restore(p, None)
-            msg = f"Undo: deleted {snap['path']}"
-        else:
-            p.write_text(snap["before"])
-            _sync_file_state_after_restore(p, snap["before"])
-            msg = f"Undo: restored {snap['path']}"
-        if _project_dir_conn and snap.get("id"):
-            _project_dir_conn.execute(
-                "UPDATE file_snapshot SET undone=1 WHERE id=?", (snap["id"],))
-            _project_dir_conn.commit()
-        snap["undone"] = 1
-        _redo_stack.append(snap)
-        return msg
+        for item in group:
+            p = _snapshot_path(item["path"]); paths.append(p)
+            current = _snapshot_current_bytes(p); old_states[p] = current
+            if current != _snapshot_expected_bytes(item["after"]):
+                return (f"[undo conflict] '{item['path']}' changed after this action. "
+                        "Undo was not applied; review the current file first.")
+        for item, p in zip(group, paths):
+            _snapshot_restore(p, item["before"])
+        if _project_dir_conn:
+            try:
+                for item in group:
+                    if item.get("id"):
+                        _project_dir_conn.execute("UPDATE file_snapshot SET undone=1 WHERE id=?", (item["id"],))
+                _project_dir_conn.commit()
+            except Exception:
+                try:
+                    _project_dir_conn.rollback()
+                except Exception:
+                    pass
+                raise
+        del _undo_stack[-len(group):]
+        for item, p in zip(group, paths):
+            item["undone"] = 1; _redo_stack.append(item)
+            restored = snapshot_decode(item["before"])
+            try: _sync_file_state_after_restore(p, restored.decode("utf-8") if restored is not None else None)
+            except UnicodeDecodeError: _file_cache.pop(str(p), None)
+        return (f"Undo: restored {snap['path']}" if snap["before"] is not None
+                else f"Undo: deleted {snap['path']}") + (f" (+{len(group)-1} related files)" if len(group)>1 else "")
     except Exception as e:
+        for p, old in old_states.items():
+            try:
+                if old is None: p.unlink(missing_ok=True)
+                else: _snapshot_restore(p, snapshot_encode_bytes(old))
+            except Exception: pass
         return f"[undo error: {e}]"
 
 def do_redo():
     if not _redo_stack:
         return "Nothing to redo."
-    snap = _redo_stack.pop()
-    p = Path(snap["path"])
+    snap = _redo_stack[-1]
+    group_id = snap.get("group_id")
+    group = [snap]
+    if group_id:
+        i = len(_redo_stack) - 2
+        while i >= 0 and _redo_stack[i].get("group_id") == group_id:
+            group.append(_redo_stack[i]); i -= 1
+    paths, old_states = [], {}
     try:
-        if snap["after"] is None:
-            # BUG FIX: trước đây p.write_text(None) sẽ raise TypeError —
-            # chưa từng xảy ra vì trước đây không có nghiệp vụ nào tạo
-            # snapshot với after=None (chỉ before=None cho "tạo mới file").
-            # Tool xoá file mới (tool_delete) tạo snapshot after=None (nghĩa
-            # là "sau thao tác này, file không tồn tại") — redo phải xoá lại
-            # file, đối xứng với do_undo() đã xử lý before=None.
-            p.unlink(missing_ok=True)
-            _sync_file_state_after_restore(p, None)
-            msg = f"Redo: deleted {snap['path']}"
-        else:
-            p.write_text(snap["after"])
-            _sync_file_state_after_restore(p, snap["after"])
-            msg = f"Redo: applied {snap['path']}"
-        if _project_dir_conn and snap.get("id"):
-            _project_dir_conn.execute(
-                "UPDATE file_snapshot SET undone=0 WHERE id=?", (snap["id"],))
-            _project_dir_conn.commit()
-        snap["undone"] = 0
-        _undo_stack.append(snap)
-        return msg
+        for item in group:
+            p = _snapshot_path(item["path"]); paths.append(p)
+            current = _snapshot_current_bytes(p); old_states[p] = current
+            if current != _snapshot_expected_bytes(item["before"]):
+                return (f"[redo conflict] '{item['path']}' changed after undo. "
+                        "Redo was not applied; review the current file first.")
+        for item, p in zip(group, paths): _snapshot_restore(p, item["after"])
+        if _project_dir_conn:
+            try:
+                for item in group:
+                    if item.get("id"):
+                        _project_dir_conn.execute("UPDATE file_snapshot SET undone=0 WHERE id=?", (item["id"],))
+                _project_dir_conn.commit()
+            except Exception:
+                try:
+                    _project_dir_conn.rollback()
+                except Exception:
+                    pass
+                raise
+        del _redo_stack[-len(group):]
+        for item, p in zip(group, paths):
+            item["undone"] = 0; _undo_stack.append(item)
+            applied = snapshot_decode(item["after"])
+            try: _sync_file_state_after_restore(p, applied.decode("utf-8") if applied is not None else None)
+            except UnicodeDecodeError: _file_cache.pop(str(p), None)
+        return (f"Redo: applied {snap['path']}" if snap["after"] is not None
+                else f"Redo: deleted {snap['path']}") + (f" (+{len(group)-1} related files)" if len(group)>1 else "")
     except Exception as e:
+        for p, old in old_states.items():
+            try:
+                if old is None: p.unlink(missing_ok=True)
+                else: _snapshot_restore(p, snapshot_encode_bytes(old))
+            except Exception: pass
         return f"[redo error: {e}]"
 
 def _patch_snippet(after: str, patch: str) -> str:
@@ -94,13 +169,189 @@ def _patch_snippet(after: str, patch: str) -> str:
     return header + "\n" + "\n---\n".join(parts)
 
 
+_UNIFIED_HUNK_RE = re.compile(
+    r"^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@(?:.*)$"
+)
+
+
+def _prepare_patch_text(patch: str, requested_path: str) -> str:
+    """Accept plain unified diffs and the common ``*** Begin Patch`` wrapper."""
+    lines = patch.splitlines(keepends=True)
+    if sum(1 for line in lines if line.startswith("diff --git ")) > 1:
+        raise ValueError("patch contains changes for more than one file")
+    header_pairs = sum(
+        1 for i in range(len(lines) - 1)
+        if lines[i].startswith("--- ") and lines[i + 1].startswith("+++ ")
+    )
+    if header_pairs > 1:
+        raise ValueError("patch contains more than one file-header pair")
+    out = []
+    update_paths = []
+    for line in lines:
+        marker = line.rstrip("\r\n")
+        if marker in ("*** Begin Patch", "*** End Patch"):
+            continue
+        if marker.startswith("*** Add File:") or marker.startswith("*** Delete File:"):
+            raise ValueError(
+                "apply_patch only updates an existing path; use write/delete for add/delete"
+            )
+        if marker.startswith("*** Update File:"):
+            update_paths.append(marker.split(":", 1)[1].strip())
+            continue
+        out.append(line)
+    if len(update_paths) > 1:
+        raise ValueError("patch contains updates for more than one file")
+    if update_paths:
+        declared = update_paths[0].replace("\\", "/").lstrip("./")
+        requested = requested_path.replace("\\", "/").lstrip("./")
+        if declared != requested and not requested.endswith("/" + declared):
+            raise ValueError(
+                f"patch targets '{update_paths[0]}' but tool path is '{requested_path}'"
+            )
+    prepared = "".join(out)
+    if not prepared.strip():
+        raise ValueError("patch is empty")
+    return prepared
+
+
+def _parse_unified_hunks(patch: str) -> list[dict]:
+    """Parse standard unified hunks without trusting their line counts blindly."""
+    lines = patch.splitlines()
+    hunks = []
+    i = 0
+    while i < len(lines):
+        header = _UNIFIED_HUNK_RE.match(lines[i])
+        if not header:
+            i += 1
+            continue
+        old_start = int(header.group(1))
+        new_start = int(header.group(3))
+        declared_old = int(header.group(2) or 1)
+        declared_new = int(header.group(4) or 1)
+        body = []
+        new_no_newline = False
+        i += 1
+        while i < len(lines) and not lines[i].startswith("@@"):
+            line = lines[i]
+            if line == r"\ No newline at end of file":
+                if body and body[-1][0] in ("+", " "):
+                    new_no_newline = True
+                i += 1
+                continue
+            if not line or line[0] not in (" ", "+", "-"):
+                raise ValueError(
+                    f"invalid unified-diff line in hunk near line {i + 1}: {line[:80]!r}"
+                )
+            body.append((line[0], line[1:]))
+            i += 1
+        if not body:
+            raise ValueError(f"empty hunk at old line {old_start}")
+        old_lines = [text for tag, text in body if tag != "+"]
+        new_lines = [text for tag, text in body if tag != "-"]
+        hunks.append({
+            "old_start": old_start,
+            "new_start": new_start,
+            "declared_old": declared_old,
+            "declared_new": declared_new,
+            "old": old_lines,
+            "new": new_lines,
+            "new_no_newline": new_no_newline,
+        })
+    if not hunks:
+        raise ValueError("no valid @@ unified-diff hunks found")
+    return hunks
+
+
+def _apply_unified_hunks(before: str, patch: str) -> str:
+    """Apply all hunks in memory, resolving repeated text by hunk line position."""
+    hunks = _parse_unified_hunks(patch)
+    newline = "\r\n" if "\r\n" in before else "\n"
+    original_had_newline = before.endswith(("\n", "\r"))
+    original = before.splitlines()
+    current = list(original)
+    offset = 0
+    final_newline = original_had_newline
+
+    for hunk_no, hunk in enumerate(hunks, 1):
+        old = hunk["old"]
+        new = hunk["new"]
+        expected = max(0, min(len(current), hunk["old_start"] - 1 + offset))
+        if old:
+            candidates = [
+                pos for pos in range(0, len(current) - len(old) + 1)
+                if current[pos:pos + len(old)] == old
+            ]
+            if not candidates:
+                raise ValueError(
+                    f"hunk {hunk_no} context was not found; reload the file and regenerate that hunk"
+                )
+            distance = min(abs(pos - expected) for pos in candidates)
+            nearest = [pos for pos in candidates if abs(pos - expected) == distance]
+            if len(nearest) != 1:
+                raise ValueError(
+                    f"hunk {hunk_no} is ambiguous at {len(nearest)} equally close locations; add context"
+                )
+            pos = nearest[0]
+        else:
+            # Insertion-only hunks have no searchable source. Their declared
+            # old line is the only safe anchor, adjusted for earlier hunks.
+            pos = expected
+
+        touched_original_eof = (
+            hunk["old_start"] - 1 + len(old) >= len(original)
+        )
+        current[pos:pos + len(old)] = new
+        offset += len(new) - len(old)
+        if touched_original_eof:
+            final_newline = not hunk["new_no_newline"]
+
+    after = newline.join(current)
+    if current and final_newline:
+        after += newline
+    return after
+
+
+def _try_system_patch_in_memory(before: str, patch: str, parent: "Path"):
+    """Run system patch against a disposable file; never partially edit target."""
+    if not shutil.which("patch"):
+        return None, "system patch is unavailable"
+    fd, tmp_name = tempfile.mkstemp(prefix=".fw-patch-", dir=str(parent))
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+            f.write(before)
+        result = subprocess.run(
+            ["patch", "--batch", "--forward", "--unified", str(tmp)],
+            input=patch, text=True, capture_output=True, timeout=30,
+        )
+        if result.returncode == 0:
+            with open(tmp, "r", encoding="utf-8", newline="") as f:
+                return f.read(), ""
+        detail = (result.stderr or result.stdout or "patch rejected input").strip()
+        return None, detail[:500]
+    except Exception as e:
+        return None, str(e)[:500]
+    finally:
+        for extra in (tmp, Path(tmp_name + ".rej"), Path(tmp_name + ".orig")):
+            try:
+                extra.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
 def tool_apply_patch(path, patch, conn=None, sid=None):
-    """Apply unified diff patch — uses system `patch` if available."""
+    """Apply a unified diff atomically with robust in-memory fallback."""
+    if not isinstance(path, str) or not isinstance(patch, str):
+        return "[error: path and patch must be strings]"
     if _contains_compaction_marker(patch):
         return _COMPACTION_MARKER_ERROR
+    if len(patch.encode("utf-8", errors="replace")) > 10 * 1024 * 1024:
+        return "[error: patch exceeds 10 MiB]"
     p = _resolve_to_sandbox(path)
     if not p.exists(): return f"[not found: {p}]"
     try:
+        if p.stat().st_size > 50 * 1024 * 1024:
+            return "[policy] File quá lớn cho apply_patch (>50 MiB); chia nhỏ thao tác trước."
         # FileTime safety: cùng cơ chế đã có ở tool_edit — chặn patch ghi đè
         # lên file đã bị sửa từ ngoài (process khác, user tự sửa tay, git
         # checkout...) mà agent chưa đọc lại. Trước đây tool_apply_patch
@@ -113,106 +364,37 @@ def tool_apply_patch(path, patch, conn=None, sid=None):
                     f"(mtime={mtime:.0f}, last_read={last_read:.0f}). "
                     f"Use the read tool to reload it before applying the patch.")
 
-        before = p.read_text()
-        patch_errors = []  # thu thập lý do patch binary fail để không nuốt im lặng
+        with open(p, "r", encoding="utf-8", newline="") as f:
+            before = f.read()
+        prepared_patch = _prepare_patch_text(patch, path)
 
-        # Prefer system patch (more robust khi context đúng chuẩn unified diff)
-        if shutil.which("patch"):
-            result = subprocess.run(
-                ["patch", "--unified", str(p)],
-                input=patch, text=True, capture_output=True, timeout=15
-            )
-            if result.returncode == 0:
-                after = p.read_text()
-                if after == before:
-                    # BUG FIX: `patch` binary trả returncode 0 dù nội dung
-                    # không thực sự đổi — xảy ra khi hunk hợp lệ về cú pháp
-                    # nhưng vô nghĩa về nội dung (vd "-line\n+line" giống hệt
-                    # nhau, model paraphrase nhầm khi sinh diff). `patch`
-                    # VẪN GHI file xuống đĩa (rewrite y hệt nội dung cũ) nên
-                    # mtime đã đổi dù text giống hệt — phải cập nhật
-                    # _file_read_time ở đây, nếu không lần gọi tool tiếp theo
-                    # (edit/apply_patch khác) trên CÙNG file sẽ bị mtime-guard
-                    # chặn oan (\"modified since last read\") dù nội dung agent
-                    # đang cầm vẫn đúng 100% với đĩa.
-                    _file_read_time[str(p.resolve())] = time.time()
-                    return (f"[error: patch appeared to apply (exit 0) but file content "
-                            f"is unchanged — likely a no-op hunk (removed and re-added "
-                            f"identical content). No changes were made to {path}.]")
-                _file_read_time[str(p.resolve())] = time.time()
-                _cache_put(str(p), after, _current_sid)
-                if conn and sid:
-                    _undo_stack.append(snapshot_save(
-                        conn, sid, str(p.resolve()), before, after))
-                    _redo_stack.clear()
-                return f"Patch applied to {path}\n" + _patch_snippet(after, patch)
-            # patch binary fail (thường do context lệch nhẹ) — không bỏ cuộc
-            # ngay, thử fallback manual parser bên dưới trước khi báo lỗi.
-            # `patch` ghi từng hunk xuống đĩa ngay khi apply, không transaction.
-            # Nếu hunk sau FAILED, file trên đĩa có thể đã bị sửa dở dang bởi
-            # các hunk trước dù cả lệnh coi là fail. Phải restore về `before`
-            # ngay ở đây để fallback (và nhánh lỗi cuối) luôn xuất phát từ
-            # trạng thái gốc sạch — giữ tính all-or-nothing của apply_patch.
-            if p.read_text() != before:
-                p.write_text(before)
-            rej_path = p.with_name(p.name + ".rej")
-            if rej_path.exists():
-                try:
-                    rej_path.unlink()
-                except OSError:
-                    pass
-            patch_errors.append(f"system patch: {result.stderr.strip()[:300]}")
-
-        # Fallback: manual hunk parser (string-replace theo nội dung hunk,
-        # không phụ thuộc số dòng khớp tuyệt đối như `patch` binary).
-        original = before.splitlines(keepends=True)
-        patched  = list(original)
-        lines    = patch.splitlines(keepends=True)
-        i = 0
-        while i < len(lines):
-            if lines[i].startswith("@@"):
-                m = re.match(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", lines[i])
-                if not m: i += 1; continue
-                i += 1
-                removes, adds = [], []
-                while i < len(lines) and not lines[i].startswith("@@"):
-                    l = lines[i]
-                    if l.startswith("-"):   removes.append(l[1:])
-                    elif l.startswith("+"): adds.append(l[1:])
-                    elif l.startswith(" "): removes.append(l[1:]); adds.append(l[1:])
-                    i += 1
-                src = "".join(removes); dst = "".join(adds)
-                content = "".join(patched)
-                count = content.count(src)
-                if count == 0:
-                    err_msg = "[error: patch hunk not found in file]"
-                    if patch_errors:
-                        err_msg = f"[error: patch hunk not found in file | {'; '.join(patch_errors)}]"
-                    return err_msg
-                if count > 1:
-                    # Giống tool_edit: hunk khớp nhiều vị trí là mơ hồ, không
-                    # tự đoán vị trí đúng — an toàn hơn là từ chối và báo rõ.
-                    return (f"[error: patch hunk matches {count} locations in file — "
-                            f"ambiguous, must be unique. Add more context lines to the hunk "
-                            f"or use apply_patch with a narrower, more specific hunk.]")
-                content = content.replace(src, dst, 1)
-                patched = content.splitlines(keepends=True)
-            else:
-                i += 1
-        after = "".join(patched)
+        # GNU/BSD patch remains the most compatible implementation, but it
+        # only ever sees a disposable sibling file. A failed later hunk can
+        # therefore never leave the real target half-modified.
+        after, system_error = _try_system_patch_in_memory(
+            before, prepared_patch, p.parent
+        )
+        if after is None:
+            try:
+                after = _apply_unified_hunks(before, prepared_patch)
+            except ValueError as manual_error:
+                return (f"[error: {manual_error}; system patch: "
+                        f"{system_error or 'not attempted'}]")
         if after == before:
-            # BUG FIX: cùng lý do với nhánh system patch ở trên — nếu mọi
-            # hunk đều có src==dst (patch no-op / đã áp dụng trước đó),
-            # manual parser vẫn "thành công" viết lại y hệt nội dung cũ.
             return (f"[error: patch parsed and matched but resulted in no actual "
                     f"change — likely an empty hunk or a patch that was already "
                     f"applied. No changes were made to {path}.]")
-        p.write_text(after)
+        _atomic_write_text(p, after)
         _file_read_time[str(p.resolve())] = time.time()
-        _cache_put(str(p), after, _current_sid)
+        _cache_put(str(p), after, _active_session_id())
         if conn and sid:
-            _undo_stack.append(snapshot_save(
-                conn, sid, str(p.resolve()), before, after))
+            try:
+                _undo_stack.append(snapshot_save(
+                    conn, sid, str(p.resolve()), before, after))
+            except Exception as e:
+                _snapshot_restore(p, before)
+                _cache_put(str(p), before, _active_session_id())
+                return f"[error] snapshot failed; patch rolled back: {e}"
             _redo_stack.clear()
         return f"Patch applied to {path}\n" + _patch_snippet(after, patch)
     except Exception as e:
@@ -272,6 +454,9 @@ def tool_task(description, tools=None, model=None, api_key=None, conn=None, sid=
     _resolve_subagent_max_steps() — không tin trực tiếp giá trị model gửi.
     """
     global _task_depth
+    if not isinstance(description, str) or not description.strip():
+        return "[task error: description must be a non-empty string]"
+    description = description[:12000]
     # BUG FIX (nghiêm trọng — unbounded recursive subagent spawning):
     # `allowed.discard("task")` (fix cũ, giữ nguyên bên dưới) chỉ ẩn schema
     # "task" khỏi tools list gửi lên API cho subagent — đây là biện pháp
@@ -491,6 +676,11 @@ def tool_delegate(task_type, instruction, expected_output, target_files=None,
     1 hàm resolve dùng chung với tool_task, không tự parse riêng ở đây.
     """
     global _task_depth
+    if not isinstance(instruction, str) or not instruction.strip():
+        return "[delegate error: instruction must be a non-empty string]"
+    if not isinstance(expected_output, str) or not expected_output.strip():
+        return "[delegate error: expected_output must be a non-empty string]"
+    instruction, expected_output = instruction[:12000], expected_output[:6000]
     if _task_depth >= _TASK_MAX_DEPTH:
         return (f"[delegate denied: subagent nesting depth limit ({_TASK_MAX_DEPTH}) "
                 f"reached — a delegate cannot spawn another nested subagent (task or "
@@ -805,6 +995,7 @@ def _run_subagent_loop(sub_messages, sub_sys, allowed, model, api_key, conn, sid
     # Chặn cứng ở đây, cùng tầng với task/delegate, thay vì chỉ dựa vào việc
     # "question" không nằm trong default.
     allowed.discard("question")
+    allowed.discard("verify")
     sub_tools = [t for t in get_active_tools() if t["function"]["name"] in allowed]
 
     # Guard: nếu model truyền `tools` toàn tên không tồn tại (vd ảo giác/gõ sai),
@@ -827,6 +1018,7 @@ def _run_subagent_loop(sub_messages, sub_sys, allowed, model, api_key, conn, sid
     # ở đây là danh sách CUỐI CÙNG, đã qua đủ 2 lớp lọc, đúng những gì
     # subagent thực sự gọi được.
     _tool_names = sorted(t["function"]["name"] for t in sub_tools)
+    allowed_names = set(_tool_names)
     sub_sys = sub_sys + "\n\n# Your tools this run\n" + ", ".join(_tool_names) + "."
 
     # Step budget (2-tier max_steps — xem _resolve_subagent_max_steps ở
@@ -936,7 +1128,7 @@ def _run_subagent_loop(sub_messages, sub_sys, allowed, model, api_key, conn, sid
                 else:
                     resp_cm = urllib.request.urlopen(req, timeout=timeout)
                 with resp_cm as resp:
-                    body = json.loads(resp.read())
+                    body = json.loads(_read_response_limited(resp))
                     pool_mark_success(api_key)  # key này ổn → giảm fail_count (decay)
 
                     # Nhánh 1: AWS Bedrock — Converse API format
@@ -1039,6 +1231,8 @@ def _run_subagent_loop(sub_messages, sub_sys, allowed, model, api_key, conn, sid
 
     steps = 0
     final_text = ""
+    _sub_seen_calls = {}
+    _sub_epoch = 0
     while steps < max_steps:
         # Subagents do not pass through the main-loop pruning threshold. Keep
         # the immediately preceding tool group intact for correct follow-up,
@@ -1099,6 +1293,13 @@ def _run_subagent_loop(sub_messages, sub_sys, allowed, model, api_key, conn, sid
             except Exception:
                 pass
 
+        tool_calls, _sub_tc_warnings = _normalize_runtime_tool_calls(tool_calls)
+        if _sub_tc_warnings:
+            _warning_text = "\n".join(_sub_tc_warnings)
+            text = (text.rstrip() + "\n\n" + _warning_text).strip() if text else _warning_text
+            if state is not None:
+                state.emit(EV_WARN, text=_warning_text)
+
         if text:
             final_text = text
             _preview = f"  {DIM}[{log_prefix}] {text[:100]}...{R}" if len(text) > 100 else f"  {DIM}[{log_prefix}] {text}{R}"
@@ -1108,30 +1309,55 @@ def _run_subagent_loop(sub_messages, sub_sys, allowed, model, api_key, conn, sid
                 print(_preview)
 
         if tool_calls:
-            # Preserve a manageable current call for the next reasoning step.
-            # Extremely large generated arguments are compacted immediately to
-            # prevent a single write from exceeding the model context.
-            stored_tool_calls = []
-            for tc in tool_calls:
-                args_text = tc.get("function", {}).get("arguments", "")
-                stored_tool_calls.append(
-                    _compact_heavy_tool_call(tc)
-                    if len(args_text) > TOOL_OUTPUT_MAX_CHARS else tc
-                )
+            # Keep the current assistant call intact until its result has been
+            # consumed; pruning compacts older turns on the next iteration.
+            # This prevents invalid JSON/large writes from losing the exact
+            # arguments needed by the provider's tool-call protocol.
+            if len(tool_calls) > 16:
+                if state is not None:
+                    state.emit(EV_WARN, text="[subagent] Provider returned more than 16 tool calls; extras were discarded.")
+                tool_calls = tool_calls[:16]
             sub_messages.append({"role":"assistant","content": text or None,
-                                  "tool_calls": stored_tool_calls})
+                                  "tool_calls": tool_calls})
             for tc in tool_calls:
                 name = tc["function"]["name"]
-                try: args = json.loads(tc["function"]["arguments"])
-                except: args = {}
+                if name not in allowed_names:
+                    out = f"[tool_error: tool '{name}' is not available to this subagent]"
+                    sub_messages.append({"role":"tool","tool_call_id":tc.get("id",""),"content":out})
+                    continue
+                raw_args = tc.get("function", {}).get("arguments", "")
+                try:
+                    if not isinstance(raw_args, str):
+                        raise ValueError("tool arguments must be a JSON string")
+                    if len(raw_args) > 2 * 1024 * 1024:
+                        raise ValueError("tool arguments exceed 2 MiB")
+                    args = json.loads(raw_args)
+                    if not isinstance(args, dict):
+                        raise ValueError("tool arguments must be an object")
+                except Exception as e:
+                    out = f"[tool_error: invalid JSON arguments for '{name}': {e}]"
+                    sub_messages.append({"role":"tool","tool_call_id":tc.get("id",""),"content":out})
+                    continue
+                sig = _runtime_tool_call_signature(name, args)
+                if _dedup_should_block(name) and _sub_seen_calls.get(sig) == _sub_epoch:
+                    out = f"[dedup] Skipped unchanged duplicate call: {name}"
+                    sub_messages.append({"role":"tool","tool_call_id":tc.get("id",""),"content":out})
+                    continue
+                if _dedup_should_block(name):
+                    _sub_seen_calls[sig] = _sub_epoch
                 _sub_line = f"  {BLUE}[{log_prefix}:{name}]{R} {DIM}{json.dumps(args)[:80]}{R}"
                 if state is not None:
                     state.emit(EV_INFO, text=_sub_line, raw=True)
                 else:
                     print(_sub_line)
-                out = _dispatch_tool(name, args, model, api_key, conn, sid, state=state)
+                out_model, _out_history = run_tool(
+                    name, args, model, api_key, conn, sid, state=state)
                 sub_messages.append({"role":"tool","tool_call_id":tc.get("id",""),
-                                      "content": _head_tail(str(out), TOOL_OUTPUT_MAX_CHARS, label=f"{log_prefix}:{name}")})
+                                      "content": _head_tail(str(out_model), TOOL_OUTPUT_MAX_CHARS,
+                                                            label=f"{log_prefix}:{name}")})
+                if (_tool_may_mutate_state(name, args)
+                        and not _tool_was_definitely_blocked(str(out_model))):
+                    _sub_epoch += 1
         else:
             break
         steps += 1
@@ -1332,15 +1558,38 @@ _current_sid: str = ""  # session id hiện tại — set mỗi agent_turn
 _custom_perms: dict = {}
 _bash_allow_all: bool = False  # set True khi user chọn "a" = allow all bash
 
+_SENSITIVE_PATH_RE = re.compile(
+    r"(?:^|[/\\])(?:\.env(?:\.[^/\\]*)?|"
+    r"(?:[^/\\]*[._-])?(?:secrets?|credentials?|passwords?|tokens?|"
+    r"private[_-]?keys?|auth|production|prod)(?:[._-][^/\\]*)?)(?:$|[/\\])|"
+    r"(?:^|[/\\])(?:\.github/workflows|\.gitlab-ci|migrations?|deploy|production)(?:[/\\]|$)", re.I)
+
+def _tool_targets_sensitive(name, args) -> bool:
+    if name.startswith("mcp__"):
+        return True
+    if name == "bash":
+        command = str((args or {}).get("command", "")).lower()
+        return any(x in command for x in ("pip install", "npm install", "pnpm add", "yarn add",
+                                          "git checkout", "git restore", "git rebase",
+                                          "git branch -d", "git stash drop", "serve:"))
+    for key in ("path", "src", "dst"):
+        value = str((args or {}).get(key, ""))
+        if _SENSITIVE_PATH_RE.search(value):
+            return True
+    return False
+
 def _check_permission(name, args, agent=None):
     """Returns True if tool is allowed. Handles ask/deny/allow + wildcard patterns."""
-    ag = agent or _current_agent
     state = current_state()   # SessionState | None — xem 01d_events.py
-    # Merge: custom > plan-override > default
+    ag = agent or (getattr(state, "agent", None) if state is not None else _current_agent) or AGENT_BUILD
+    # Session-local overrides avoid leaking permissions across tabs/sessions.
     perms = dict(DEFAULT_PERMS)
+    perms.update(state.custom_perms if state is not None else _custom_perms)
+    # Plan mode is a hard read-only floor: custom /perm rules cannot weaken it.
     if ag == AGENT_PLAN:
         perms.update(PLAN_PERMS)
-    perms.update(_custom_perms)
+        if name.startswith("mcp__") and _mcp_name_may_mutate(name):
+            perms[name] = PERM_DENY
     # Exact match first, then wildcard (e.g. "mymcp_*": "ask")
     level = perms.get(name)
     if level is None:
@@ -1364,7 +1613,10 @@ def _check_permission(name, args, agent=None):
                     best_pattern = pattern
                     level = plevel
     if level is None:
-        level = PERM_ALLOW
+        level = PERM_ASK
+    if _tool_targets_sensitive(name, args) and level == PERM_ALLOW:
+        # Safety policy is not weakened by /perm allow or bash allow-all.
+        level = PERM_ASK
     if level == PERM_DENY:
         if state is not None:
             state.emit(EV_TOOL_DENIED, name=name, agent=ag)
@@ -1377,7 +1629,8 @@ def _check_permission(name, args, agent=None):
         # nhiều tab/nhiều người không đụng nhau qua global chung. CLI (state
         # is None) giữ hành vi cũ dùng global module-level.
         allow_all = state.bash_allow_all if state is not None else _bash_allow_all
-        if allow_all and name == "bash":
+        exact_allow = name in (state.tool_allow_all if state is not None else set())
+        if ((allow_all and name == "bash") or exact_allow) and not _tool_targets_sensitive(name, args):
             return True
 
         explanation = _explain_tool_action(name, args)
@@ -1394,6 +1647,7 @@ def _check_permission(name, args, agent=None):
                 kind="confirm",
                 default="n",
                 extra={"explanation": explanation, "name": name},
+                timeout=300,
             ) or "n"
             ans = str(ans).strip().lower()
         else:
@@ -1407,14 +1661,17 @@ def _check_permission(name, args, agent=None):
                 ans = "n"
 
         if ans in ("a", "all"):
+            if name == "bash":
+                if state is not None:
+                    state.bash_allow_all = True
+                else:
+                    _bash_allow_all = True
+            elif state is not None:
+                state.tool_allow_all.add(name)
             if state is not None:
-                state.bash_allow_all = True
+                state.emit(EV_INFO, text=f"✓ Allow '{name}' for this session.")
             else:
-                _bash_allow_all = True
-            if state is not None:
-                state.emit(EV_INFO, text="✓ Allow all bash for this session.")
-            else:
-                print(f"  {GREEN}✓ Allow all bash for this session.{R}")
+                print(f"  {GREEN}✓ Allowed '{name}' for this call.{R}")
             return True
         if ans not in ("y", "yes"):
             if state is not None:
@@ -1427,6 +1684,10 @@ def _check_permission(name, args, agent=None):
 
 # ── Dispatch ─────────────────────────────────────────────────────────────────
 def _dispatch_tool(name, args, model, api_key, conn, sid, state=None):
+    if not isinstance(name, str) or not name:
+        return "[tool_error: tool name must be a non-empty string]"
+    if not isinstance(args, dict):
+        return "[tool_error: tool arguments must be an object]"
     if name.startswith("mcp__"):
         # B3 FIX: trước đây return ngay tại đây, bỏ qua _check_permission()
         # hoàn toàn — /perm mcp__server_* deny/ask không có tác dụng gì dù
@@ -1480,6 +1741,8 @@ def _dispatch_tool(name, args, model, api_key, conn, sid, state=None):
         return fn(args)
     except KeyError as e:
         return f"[tool_error: missing required arg {e} for tool '{name}'. args received: {list(args.keys())}]"
+    except Exception as e:
+        return f"[tool_error: {type(e).__name__}: {e}]"
 
 TOOL_ICONS = {
     "bash":        f"{YELLOW}$",
@@ -1498,15 +1761,23 @@ TOOL_ICONS = {
     "todoread":    f"{MAGENTA}📋",
     "question":    f"{BLUE}❓",
     "task":        f"{CYAN}⇢",
+    "delegate":    f"{CYAN}⇢",
     "skill":       f"{YELLOW}★",
     "lsp":         f"{DIM}◎",
+    "view_symbol": f"{DIM}◎",
     "file_index":  f"{MAGENTA}⊞",
     "verify":      f"{CYAN}⊙",
 }
 
 def run_tool(name, args, model, api_key, conn, sid, state=None):
+    if not isinstance(name, str) or not name or not isinstance(args, dict):
+        error = "[tool_error: tool name must be a string and arguments must be an object]"
+        return error, error
     icon = TOOL_ICONS.get(name, f"{DIM}⚙")
-    preview = json.dumps(args, ensure_ascii=False)[:100]
+    try:
+        preview = json.dumps(args, ensure_ascii=False)[:100]
+    except Exception:
+        preview = "<unserializable arguments>"
     if state is not None:
         state.emit(EV_TOOL_START, name=name, args=args, preview=preview)
     else:
@@ -1535,7 +1806,11 @@ def run_tool(name, args, model, api_key, conn, sid, state=None):
     # write/edit/multiedit/apply_patch — chuẩn hoá về args={"path": dst}
     # trước khi gọi, để codeweb_maybe_auto_preview không cần biết gì về sự
     # khác biệt tên field giữa các tool.
-    if name in ("write", "edit", "multiedit", "apply_patch", "extract"):
+    success = not str(result).lstrip().lower().startswith((
+        "[error", "[not found", "[permission", "[policy", "[tool_error",
+        "[sandbox", "[mcp_error", "[unknown tool",
+    ))
+    if success and name in ("write", "edit", "multiedit", "apply_patch", "extract"):
         try:
             _cw_args = args
             if name == "extract" and isinstance(args, dict) and "dst" in args:

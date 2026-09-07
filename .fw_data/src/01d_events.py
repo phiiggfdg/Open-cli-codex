@@ -71,10 +71,25 @@ class PendingAsk:
         self.extra = extra or {}  # vd {"explanation": "...", "name": "bash"} cho permission ask
         self._event = threading.Event()
         self._answer = None
+        self._waiters = set()
+        self._lock = threading.Lock()
 
     def resolve(self, answer):
-        self._answer = answer
-        self._event.set()
+        with self._lock:
+            if not self._event.is_set():
+                self._answer = answer
+                self._event.set()
+
+    def add_waiter(self, waiter_id):
+        with self._lock:
+            self._waiters.add(waiter_id)
+
+    def remove_waiter(self, waiter_id):
+        with self._lock:
+            self._waiters.discard(waiter_id)
+            none_left = not self._waiters
+        if none_left and not self._event.is_set():
+            self.resolve(self.default)
 
     def wait(self, timeout: float | None = None):
         got = self._event.wait(timeout)
@@ -172,6 +187,8 @@ class SessionState:
         self.tool_mode = "batch"
         self.thinking_mode = "off"
         self.bash_allow_all = False
+        self.custom_perms = {}
+        self.tool_allow_all = set()
 
         self.bus = EventBus()
         self.lock = threading.RLock()   # 1 turn tại 1 thời điểm cho mỗi session
@@ -535,6 +552,7 @@ def make_web_ask_handler(send_json, pending_registry):
     def web_ask_handler(pending: PendingAsk):
         pid = _uuid.uuid4().hex[:12]
         pending_registry[pid] = pending
+        pending.add_waiter(pid)
         try:
             send_json({
                 "type": "ask",
@@ -545,5 +563,6 @@ def make_web_ask_handler(send_json, pending_registry):
                 "extra": pending.extra,
             })
         except Exception:
+            pending.remove_waiter(pid)
             pending.resolve(pending.default)
     return web_ask_handler

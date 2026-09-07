@@ -201,7 +201,7 @@ def fetch_models(api_key):
     try:
         req = _provider_request(models_url, api_key)
         with urllib.request.urlopen(req, timeout=8) as resp:
-            data = json.loads(resp.read())
+            data = json.loads(_read_response_limited(resp))
             ids  = p["parse_models"](data)
             # Tự học context limit từ API nếu có trả về
             _patch_context_limits_from_api(data)
@@ -878,7 +878,7 @@ def _call_simple(messages, model, api_key, retry_max=None, silent=False,
             else:
                 resp_cm = urllib.request.urlopen(req, timeout=120)
             with resp_cm as resp:
-                body = json.loads(resp.read())
+                body = json.loads(_read_response_limited(resp))
                 _rate_limit_mark()
                 pool_mark_success(api_key)  # key này ổn → giảm fail_count (decay)
                 if _active_provider == "aws_bedrock":
@@ -961,7 +961,7 @@ def _call_simple(messages, model, api_key, retry_max=None, silent=False,
                     else:
                         __import__("time").sleep(wait)
                     continue
-            body_txt = e.read().decode(errors="replace")
+            body_txt = e.read(16384).decode(errors="replace")
             return {"text": f"[HTTP {e.code}: {body_txt[:200]}]", "tool_calls": []}
         except Exception as e:
             _rate_limit_mark()
@@ -1033,7 +1033,33 @@ def _stream_response(resp, text_parts, tc_raw, usage_out, spinner_ref, reasoning
     _wb = getattr(state, "web_bridge", None) if state is not None else None
     _raw_line_count = 0
     _data_line_count = 0
-    for raw_line in resp:
+    _stream_bytes = 0
+    _MAX_SSE_LINE_BYTES = 1024 * 1024
+    _MAX_STREAM_BYTES = 32 * 1024 * 1024
+    # urllib responses expose readline(size), while the Bedrock/Anthropic/
+    # Responses adapters intentionally expose only the iterator protocol.
+    # Support both so the defensive bounds do not break those providers.
+    _readline = getattr(resp, "readline", None)
+    _line_iter = None if callable(_readline) else iter(resp)
+    while True:
+        if _line_iter is None:
+            raw_line = _readline(_MAX_SSE_LINE_BYTES + 1)
+        else:
+            try:
+                raw_line = next(_line_iter)
+            except StopIteration:
+                break
+        if not raw_line:
+            break
+        if isinstance(raw_line, str):
+            raw_line = raw_line.encode("utf-8")
+        elif not isinstance(raw_line, (bytes, bytearray)):
+            raise RuntimeError("stream yielded a non-bytes line")
+        if len(raw_line) > _MAX_SSE_LINE_BYTES:
+            raise RuntimeError("SSE line exceeds 1 MiB")
+        _stream_bytes += len(raw_line)
+        if _stream_bytes > _MAX_STREAM_BYTES:
+            raise RuntimeError("stream response exceeds 32 MiB")
         if _wb is not None and _wb.consume_stream_interrupt():
             raise KeyboardInterrupt()
         line = raw_line.decode("utf-8").strip()
@@ -1058,6 +1084,8 @@ def _stream_response(resp, text_parts, tc_raw, usage_out, spinner_ref, reasoning
         if ds == "[DONE]": break
         try:
             chunk  = json.loads(ds)
+            if not isinstance(chunk, dict):
+                continue
             if _cache_debug:
                 # BUG FIX (log hiển thị): trước đây _cache_log() print()
                 # thẳng ra stdout trong khi spinner vẫn đang chạy (spinner
@@ -1076,10 +1104,10 @@ def _stream_response(resp, text_parts, tc_raw, usage_out, spinner_ref, reasoning
                     spinner_ref[0].stop()
                 if _data_line_count == 1:
                     _cache_log("?", "stream-first-chunk", json.dumps(chunk, ensure_ascii=False)[:500])
-            if chunk.get("usage"):
+            if isinstance(chunk.get("usage"), dict):
                 usage_out.update(chunk["usage"])
             choices = chunk.get("choices") or []
-            if not choices:
+            if not isinstance(choices, list) or not choices:
                 # BUG FIX (nghiêm trọng): 1 số gateway OpenAI-compatible
                 # (xác nhận thật với Upstage — Solar Pro4) gửi chunk usage
                 # RIÊNG ở cuối stream với "choices": [] (mảng rỗng), khác
@@ -1097,12 +1125,18 @@ def _stream_response(resp, text_parts, tc_raw, usage_out, spinner_ref, reasoning
                 # toàn, không cần thử choices[0].
                 continue
             choice = choices[0]
+            if not isinstance(choice, dict):
+                continue
             if choice.get("finish_reason"):
                 finish_reason = choice["finish_reason"]
             delta = choice.get("delta") or {}
+            if not isinstance(delta, dict):
+                continue
             # OpenAI-compatible providers use either field; do not restrict
             # `reasoning` to Upstage because the support probe checks both.
             reasoning_delta = delta.get("reasoning_content") or delta.get("reasoning")
+            if not isinstance(reasoning_delta, str):
+                reasoning_delta = ""
             if reasoning_parts is not None and reasoning_delta:
                 reasoning_parts.append(reasoning_delta)
             if reasoning_delta and (
@@ -1129,9 +1163,10 @@ def _stream_response(resp, text_parts, tc_raw, usage_out, spinner_ref, reasoning
                 else:
                     _chunk = reasoning_delta.replace("\n", f"{R}\n{DIM}│ {R}{DIM}")
                     print(f"{DIM}{_chunk}{R}", end="", flush=True)
-            if delta.get("thinking"):
+            thinking_delta = delta.get("thinking") if isinstance(delta.get("thinking"), str) else ""
+            if thinking_delta:
                 if thinking_parts is not None:
-                    thinking_parts.append(delta["thinking"])
+                    thinking_parts.append(thinking_delta)
                 if first_thinking:
                     if spinner_ref:
                         spinner_ref[0].stop()
@@ -1157,14 +1192,18 @@ def _stream_response(resp, text_parts, tc_raw, usage_out, spinner_ref, reasoning
                         print(f"{DIM}│ {R}", end="", flush=True)
                     first_thinking = False
                 if state is not None:
-                    state.emit(EV_THINKING_DELTA, text=delta["thinking"])
+                    state.emit(EV_THINKING_DELTA, text=thinking_delta)
                 else:
-                    _chunk = delta["thinking"].replace("\n", f"{R}\n{DIM}│ {R}{DIM}")
+                    _chunk = thinking_delta.replace("\n", f"{R}\n{DIM}│ {R}{DIM}")
                     print(f"{DIM}{_chunk}{R}", end="", flush=True)
-            if delta.get("thinking_signature") and thinking_sig is not None:
-                thinking_sig.append(delta["thinking_signature"])
-            if delta.get("redacted_thinking_data") and redacted_parts is not None:
-                redacted_parts.append(delta["redacted_thinking_data"])
+            signature_delta = (delta.get("thinking_signature")
+                               if isinstance(delta.get("thinking_signature"), str) else "")
+            if signature_delta and thinking_sig is not None:
+                thinking_sig.append(signature_delta)
+            redacted_delta = (delta.get("redacted_thinking_data")
+                              if isinstance(delta.get("redacted_thinking_data"), str) else "")
+            if redacted_delta and redacted_parts is not None:
+                redacted_parts.append(redacted_delta)
                 if first_thinking:
                     if spinner_ref:
                         spinner_ref[0].stop()
@@ -1174,7 +1213,11 @@ def _stream_response(resp, text_parts, tc_raw, usage_out, spinner_ref, reasoning
                         print(f"\n{DIM}┌─ thinking ─────────────────────{R}")
                         print(f"{DIM}│ (redacted by safety system){R}", end="", flush=True)
                     first_thinking = False
-            if first_token and (delta.get("content") or delta.get("tool_calls")):
+            delta_tool_calls = delta.get("tool_calls") or []
+            if not isinstance(delta_tool_calls, list):
+                delta_tool_calls = []
+            content_delta = delta.get("content") if isinstance(delta.get("content"), str) else ""
+            if first_token and (content_delta or delta_tool_calls):
                 if spinner_ref:
                     spinner_ref[0].stop()
                 if state is None:
@@ -1182,15 +1225,19 @@ def _stream_response(resp, text_parts, tc_raw, usage_out, spinner_ref, reasoning
                         print(f"\n{DIM}└─────────────────────────────────{R}")
                     print(f"\n{GREEN}{BOLD}AI:{R} ", end="", flush=True)
                 first_token = False
-            if delta.get("content"):
+            if content_delta:
                 if state is not None:
-                    state.emit(EV_TEXT_DELTA, text=delta["content"])
+                    state.emit(EV_TEXT_DELTA, text=content_delta)
                 else:
-                    print(delta["content"], end="", flush=True)
-                text_parts.append(delta["content"])
-            for tc in delta.get("tool_calls") or []:
+                    print(content_delta, end="", flush=True)
+                text_parts.append(content_delta)
+            for tc in delta_tool_calls:
+                if not isinstance(tc, dict):
+                    continue
                 idx = tc.get("index", 0)
-                tc_id = tc.get("id")
+                if not isinstance(idx, (int, str)):
+                    idx = len(tc_raw)
+                tc_id = tc.get("id") if isinstance(tc.get("id"), str) else None
                 # Bất kỳ OpenAI-compatible gateway nào cũng có thể tái dùng
                 # index=0 cho nhiều call. ID khác nhau luôn là hai call thật;
                 # tách theo ID để không gộp nhầm, kể cả khi cùng gọi một tool.
@@ -1204,10 +1251,15 @@ def _stream_response(resp, text_parts, tc_raw, usage_out, spinner_ref, reasoning
                                    "_name_parts": []}
                 if tc.get("id"): tc_raw[idx]["id"] = tc["id"]
                 fn = tc.get("function", {})
-                if fn.get("name"):
-                    tc_raw[idx]["_name_parts"].append(fn["name"])
-                    tc_raw[idx]["function"]["name"] += fn["name"]
-                if fn.get("arguments"): tc_raw[idx]["function"]["arguments"] += fn["arguments"]
+                if not isinstance(fn, dict):
+                    fn = {}
+                fn_name = fn.get("name") if isinstance(fn.get("name"), str) else ""
+                fn_args = fn.get("arguments") if isinstance(fn.get("arguments"), str) else ""
+                if fn_name:
+                    tc_raw[idx]["_name_parts"].append(fn_name)
+                    tc_raw[idx]["function"]["name"] += fn_name
+                if fn_args:
+                    tc_raw[idx]["function"]["arguments"] += fn_args
                 if handle_gemini_metadata:
                     # Gemini-only: thought_signature bắt buộc phải replay lại
                     # nguyên văn ở turn sau khi message có tool_calls, nếu
@@ -1223,7 +1275,9 @@ def _stream_response(resp, text_parts, tc_raw, usage_out, spinner_ref, reasoning
                     # nhánh replay Gemini bên dưới (a_msg) rồi bị strip ra —
                     # 3 provider khác (OpenAI mặc định/Anthropic/Bedrock) và
                     # mọi custom provider khác không bao giờ đọc field này.
-                    _sig = (tc.get("extra_content", {}) or {}).get("google", {}).get("thought_signature")
+                    _extra = tc.get("extra_content", {})
+                    _google = _extra.get("google", {}) if isinstance(_extra, dict) else {}
+                    _sig = _google.get("thought_signature") if isinstance(_google, dict) else None
                     if _sig:
                         tc_raw[idx]["_thought_signature"] = _sig
         except (json.JSONDecodeError, KeyError, IndexError) as e:
@@ -1272,41 +1326,112 @@ def _sanitize_tool_turns(messages: list) -> list:
     brute-force thật, không phải lý thuyết. Lọc bỏ orphan TRƯỚC khi chạy
     logic cũ (chỉ xử lý chiều thiếu — assistant tool_calls không có result).
     """
-    # Bước 1: tập hợp toàn bộ tool_call_id hợp lệ (do assistant trong CHÍNH
-    # list này phát ra) — chỉ những id này mới có quyền xuất hiện ở role=tool.
-    valid_ids = {
-        tc.get("id", "")
-        for m in messages if m.get("role") == "assistant"
-        for tc in (m.get("tool_calls") or [])
-    }
-    filtered = [
-        m for m in messages
-        if not (m.get("role") == "tool" and m.get("tool_call_id", "") not in valid_ids)
-    ]
+    # Chuẩn hoá nhẹ trước khi duyệt. History có thể đến từ DB cũ hoặc bị
+    # provider trả về lệch schema; một phần tử không phải dict/đáy tool_call
+    # hỏng không được phép làm agent turn crash trước khi API được gọi.
+    safe_messages = []
+    for raw_msg in (messages or []):
+        if not isinstance(raw_msg, dict):
+            continue
+        msg = dict(raw_msg)
+        if msg.get("role") == "assistant" and "tool_calls" in msg:
+            raw_tcs = msg.get("tool_calls")
+            if not isinstance(raw_tcs, list):
+                raw_tcs = []
+            clean_tcs = []
+            for raw_tc in raw_tcs:
+                if not isinstance(raw_tc, dict):
+                    continue
+                fn = raw_tc.get("function")
+                if not isinstance(fn, dict):
+                    continue
+                tc_id = raw_tc.get("id")
+                name = fn.get("name")
+                args = fn.get("arguments", "{}")
+                if not isinstance(tc_id, str) or not tc_id.strip():
+                    continue
+                if not isinstance(name, str) or not name.strip():
+                    continue
+                # Một số history cũ lưu arguments đã decode thành object;
+                # chuyển lại thành JSON để adapter nhận đúng kiểu chuẩn.
+                if isinstance(args, (dict, list)):
+                    try:
+                        args = json.dumps(args, ensure_ascii=False)
+                    except Exception:
+                        continue
+                if not isinstance(args, str) or len(args) > 2 * 1024 * 1024:
+                    continue
+                tc = dict(raw_tc)
+                tc["id"] = tc_id.strip()[:256]
+                tc_fn = dict(fn)
+                tc_fn["name"] = name.strip()
+                tc_fn["arguments"] = args
+                tc["function"] = tc_fn
+                clean_tcs.append(tc)
+            if clean_tcs:
+                msg["tool_calls"] = clean_tcs
+            else:
+                msg.pop("tool_calls", None)
+        safe_messages.append(msg)
 
+    # Rebuild each assistant→tool group in chronological order. This removes
+    # orphan results wherever they appear (not merely those whose id is absent
+    # globally), pairs duplicate provider ids by occurrence, and guarantees
+    # every published id is unique across the history sent to the API.
     result = []
-    for i, msg in enumerate(filtered):
-        result.append(msg)
-        if msg.get("role") != "assistant":
+    used_ids = set()
+    i = 0
+    while i < len(safe_messages):
+        msg = safe_messages[i]
+        if msg.get("role") == "tool":
+            i += 1
             continue
-        tcs = msg.get("tool_calls") or []
-        if not tcs:
+        tcs = msg.get("tool_calls") if msg.get("role") == "assistant" else None
+        if not isinstance(tcs, list) or not tcs:
+            result.append(msg)
+            i += 1
             continue
-        # Tìm tool result ngay sau
-        existing_ids = set()
-        j = i + 1
-        while j < len(filtered) and filtered[j].get("role") == "tool":
-            existing_ids.add(filtered[j].get("tool_call_id", ""))
-            j += 1
-        # Inject placeholder cho tool_call nào thiếu response
+
+        normalized_tcs = []
+        original_ids = []
         for tc in tcs:
-            tc_id = tc.get("id", "")
-            if tc_id not in existing_ids:
+            original_id = tc.get("id", "")
+            unique_id = original_id
+            suffix = 2
+            while unique_id in used_ids:
+                unique_id = f"{original_id}_{suffix}"
+                suffix += 1
+            used_ids.add(unique_id)
+            tc_copy = dict(tc)
+            tc_copy["id"] = unique_id
+            normalized_tcs.append(tc_copy)
+            original_ids.append(original_id)
+        msg_copy = dict(msg)
+        msg_copy["tool_calls"] = normalized_tcs
+        result.append(msg_copy)
+
+        j = i + 1
+        following = []
+        while j < len(safe_messages) and safe_messages[j].get("role") == "tool":
+            following.append(safe_messages[j])
+            j += 1
+        consumed = set()
+        for tc, original_id in zip(normalized_tcs, original_ids):
+            match_index = next((k for k, tool_msg in enumerate(following)
+                                if k not in consumed
+                                and tool_msg.get("tool_call_id", "") == original_id), None)
+            if match_index is None:
                 result.append({
                     "role": "tool",
-                    "tool_call_id": tc_id,
-                    "content": "[tool_error: response missing — tool call was incomplete]"
+                    "tool_call_id": tc["id"],
+                    "content": "[tool_error: response missing — tool call was incomplete]",
                 })
+            else:
+                consumed.add(match_index)
+                tool_copy = dict(following[match_index])
+                tool_copy["tool_call_id"] = tc["id"]
+                result.append(tool_copy)
+        i = j
     return result
 
 
@@ -2015,7 +2140,7 @@ def _probe_thinking_support(model: str, api_key: str) -> bool:
         else:
             resp_cm = urllib.request.urlopen(req, timeout=30)
         with resp_cm as resp:
-            body = json.loads(resp.read())
+            body = json.loads(_read_response_limited(resp))
         if _active_provider == "aws_bedrock":
             # Bedrock Converse: reasoningContent nằm trong content blocks.
             blocks = (body.get("output", {}).get("message", {}) or {}).get("content", [])
@@ -2072,7 +2197,7 @@ def _probe_thinking_disable(model: str, api_key: str) -> bool:
         else:
             resp_cm = urllib.request.urlopen(req, timeout=30)
         with resp_cm as resp:
-            body = json.loads(resp.read())
+            body = json.loads(_read_response_limited(resp))
         if _active_provider == "aws_bedrock":
             blocks = (body.get("output", {}).get("message", {}) or {}).get("content", [])
             return not any("reasoningContent" in b for b in blocks)
@@ -2129,7 +2254,7 @@ def call_api_stream(messages, model, api_key, tool_choice="auto", session_id=Non
         "max_tokens": _known_max_tokens.get(model, 32768),
         "stream": True,
         "stream_options": {"include_usage": True},
-        "parallel_tool_calls": True,
+        "parallel_tool_calls": ((getattr(state, "tool_mode", _tool_mode) if state is not None else _tool_mode) != "sequential"),
     }
     if not _no_temperature(model):
         payload["temperature"] = 0.5
@@ -2254,7 +2379,7 @@ def call_api_stream(messages, model, api_key, tool_choice="auto", session_id=Non
 
         except urllib.error.HTTPError as e:
             _rate_limit_mark()
-            body_txt = e.read().decode(errors="replace")
+            body_txt = e.read(16384).decode(errors="replace")
 
             # 400 max_tokens: model có giới hạn output riêng (Fireworks/Cohere).
             # Cohere báo lỗi dạng "max tokens must be less than or equal to N"
@@ -2586,7 +2711,11 @@ def call_api_stream(messages, model, api_key, tool_choice="auto", session_id=Non
     else:
         # Hết retry mà vẫn chưa break
         spinner_ref[0].stop()
-        print(f"\n{RED}  ✗ Quá số lần retry ({_RETRY_MAX}). Bỏ qua.{R}")
+        _retry_exhausted = f"  ✗ Quá số lần retry ({_RETRY_MAX}). Bỏ qua."
+        if state is not None:
+            state.emit(EV_ERROR, text=_retry_exhausted)
+        else:
+            print(f"\n{RED}{_retry_exhausted}{R}")
         return {"text": "", "tool_calls": [], "usage": {}, "truncated": False, "reasoning": "", "thinking": "", "thinking_signature": "", "redacted_thinking_data": ""}
 
     spinner_ref[0].stop()
@@ -2605,7 +2734,11 @@ def call_api_stream(messages, model, api_key, tool_choice="auto", session_id=Non
         print()
     truncated = (finish_reason == "length")
     if truncated:
-        print(f"{YELLOW}  ⚠ Output bị cắt (finish_reason=length) — tự động tiếp tục...{R}")
+        _truncation_notice = "  ⚠ Output bị cắt (finish_reason=length) — tự động tiếp tục..."
+        if state is not None:
+            state.emit(EV_WARN, text=_truncation_notice)
+        else:
+            print(f"{YELLOW}{_truncation_notice}{R}")
     final_text = "".join(text_parts)
     final_tcs  = list(tc_raw.values())
     # BUG FIX (log): turn "thành công" (không lỗi HTTP, không exception)
@@ -2763,20 +2896,23 @@ OS: {os_name}"""
     _system_static_cache[key] = result
     return result
 
-def build_mode_hint(agent=AGENT_BUILD) -> str:
+def build_mode_hint(agent=AGENT_BUILD, state=None) -> str:
     """Dynamic mode hints — KHÔNG nằm trong system prompt để không phá prefix cache.
     Được append vào cuối user message mỗi turn nếu có nội dung.
     Thay đổi khi user toggle /sequential hoặc /batch, nhưng chỉ ảnh hưởng đến suffix,
     không phá cache prefix (system + messages cũ)."""
     parts = []
-    if _tool_mode == "sequential":
+    effective_tool_mode = getattr(state, "tool_mode", _tool_mode) if state is not None else _tool_mode
+    if effective_tool_mode == "sequential":
         parts.append(
             "\n\n[Mode: sequential] Làm từng bước: một tool call mỗi turn, "
-            "verify kết quả trước khi tiếp theo. Ưu tiên độ chính xác hơn tốc độ."
+            "verify kết quả trước khi tiếp theo. Ưu tiên độ chính xác hơn tốc độ. "
+            "Nếu model trả nhiều tool, hệ thống chỉ chạy tool đầu tiên."
         )
     if agent == AGENT_PLAN:
         parts.append(
-            "\n\n[Mode: plan/read-only] KHÔNG write, edit, hoặc apply patch. "
+            "\n\n[Mode: plan/read-only] KHÔNG write, delete, extract, edit, multiedit, "
+            "apply_patch, Bash, hoặc MCP mutation. "
             "Chỉ đọc, phân tích, và đề xuất. Bash bị từ chối ở mode này; "
             "dùng read/glob/grep hoặc chuyển sang build mode nếu thật sự cần chạy lệnh."
         )
@@ -2844,6 +2980,8 @@ def _inject_agents_md_once(messages: list) -> list:
     marker = "[AGENTS.MD RULES]"
     # Kiểm tra xem đã inject chưa
     for m in messages:
+        if not isinstance(m, dict):
+            continue
         c = m.get("content") or ""
         if isinstance(c, str) and marker in c:
             return messages  # đã có rồi
@@ -2858,7 +2996,8 @@ def _get_git_branch() -> str:
     try:
         branch = subprocess.run(
             ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-            capture_output=True, text=True, timeout=3, cwd=os.getcwd()
+            capture_output=True, text=True, timeout=3,
+            cwd=str(_workspace_root() if globals().get("_project_dir") is not None else Path.cwd())
         ).stdout.strip()
         return branch if branch and branch != "HEAD" else ""
     except Exception:
@@ -2878,6 +3017,8 @@ def _inject_git_context_once(messages: list) -> list:
         return messages
     marker = "[GIT CONTEXT]"
     for m in messages:
+        if not isinstance(m, dict):
+            continue
         c = m.get("content") or ""
         if isinstance(c, str) and marker in c:
             return messages  # đã có
@@ -2890,6 +3031,10 @@ def _inject_git_context_once(messages: list) -> list:
 
 def agent_turn(messages, model, api_key, conn, sid, max_steps=20, agent=AGENT_BUILD, state=None):
     global _current_agent, _todowrite_calls_this_turn, _current_sid
+    try:
+        max_steps = max(1, min(int(max_steps), 100))
+    except (TypeError, ValueError):
+        max_steps = 20
     # state: SessionState | None — khi có, output đi qua state.emit(...) thay vì
     # print() trực tiếp (xem 01d_events.py). None → hành vi CLI cũ y hệt, dùng
     # khi agent_turn() được gọi từ nơi chưa migrate (vd tool_task() subagent).
@@ -2944,14 +3089,14 @@ _BASH_READONLY_RE = re.compile(
 
 _LOCAL_MUTATING_TOOLS = {
     "write", "delete", "extract", "edit", "multiedit", "apply_patch",
-    "todowrite", "task",
+    "todowrite", "task", "delegate",
 }
 
 # These tools are interactive, time-varying, or may legitimately be retried
 # with identical arguments. Hard-blocking them creates false positives and the
 # warning often costs more tokens than their short result.
 _DEDUP_EXEMPT_TOOLS = {
-    "question", "verify", "webfetch", "websearch", "task", "todowrite",
+    "question", "verify", "webfetch", "websearch", "task", "todowrite", "file_index",
 }
 
 # MCP schemas are dynamic. Only names that clearly describe a side effect keep
@@ -2960,7 +3105,9 @@ _DEDUP_EXEMPT_TOOLS = {
 _MCP_MUTATION_HINT_RE = re.compile(
     r"(?:^|_)(?:create|update|delete|replace|write|patch|edit|add|remove|move|"
     r"rename|send|post|publish|upload|finalize|restore|execute|run|start|stop|"
-    r"manage|mutate)(?:_|$)",
+    r"manage|mutate|archive|close|merge|approve|assign|invite|upsert|set|trigger|"
+    r"deploy|commit|submit|cancel|enable|disable|link|unlink|comment|reply|react|"
+    r"like|follow|unfollow|schedule|unschedule|transfer|grant|revoke)(?:_|$)",
     re.IGNORECASE,
 )
 
@@ -3009,6 +3156,66 @@ def _runtime_tool_call_signature(name: str, args: dict) -> str:
     elif name == "bash":
         normalized.setdefault("timeout", 30)
     return f"{name}:{json.dumps(normalized, sort_keys=True, separators=(',', ':'), ensure_ascii=False)}"
+
+
+def _normalize_runtime_tool_calls(raw_tcs):
+    """Validate provider tool calls before they enter history/dispatch.
+
+    Gateways occasionally emit a partial tool-call object (missing function,
+    id, or string arguments).  The old loop indexed those fields directly,
+    so one malformed SSE response could terminate the whole agent turn.  Keep
+    valid calls, generate a local id when a provider omitted one, and report
+    discarded entries without allowing untrusted sizes to reach json.loads.
+    """
+    if raw_tcs is None:
+        return [], []
+    if not isinstance(raw_tcs, list):
+        return [], ["[tool_error: provider returned malformed tool_calls]"]
+    clean = []
+    warnings = []
+    used_ids = set()
+    for index, raw_tc in enumerate(raw_tcs):
+        if not isinstance(raw_tc, dict):
+            warnings.append(f"[tool_error: discarded malformed tool call #{index + 1}]")
+            continue
+        fn = raw_tc.get("function")
+        if not isinstance(fn, dict):
+            warnings.append(f"[tool_error: discarded tool call #{index + 1} without function]")
+            continue
+        name = fn.get("name")
+        if not isinstance(name, str) or not name.strip():
+            warnings.append(f"[tool_error: discarded tool call #{index + 1} without a name]")
+            continue
+        raw_args = fn.get("arguments", "{}")
+        if isinstance(raw_args, (dict, list)):
+            try:
+                raw_args = json.dumps(raw_args, ensure_ascii=False)
+            except Exception:
+                raw_args = None
+        if not isinstance(raw_args, str):
+            warnings.append(f"[tool_error: discarded `{name}` with invalid arguments]")
+            continue
+        if len(raw_args) > 2 * 1024 * 1024:
+            warnings.append(f"[tool_error: discarded `{name}` because arguments exceed 2 MiB]")
+            continue
+        tc_id = raw_tc.get("id")
+        if not isinstance(tc_id, str) or not tc_id.strip():
+            tc_id = f"call_auto_{index + 1}"
+        tc_id = tc_id.strip()[:256]
+        base_id = tc_id
+        suffix = 2
+        while tc_id in used_ids:
+            tc_id = f"{base_id}_{suffix}"
+            suffix += 1
+        used_ids.add(tc_id)
+        tc = dict(raw_tc)
+        tc["id"] = tc_id
+        tc_fn = dict(fn)
+        tc_fn["name"] = name.strip()
+        tc_fn["arguments"] = raw_args
+        tc["function"] = tc_fn
+        clean.append(tc)
+    return clean, warnings
 
 
 def _tool_was_definitely_blocked(result: str) -> bool:
@@ -3067,6 +3274,10 @@ def _agent_turn_inner(messages, model, api_key, conn, sid, max_steps, agent, sta
     # MỚI, để 1 lỗi ở turn trước không kẹt sai depth cho các turn sau, làm
     # subagent hợp lệ bị từ chối oan vì depth "ảo" còn sót lại).
     _task_depth = 0
+
+    # Session databases and imported histories are external inputs. Normalize
+    # them before any injector/pruner calls .get() on message objects.
+    messages = _sanitize_tool_turns(messages if isinstance(messages, list) else [])
 
     # Inject AGENTS.md 1 lần vào đầu conversation (không lặp mỗi turn)
     messages = _inject_agents_md_once(messages)
@@ -3152,7 +3363,13 @@ def _agent_turn_inner(messages, model, api_key, conn, sid, max_steps, agent, sta
         if _had_writes_last_step:
             _cache_validate_all()
             _had_writes_last_step = False
+        _messages_before_compact = messages
         messages = maybe_compact(messages, model, api_key, conn, sid)
+        if messages is not _messages_before_compact:
+            # Compaction may remove the earlier result that justified a
+            # duplicate guard. Never carry stale signatures across it.
+            _seen_calls_this_turn.clear()
+            _mutation_epoch += 1
         # Bug C fix: sau compact, marker AGENTS.md + git bị xoá khỏi history
         # → phải inject lại để prefix cache không bị phá ở step tiếp theo.
         messages = _inject_agents_md_once(messages)
@@ -3177,7 +3394,7 @@ def _agent_turn_inner(messages, model, api_key, conn, sid, max_steps, agent, sta
         # Append 2 message mới làm position thay đổi mỗi step → phá prefix cache.
         # Prepend vào content message cuối → chỉ suffix của message đó thay đổi,
         # toàn bộ history trước vẫn cache được.
-        mode_hint = build_mode_hint(agent)
+        mode_hint = build_mode_hint(agent, state)
         if mode_hint:
             messages_with_cache = list(messages_with_cache)
             # Tìm user message cuối để append hint vào
@@ -3222,9 +3439,16 @@ def _agent_turn_inner(messages, model, api_key, conn, sid, max_steps, agent, sta
         tc_mode = "auto"
         result  = call_api_stream(full, model, api_key, tool_choice=tc_mode, session_id=sid,
                                    tools=_turn_api_tools, state=state)
-        text    = result["text"]
-        tcs     = result["tool_calls"]
-        usage   = result["usage"]
+        if not isinstance(result, dict):
+            result = {"text": "", "tool_calls": [], "usage": {}, "truncated": False}
+        text    = result.get("text") or ""
+        tcs, _tc_warnings = _normalize_runtime_tool_calls(result.get("tool_calls"))
+        usage   = result.get("usage") if isinstance(result.get("usage"), dict) else {}
+        if _tc_warnings:
+            warning_text = "\n".join(_tc_warnings)
+            text = (text.rstrip() + "\n\n" + warning_text).strip() if text else warning_text
+            if state is not None:
+                state.emit(EV_WARN, text=warning_text)
         truncated = result.get("truncated", False)
         if result.get("interrupted"):
             if text:
@@ -3259,8 +3483,15 @@ def _agent_turn_inner(messages, model, api_key, conn, sid, max_steps, agent, sta
             full2   = [{"role":"system","content":build_system(agent)}] + messages
             result2 = call_api_stream(full2, model, api_key, tool_choice="auto", session_id=sid,
                                        tools=_turn_api_tools, state=state)
-            text2   = result2["text"]
-            tcs2    = result2["tool_calls"]
+            if not isinstance(result2, dict):
+                result2 = {"text": "", "tool_calls": [], "usage": {}, "truncated": False}
+            text2   = result2.get("text") or ""
+            tcs2, _tc2_warnings = _normalize_runtime_tool_calls(result2.get("tool_calls"))
+            if _tc2_warnings:
+                warning_text = "\n".join(_tc2_warnings)
+                text2 = (text2.rstrip() + "\n\n" + warning_text).strip() if text2 else warning_text
+                if state is not None:
+                    state.emit(EV_WARN, text=warning_text)
             if result2.get("interrupted"):
                 if text2:
                     partial = text2.rstrip() + "\n\n[interrupted]"
@@ -3290,10 +3521,11 @@ def _agent_turn_inner(messages, model, api_key, conn, sid, max_steps, agent, sta
             text      = text + text2
             tcs       = tcs2
             truncated = result2.get("truncated", False)
-            total_in     += result2["usage"].get("prompt_tokens", 0)
-            total_out    += result2["usage"].get("completion_tokens", 0)
+            _usage2 = result2.get("usage") if isinstance(result2.get("usage"), dict) else {}
+            total_in     += _usage2.get("prompt_tokens", 0)
+            total_out    += _usage2.get("completion_tokens", 0)
             if _active_provider in _CACHE_PROVIDERS:
-                total_cached += (result2["usage"].get("prompt_tokens_details") or {}).get("cached_tokens", 0)
+                total_cached += (_usage2.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
             if _active_provider == "requesty":
                 _requesty_turn_cost += float(result2["usage"].get("cost") or 0)
             continue_count += 1
@@ -3385,7 +3617,15 @@ def _agent_turn_inner(messages, model, api_key, conn, sid, max_steps, agent, sta
                 # Bedrock/custom provider khác.
                 if _active_provider == "gemini" and tcs:
                     _first_sig = tcs[0].pop("_thought_signature", None) or "skip_thought_signature_validator"
-                    tcs[0].setdefault("extra_content", {}).setdefault("google", {})["thought_signature"] = _first_sig
+                    _extra = tcs[0].get("extra_content")
+                    if not isinstance(_extra, dict):
+                        _extra = {}
+                        tcs[0]["extra_content"] = _extra
+                    _google = _extra.get("google")
+                    if not isinstance(_google, dict):
+                        _google = {}
+                        _extra["google"] = _google
+                    _google["thought_signature"] = _first_sig
                     for _tc in tcs[1:]:
                         _tc.pop("_thought_signature", None)
                 else:
@@ -3404,17 +3644,45 @@ def _agent_turn_inner(messages, model, api_key, conn, sid, max_steps, agent, sta
         if state is None or not (getattr(state, "web_bridge", None) and state.web_bridge.is_armed()):
             print()
         tool_results         = []   # sent to model (larger)
-
-        # Cùng bug với print() trần trong call_api_stream (09_api_system.py
-        # ~dòng 1364, đã sửa) -- dòng trống này chạy vô điều kiện mỗi khi
-        # có tool_calls, kể cả khi web đang armed. Áp dụng cùng guard.
-        if state is None or not (getattr(state, "web_bridge", None) and state.web_bridge.is_armed()):
-            print()
         tool_results_history = []   # saved to DB (smaller)
+        _sequential_taken = False
         for _tc_index, tc in enumerate(tcs):
-            name = tc["function"]["name"]
-            try: args = json.loads(tc["function"].get("arguments") or "{}")
-            except: args = {}
+            fn = tc.get("function") if isinstance(tc, dict) else None
+            name = fn.get("name") if isinstance(fn, dict) else ""
+            tc_id = tc.get("id", "") if isinstance(tc, dict) else ""
+            raw_args = fn.get("arguments") if isinstance(fn, dict) else "{}"
+            if not isinstance(name, str) or not name.strip():
+                bad = "[tool_error: provider returned a tool call without a valid name]"
+                tool_results.append({"role":"tool","tool_call_id":tc_id,"content":bad})
+                tool_results_history.append({"role":"tool","tool_call_id":tc_id,"content":bad})
+                continue
+            name = name.strip()
+            if not isinstance(raw_args, str):
+                bad = f"[tool_error: invalid JSON arguments for '{name}': arguments must be a string]"
+                tool_results.append({"role":"tool","tool_call_id":tc_id,"content":bad})
+                tool_results_history.append({"role":"tool","tool_call_id":tc_id,"content":bad})
+                continue
+            if len(raw_args) > 2 * 1024 * 1024:
+                bad = f"[tool_error: invalid JSON arguments for '{name}': arguments exceed 2 MiB]"
+                tool_results.append({"role":"tool","tool_call_id":tc_id,"content":bad})
+                tool_results_history.append({"role":"tool","tool_call_id":tc_id,"content":bad})
+                continue
+            try:
+                args = json.loads(raw_args)
+                if not isinstance(args, dict):
+                    raise ValueError("arguments must be an object")
+            except Exception as e:
+                bad = f"[tool_error: invalid JSON arguments for '{name}': {e}]"
+                tool_results.append({"role":"tool","tool_call_id":tc_id,"content":bad})
+                tool_results_history.append({"role":"tool","tool_call_id":tc_id,"content":bad})
+                continue
+            effective_tool_mode = (getattr(state, "tool_mode", _tool_mode)
+                                   if state is not None else _tool_mode)
+            if effective_tool_mode == "sequential" and _sequential_taken:
+                skipped = "[sequential] Skipped: execute one tool call per step in sequential mode."
+                tool_results.append({"role":"tool","tool_call_id":tc.get("id",""),"content":skipped})
+                tool_results_history.append({"role":"tool","tool_call_id":tc.get("id",""),"content":skipped})
+                continue
             # Dedup guard: block stable/side-effecting identical calls only when
             # no observable mutation attempt happened in between. Dynamic,
             # interactive and read-only MCP tools remain retryable.
@@ -3459,6 +3727,7 @@ def _agent_turn_inner(messages, model, api_key, conn, sid, max_steps, agent, sta
                         pass
             _epoch_before_tool = _mutation_epoch
             out_model, out_history = run_tool(name, args, model, api_key, conn, sid, state=state)
+            _sequential_taken = True
             _definitely_blocked = _tool_was_definitely_blocked(out_model)
             if _may_mutate_state and not _definitely_blocked:
                 _mutation_epoch += 1

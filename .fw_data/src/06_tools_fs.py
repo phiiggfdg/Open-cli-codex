@@ -217,6 +217,31 @@ def _validate_bash_command(command: str, for_serve: bool = False):
 _SERVE_PREFIX_RE = re.compile(r"^\s*serve\s*:\s*", re.IGNORECASE)
 _serve_procs: dict[str, dict] = {}  # project_dir_str -> {"proc": Popen, "cmd": str, "port_hint": str}
 
+def _serve_cleanup_all():
+    for key in list(_serve_procs):
+        _serve_kill_existing(key)
+
+atexit.register(_serve_cleanup_all)
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    """Replace a text file atomically, preserving UTF-8 and avoiding partial writes."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        existing_mode = path.stat().st_mode & 0o7777
+    except OSError:
+        existing_mode = None
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    try:
+        if existing_mode is not None:
+            os.fchmod(fd, existing_mode)
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+            f.write(content)
+            f.flush(); os.fsync(f.fileno())
+        os.replace(tmp_name, path)
+    finally:
+        try: Path(tmp_name).unlink(missing_ok=True)
+        except Exception: pass
+
 # Nhận diện cổng CHỈ cho `python(3) -m http.server [PORT]` -- đây là lệnh serve
 # duy nhất mà ta CHẮC CHẮN biết quy tắc định tuyến của nó (phục vụ file tĩnh
 # đúng theo cây thư mục, không có routing/rewrite riêng như dev server
@@ -315,173 +340,46 @@ def _serve_kill_existing(key: str) -> str | None:
 # (ranh giới \b) để không bắt nhầm số bên trong path/tên file. Không bắt
 # được -> bỏ qua bước check port (an toàn, không đoán bừa), rơi về hành vi
 # cũ y hệt trước khi có fix này.
-_SERVE_PORT_RE = re.compile(r"\b(\d{2,5})\b")
-
 def _serve_find_port(inner_command: str) -> int | None:
-    """Đoán port từ lệnh serve, ưu tiên số đứng SAU CÙNG (thường là port thật,
-    vd "http.server 8080" hay "--port 5173") -- best-effort, chỉ dùng để check
-    port bận trước khi Popen, không dùng cho auto-detect entry file (đã có
-    _HTTP_SERVER_RE riêng, chặt chẽ hơn, cho việc đó)."""
-    nums = _SERVE_PORT_RE.findall(inner_command)
-    if not nums:
+    """Parse only documented/explicit port positions; never guess from digits."""
+    try:
+        argv = shlex.split(inner_command)
+    except ValueError:
         return None
-    port = int(nums[-1])
-    if 1 <= port <= 65535:
-        return port
+    name = _bash_command_name(argv[0]) if argv else ""
+    candidate = None
+    if name in ("python", "python3") and argv[1:3] == ["-m", "http.server"]:
+        if len(argv) > 3 and argv[3].isdigit():
+            candidate = argv[3]
+        else:
+            candidate = "8000"
+    else:
+        for i, arg in enumerate(argv[1:], 1):
+            if arg in ("--port", "-p") and i + 1 < len(argv):
+                candidate = argv[i + 1]
+                break
+            if arg.startswith("--port="):
+                candidate = arg.split("=", 1)[1]
+                break
+    if candidate and candidate.isdigit() and 1 <= int(candidate) <= 65535:
+        return int(candidate)
     return None
 
-def _serve_kill_port_owner(run_cwd: str, port: int) -> str | None:
-    """Nếu có process NGOÀI hệ thống 'serve:' (không phải _serve_procs đang
-    track) đang chiếm sẵn `port` -- ví dụ 1 lệnh `node -e ...`/server cũ user
-    tự chạy tay từ trước, hoặc zombie sống sót qua 1 lần app bị kill cứng --
-    dò và kill nó trước khi Popen lệnh serve mới. Lý do cần bước này: nếu
-    không kill, lệnh serve mới có thể bind FAIL (EADDRINUSE, phát hiện được
-    qua nhánh 'Process thoát ngay' bên dưới) HOẶC tệ hơn, tuỳ hệ điều hành/
-    tuỳ cấu hình SO_REUSEPORT, request có thể vẫn lọt vào process CŨ thay vì
-    process MỚI -- kết quả là server tưởng đã chạy nhưng client luôn thấy
-    404/nội dung cũ, không có cách nào phát hiện qua exit_code vì process
-    mới của TA vẫn sống bình thường (bug 404 thực tế đã xảy ra với Termux +
-    'node -e' chiếm port 8080 từ trước, xác nhận qua ps aux + curl).
-    Trả về mô tả process đã kill (để log/báo), hoặc None nếu port đang rảnh
-    hoặc không dò được gì (best-effort, không có quyền root/netlink trên
-    Termux nên KHÔNG dùng ss/netstat/lsof -- quét /proc trực tiếp thay thế).
-    """
-    import socket as _sock
-    # CHẶN AN TOÀN: không bao giờ kill nếu port này chính là port của web UI
-    # server chính (12_web.py, /web mode) -- đây là server phục vụ CHÍNH cái
-    # web UI mà agent đang chạy trong đó, kill nhầm nó = tự cắt kết nối của
-    # chính mình. web_server_addr() chỉ tồn tại nếu module 12_web.py đã được
-    # load (dùng globals().get() để không NameError ở nhánh CLI thuần, nơi
-    # /web chưa từng được bật -- symbol có thể chưa tồn tại trong namespace
-    # chung tại thời điểm này). Chỉ áp dụng đúng khi web server ĐANG chạy
-    # (web_server_addr() trả None nếu chưa start) -- nhánh CLI không bị ảnh
-    # hưởng gì, hành vi kill-port vẫn hoạt động bình thường như cũ.
-    _addr_fn = globals().get("web_server_addr")
-    if _addr_fn is not None:
-        try:
-            _addr = _addr_fn()
-        except Exception:
-            _addr = None
-        if _addr is not None and _addr[1] == port:
-            _serve_log(run_cwd, f"Port {port} trùng port web UI server đang chạy "
-                                 f"({_addr}) -- BỎ QUA kill để không tự cắt kết nối "
-                                 f"chính mình.")
-            return None
-    # 1) Test nhanh: port có đang bận không? Bind thử lên 127.0.0.1 -- nếu
-    # thành công nghĩa là port đang RẢNH, không cần làm gì thêm.
-    s = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
-    s.setsockopt(_sock.SOL_SOCKET, _sock.SO_REUSEADDR, 1)
+def _serve_port_available(port: int) -> bool:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind(("127.0.0.1", port))
-        s.close()
-        return None  # port rảnh -- không có gì để kill
+        return True
     except OSError:
-        s.close()  # port đang bận -- tiếp tục dò process nào giữ nó
-    # 2) Quét /proc để tìm pid nào có socket inode khớp port đang LISTEN.
-    # Không cần root: đọc /proc/net/tcp (địa chỉ hex, port ở dạng hex sau
-    # dấu ":") để lấy inode, rồi map inode -> pid qua /proc/<pid>/fd/*.
-    try:
-        port_hex = format(port, "04X")
-        target_inodes = set()
-        for tcp_file in ("/proc/net/tcp", "/proc/net/tcp6"):
-            try:
-                with open(tcp_file) as f:
-                    next(f)  # bỏ header
-                    for line in f:
-                        parts = line.split()
-                        local_addr, state, inode = parts[1], parts[3], parts[9]
-                        if local_addr.split(":")[1] == port_hex and state == "0A":  # 0A = LISTEN
-                            target_inodes.add(inode)
-            except FileNotFoundError:
-                pass
-        candidate_pid = None
-        candidate_cmd = None
-        if target_inodes:
-            # Đường chính: map inode -> pid qua /proc/<pid>/fd/* (chính xác
-            # tuyệt đối khi network namespace không bị ảo hoá lệch, đúng
-            # trường hợp Termux/Android thật).
-            for pid_dir in Path("/proc").glob("[0-9]*"):
-                pid = pid_dir.name
-                fd_dir = pid_dir / "fd"
-                try:
-                    matched = False
-                    for fd in fd_dir.iterdir():
-                        try:
-                            link = os.readlink(fd)
-                        except OSError:
-                            continue
-                        if link.startswith("socket:[") and link[8:-1] in target_inodes:
-                            matched = True
-                            break
-                    if matched:
-                        candidate_pid = pid
-                        break
-                except Exception:
-                    continue  # 1 pid lỗi đọc /proc (race condition, permission...) -- thử pid khác
-        if candidate_pid is None:
-            # Fallback: 1 vài môi trường (container ảo hoá network namespace
-            # khác lạ) khiến inode ở /proc/net/tcp không khớp trực tiếp với
-            # /proc/<pid>/fd dù cùng 1 process thật -- xác nhận qua thực
-            # nghiệm. Dò thêm bằng cách tìm process có cmdline chứa đúng số
-            # port này VÀ đang có ít nhất 1 fd loại socket đang mở -- kém
-            # chính xác hơn (có thể trùng số ngẫu nhiên trong cmdline), nên
-            # CHỈ dùng khi đường chính thất bại, và chỉ kill nếu tìm được
-            # ĐÚNG 1 ứng viên duy nhất (mơ hồ -> bỏ qua, không đoán bừa).
-            port_str = str(port)
-            found = []
-            for pid_dir in Path("/proc").glob("[0-9]*"):
-                pid = pid_dir.name
-                try:
-                    cmdline = (pid_dir / "cmdline").read_bytes().decode(errors="replace").replace("\x00", " ").strip()
-                except OSError:
-                    continue
-                if port_str not in cmdline:
-                    continue
-                try:
-                    has_socket = any(
-                        os.readlink(fd).startswith("socket:[")
-                        for fd in (pid_dir / "fd").iterdir()
-                        if True
-                    )
-                except Exception:
-                    has_socket = False
-                if has_socket:
-                    found.append((pid, cmdline))
-            if len(found) == 1:
-                candidate_pid, candidate_cmd = found[0]
-        if candidate_pid is None:
-            return None  # không dò ra được (0 hoặc >1 ứng viên mơ hồ) -- bỏ qua an toàn
-        # CHẶN AN TOÀN THỨ 2 (tự vệ tuyệt đối): không bao giờ kill chính pid
-        # process app đang chạy (os.getpid()), pid cha của nó (os.getppid(),
-        # vd tiến trình shell/Termux bao ngoài), hay bất kỳ pid nào đang được
-        # CHÍNH hệ thống serve: track trong _serve_procs (những pid đó đã có
-        # đường dọn riêng qua _serve_kill_existing/killpg ở trên rồi -- nếu
-        # lọt tới đây nghĩa là có sai lệch dò tìm, an toàn nhất là bỏ qua
-        # thay vì kill nhầm process CỦA CHÍNH HỆ THỐNG).
-        _protected_pids = {str(os.getpid()), str(os.getppid())}
-        for _entry in _serve_procs.values():
-            _protected_pids.add(str(_entry["proc"].pid))
-        if candidate_pid in _protected_pids:
-            _serve_log(run_cwd, f"Dò ra pid={candidate_pid} giữ port {port} nhưng đây là "
-                                 f"process được bảo vệ (chính app hoặc server serve: đang "
-                                 f"track) -- BỎ QUA kill để tránh tự hại chính mình.")
-            return None
-        if candidate_cmd is None:
-            try:
-                candidate_cmd = (Path("/proc") / candidate_pid / "cmdline").read_bytes().decode(errors="replace").replace("\x00", " ").strip()
-            except OSError:
-                candidate_cmd = "?"
-        try:
-            os.kill(int(candidate_pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError) as e:
-            _serve_log(run_cwd, f"Dò thấy pid={candidate_pid} ({candidate_cmd}) giữ port {port} "
-                                f"nhưng KHÔNG kill được: {e!r}")
-            return None
-        _serve_log(run_cwd, f"Port {port} đang bị pid={candidate_pid} ({candidate_cmd}) chiếm "
-                             f"(ngoài hệ thống serve:) -- đã kill để nhường chỗ.")
-        return f"pid={candidate_pid} ({candidate_cmd})"
-    except Exception as e:
-        _serve_log(run_cwd, f"LỖI dò process giữ port {port}: {e!r}")
+        return False
+    finally:
+        s.close()
+
+def _serve_kill_port_owner(run_cwd: str, port: int) -> str | None:
+    """Refuse to signal processes that were not started by this CLI."""
+    _serve_log(run_cwd,
+               f"Port {port} is occupied by an untracked process; refusing to kill it.")
     return None
 
 def tool_bash_serve(inner_command: str, argv: list[str]) -> str:
@@ -492,6 +390,11 @@ def tool_bash_serve(inner_command: str, argv: list[str]) -> str:
     if not inner_command:
         return "[serve] Thiếu lệnh sau 'serve:'. Cú pháp: serve: <lệnh chạy server>."
     key = _serve_key()
+    guessed_port = _serve_find_port(inner_command)
+    if (guessed_port is not None and not _serve_port_available(guessed_port)
+            and key not in _serve_procs):
+        return (f"[serve] Port {guessed_port} đang do tiến trình khác sử dụng. "
+                "Không tự ý kill tiến trình ngoài; hãy chọn port khác hoặc tự dừng nó.")
     old_cmd = _serve_kill_existing(key)
     if old_cmd:
         time.sleep(0.15)  # đệm nhỏ: os.killpg gửi SIGTERM cho cả process group,
@@ -522,15 +425,10 @@ def tool_bash_serve(inner_command: str, argv: list[str]) -> str:
     # _serve_kill_existing() ở trên chỉ dọn process serve: CŨ do CHÍNH hệ
     # thống này track (_serve_procs) -- không thấy được process lạ bên ngoài,
     # nên cần bước riêng này, độc lập, chạy SAU _serve_kill_existing.
-    guessed_port = _serve_find_port(inner_command)
-    killed_owner = None
     if guessed_port is not None:
-        killed_owner = _serve_kill_port_owner(run_cwd, guessed_port)
-        if killed_owner:
-            time.sleep(0.2)  # nhường chút thời gian để OS giải phóng hẳn port
-            # sau SIGKILL trước khi ta bind lại -- tránh race hiếm gặp EADDRINUSE
-            # dù process đã chết (TIME_WAIT thường không áp dụng cho SIGKILL
-            # tức thời, nhưng thêm 1 khoảng nhỏ vẫn an toàn hơn không có gì).
+        if not _serve_port_available(guessed_port):
+            return (f"[serve] Port {guessed_port} đang do tiến trình khác sử dụng. "
+                    "Không tự ý kill tiến trình ngoài; hãy chọn port khác hoặc tự dừng nó.")
     try:
         proc = subprocess.Popen(
             argv, shell=False, cwd=run_cwd,
@@ -556,12 +454,10 @@ def tool_bash_serve(inner_command: str, argv: list[str]) -> str:
     _serve_procs[key] = {"proc": proc, "cmd": inner_command}
     _serve_log(run_cwd, f"Process sống, pid={proc.pid}, pgid={os.getpgid(proc.pid)!r}")
     replaced_note = f" (đã thay thế server cũ: {old_cmd})" if old_cmd else ""
-    killed_note = f" Đã phát hiện và dọn process lạ giữ port trước đó: {killed_owner}.\n" if killed_owner else ""
     base_msg = (
         f"[serve] Đang chạy nền, pid={proc.pid}{replaced_note}.\n"
         f"Lệnh: {inner_command}\n"
         f"Thư mục: {run_cwd}\n"
-        f"{killed_note}"
         f"Server này sống cho tới khi bị thay thế bởi lệnh 'serve:' kế tiếp "
         f"(cùng project) -- không cần/không thể dùng bash thường để dừng nó."
     )
@@ -611,7 +507,89 @@ def tool_bash_serve(inner_command: str, argv: list[str]) -> str:
         f"cụ thể trong URL báo cho user, vd http://localhost:{port}/{html_files[0]}."
     )
 
+def _drain_process_stream(pipe, holder: dict, key: str, limit: int = 2 * 1024 * 1024):
+    """Drain a subprocess pipe continuously while retaining bounded output."""
+    half = max(1024, limit // 2)
+    head = bytearray()
+    tail = bytearray()
+    total = 0
+    try:
+        while True:
+            chunk = pipe.read(65536)
+            if not chunk:
+                break
+            if isinstance(chunk, str):
+                chunk = chunk.encode("utf-8", errors="replace")
+            total += len(chunk)
+            if len(head) < half:
+                take = min(half - len(head), len(chunk))
+                head.extend(chunk[:take])
+                chunk = chunk[take:]
+            if chunk:
+                tail.extend(chunk)
+                if len(tail) > half:
+                    del tail[:-half]
+    except Exception as e:
+        holder[key] = f"[stream read error: {e}]"
+        return
+    finally:
+        try:
+            pipe.close()
+        except Exception:
+            pass
+    if total > limit:
+        marker = f"[process output truncated: kept {limit:,} of {total:,} bytes]\n".encode()
+        data = marker + bytes(head) + b"\n...\n" + bytes(tail)
+    else:
+        data = bytes(head) + bytes(tail)
+    holder[key] = data.decode("utf-8", errors="replace")
+
+
+def _run_bounded_capture(argv, timeout: int, cwd=None, limit: int = 2 * 1024 * 1024):
+    """subprocess.run(capture_output=True) equivalent with bounded RAM."""
+    proc = subprocess.Popen(argv, shell=False, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, cwd=cwd, start_new_session=True)
+    captured = {}
+    readers = [
+        threading.Thread(target=_drain_process_stream,
+                         args=(proc.stdout, captured, "stdout", limit), daemon=True),
+        threading.Thread(target=_drain_process_stream,
+                         args=(proc.stderr, captured, "stderr", limit), daemon=True),
+    ]
+    for reader in readers:
+        reader.start()
+    timed_out = False
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+    for reader in readers:
+        reader.join(timeout=5)
+    stdout = captured.get("stdout", "")
+    stderr = captured.get("stderr", "")
+    if timed_out:
+        raise subprocess.TimeoutExpired(argv, timeout, output=stdout, stderr=stderr)
+    return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
+
+
 def tool_bash(command, timeout=30):
+    if not isinstance(command, str):
+        return "[error: command must be a string]"
+    try:
+        timeout = max(1, min(int(timeout), 3600))
+    except (TypeError, ValueError):
+        timeout = 30
     # Fast deny catches obviously dangerous text for both normal and serve mode;
     # the structured validator below enforces the complete command policy.
     if _BASH_DENY_RE.search(command):
@@ -651,19 +629,46 @@ def tool_bash(command, timeout=30):
 
     started = time.time()
     try:
-        r = subprocess.run(argv, shell=False, capture_output=True,
-                           text=True, timeout=int(timeout), cwd=run_cwd)
+        proc = subprocess.Popen(argv, shell=False, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, cwd=run_cwd,
+                                start_new_session=True)
+        captured = {}
+        readers = [
+            threading.Thread(target=_drain_process_stream,
+                             args=(proc.stdout, captured, "stdout"), daemon=True),
+            threading.Thread(target=_drain_process_stream,
+                             args=(proc.stderr, captured, "stderr"), daemon=True),
+        ]
+        for reader in readers:
+            reader.start()
+        timed_out = False
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    proc.wait(timeout=5)
+            except Exception:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=5)
+                except Exception:
+                    pass
+        for reader in readers:
+            reader.join(timeout=5)
+        stdout = captured.get("stdout", "")
+        stderr = captured.get("stderr", "")
         elapsed = time.time() - started
-        return _format_bash_result(command, r.returncode, r.stdout, r.stderr,
-                                   elapsed, timed_out=False, run_cwd=run_cwd)
-    except subprocess.TimeoutExpired as e:
-        elapsed = time.time() - started
-        stdout = e.stdout or ""
-        stderr = e.stderr or ""
-        if isinstance(stdout, bytes): stdout = stdout.decode("utf-8", errors="replace")
-        if isinstance(stderr, bytes): stderr = stderr.decode("utf-8", errors="replace")
-        return _format_bash_result(command, 124, stdout, stderr, elapsed,
-                                   timed_out=True, timeout=timeout, run_cwd=run_cwd)
+        code = 124 if timed_out else (proc.returncode if proc.returncode is not None else 1)
+        return _format_bash_result(command, code, stdout, stderr, elapsed,
+                                   timed_out=timed_out,
+                                   timeout=timeout if timed_out else None,
+                                   run_cwd=run_cwd)
     except Exception as e:
         return f"[error: {e}]"
 
@@ -744,6 +749,10 @@ def _dir_tree(path: Path, prefix="", depth=0, max_depth=4, max_entries=200, _cou
             lines.append(f"{prefix}... (truncated)")
             break
         connector = "└── " if i == len(visible) - 1 else "├── "
+        if entry.is_symlink():
+            lines.append(f"{prefix}{connector}{entry.name} -> [symlink skipped]")
+            _count[0] += 1
+            continue
         if entry.is_dir():
             lines.append(f"{prefix}{connector}{entry.name}/")
             _count[0] += 1
@@ -828,14 +837,13 @@ def _history_tool_call_key(name: str, args: dict) -> tuple | None:
             for field, value in defaults.items():
                 normalized.setdefault(field, value)
         elif name == "delegate":
-            # Dedup theo task_type + target — CỐ Ý không đưa "instruction"
-            # hay "expected_output" vào canonical key: 2 cách diễn đạt khác
-            # nhau cho CÙNG 1 target vẫn nên coi là việc trùng lặp (agent
-            # chính giao lại việc gần giống, chỉ đổi câu chữ) — nếu đưa
-            # instruction vào, dedup sẽ gần như không bao giờ khớp vì text
-            # tự do hiếm khi giống hệt nhau, làm dedup mất tác dụng thật.
+            # A delegate is a semantic request; only an exact same request is
+            # safe to suppress. Different instructions may intentionally ask
+            # for a second independent review of the same files.
             normalized = {
                 "task_type": normalized.get("task_type"),
+                "instruction": normalized.get("instruction") or "",
+                "expected_output": normalized.get("expected_output") or "",
                 "target_files": sorted(normalized.get("target_files") or []),
                 "target_location": normalized.get("target_location") or "",
             }
@@ -1105,9 +1113,8 @@ def _prune_delegate_results(messages: list, keep_full_turns: int | None = None) 
 
 # ── Per-session file index ───────────────────────────────────────────────────
 def _index_key() -> str:
-    """Key cho index = absolute path của cwd để tránh xung đột giữa các project
-    cùng tên folder (C36 FIX: Path.cwd().name → str(Path.cwd().resolve()))."""
-    return str(Path.cwd().resolve())
+    """Stable workspace key so sessions sharing a project also share its index."""
+    return str(_workspace_root())
 
 def _fw_data_dir() -> Path:
     """
@@ -1133,8 +1140,8 @@ def _index_path() -> Path:
     còn đụng nhau. Fallback "index.json" (không sid) chỉ dùng khi chưa có sid
     nào active (vd gọi ngoài luồng agent_turn bình thường).
     """
-    sid = _project_dir_sid if _project_dir_sid else ""
-    fname = f"index_{sid}.json" if sid else "index.json"
+    digest = hashlib.sha256(_index_key().encode()).hexdigest()[:16]
+    fname = f"index_workspace_{digest}.json"
     return _fw_data_dir() / fname
 
 def _index_load() -> dict:
@@ -1195,7 +1202,8 @@ def _index_update(abs_path: str, content: str, symbols: dict):
         "path": str(Path(abs_path).resolve()),
         "lines": len(content.splitlines()),
         "symbols": sym_map,
-        "mtime": time.time(),
+        "mtime_ns": Path(abs_path).stat().st_mtime_ns if Path(abs_path).exists() else 0,
+        "size": Path(abs_path).stat().st_size if Path(abs_path).exists() else len(content),
     }
     _index_save(index)
 
@@ -1209,8 +1217,29 @@ def _index_prune():
 def tool_file_index() -> str:
     """Trả về symbol index của project hiện tại."""
     index = _index_load()
-    if not index:
-        return "(no files indexed yet — read a file first)"
+    # Refresh lazily from disk so this tool is useful before the first read and
+    # never advertises stale symbols after an external edit.
+    for p in _workspace_reference_files(max_files=400):
+        try:
+            st = p.stat()
+            rel = str(p.resolve().relative_to(_workspace_root()))
+            old = index.get(rel, {})
+            if old.get("mtime_ns") == st.st_mtime_ns and old.get("size") == st.st_size:
+                continue
+            if st.st_size > 2 * 1024 * 1024:
+                continue
+            content = p.read_text(errors="replace")
+            index[rel] = {
+                "path": str(p.resolve()), "lines": len(content.splitlines()),
+                "symbols": {n: s["line"] for n, s in _parse_symbols(content, p.suffix).items()},
+                "mtime_ns": st.st_mtime_ns, "size": st.st_size,
+            }
+        except Exception:
+            continue
+    valid = {k: v for k, v in index.items() if Path(v.get("path", "")).exists()}
+    if valid != index:
+        index = valid
+    _index_save(index)
 
     # BUG FIX: filter cũ chỉ chạy `if not _project_dir_is_placeholder` — nghĩa
     # là TẮT HẲN đúng lúc rủi ro cao nhất. Ở placeholder mode, _check_sandbox_read
@@ -1276,6 +1305,11 @@ def _workspace_reference_files(seed_file: str | None = None, max_files: int = 40
         if not p.exists() or not p.is_file() or p.suffix.lower() not in _REFERENCE_EXTS:
             return
         try:
+            if p.stat().st_size > 20 * 1024 * 1024:
+                return
+        except OSError:
+            return
+        try:
             p.relative_to(root)
         except ValueError:
             return
@@ -1310,6 +1344,8 @@ def _references_in_python(path: Path, name: str) -> list[tuple[int, str]]:
     """AST-backed Python references with regex fallback for syntax errors."""
     import ast as _ast
     try:
+        if path.stat().st_size > 20 * 1024 * 1024:
+            return []
         src = path.read_text(errors="replace")
     except Exception:
         return []
@@ -1344,6 +1380,8 @@ def _workspace_references(name: str, seed_file: str | None = None,
             refs = _references_in_python(p, name)
         else:
             try:
+                if p.stat().st_size > 20 * 1024 * 1024:
+                    continue
                 lines = p.read_text(errors="replace").splitlines()
             except Exception:
                 continue
@@ -1413,13 +1451,18 @@ def tool_read(path, offset=1, limit=READ_DEFAULT_LIMIT, depth=4, state=None):
         if remaining > 0:
             out += f"\n\n(+{remaining} more lines — call read with offset={end+1} if truly needed)"
         _file_read_time[resolved_key] = time.time()
-        return out
+        return _head_tail(out, _read_output_cap(int(limit)), label="read output")
     # Nếu vừa pop cache vì external edit, bỏ luôn khỏi _recent_writes để
     # nhánh đọc disk thật bên dưới chạy bình thường, không tự coi là "đã biết".
     _recent_writes.discard(resolved_key)
 
     try:
-        all_lines = p.read_text(errors="replace").splitlines()
+        size = p.stat().st_size
+        if size > 50 * 1024 * 1024:
+            return (f"[policy] File quá lớn ({size:,} bytes; tối đa 50 MiB cho read). "
+                    "Dùng grep hoặc một tool chuyên dụng để thu hẹp dữ liệu.")
+        raw_content = p.read_text(errors="replace")
+        all_lines = raw_content.splitlines()
         total     = len(all_lines)
 
         # BUG FIX (đã verify bằng test thật, lịch sử): thứ tự cũ từng chạy
@@ -1484,13 +1527,13 @@ def tool_read(path, offset=1, limit=READ_DEFAULT_LIMIT, depth=4, state=None):
         # Track read time for FileTime safety check
         _file_read_time[str(p.resolve())] = time.time()
         # Cache full content (không phải annotated output) để AI dùng lại
-        full_content = "\n".join(all_lines)
-        _cache_put(str(p), full_content, _current_sid)
+        if size <= 2 * 1024 * 1024:
+            _cache_put(str(p), raw_content, _active_session_id())
         # Anchor map — AI biết structure file ngay, không cần grep lại turn sau
         amap = _anchor_map(all_lines, focus_line=start)
         if amap:
             out += f"\n\n{amap}"
-        return out
+        return _head_tail(out, _read_output_cap(orig_limit), label="read output")
     except Exception as e:
         return f"[error: {e}]"
 
@@ -1578,6 +1621,8 @@ _COMPACTION_MARKER_ERROR = (
 )
 
 def tool_write(path, content, conn=None, sid=None):
+    if not isinstance(path, str) or not isinstance(content, str):
+        return "[error: path and content must be strings]"
     if _contains_compaction_marker(content):
         return _COMPACTION_MARKER_ERROR
     # BUG FIX (đã verify bằng test thật): trước đây _resolve_to_sandbox(path)
@@ -1602,21 +1647,41 @@ def tool_write(path, content, conn=None, sid=None):
         # p.exists() và write_text(): nếu file được tạo bởi tiến trình khác
         # (vd bash chạy song song) đúng lúc giữa 2 bước, "x" mode sẽ raise
         # FileExistsError thay vì âm thầm ghi đè.
+        created = False
         try:
             with open(p, "x", encoding="utf-8") as f:
+                created = True
                 f.write(content)
+                f.flush()
+                os.fsync(f.fileno())
         except FileExistsError:
             return (f"[error] write only creates new files; '{p}' already exists. "
                     f"Use edit, multiedit, or apply_patch for existing files.")
+        except Exception:
+            # An I/O failure during an exclusive create can leave a partial
+            # new file. Remove only the file this call successfully created;
+            # never touch a pre-existing target that lost the race.
+            if created:
+                try:
+                    p.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            raise
         before = None  # write chỉ chạy tới đây khi file chưa từng tồn tại
         # Track write time so subsequent edits don't false-alarm on FileTime check
         _file_read_time[str(p.resolve())] = time.time()
         # Update cache ngay — AI không cần read lại file vừa tạo/ghi
-        _cache_put(str(p), content, _current_sid)
+        _cache_put(str(p), content, _active_session_id())
         _recent_writes.add(str(p.resolve()))  # block read-after-write
         if conn and sid:
-            _undo_stack.append(snapshot_save(
-                conn, sid, str(p.resolve()), before, content))
+            try:
+                _undo_stack.append(snapshot_save(
+                    conn, sid, str(p.resolve()), before, content))
+            except Exception as e:
+                p.unlink(missing_ok=True)
+                _file_cache.pop(str(p.resolve()), None)
+                _recent_writes.discard(str(p.resolve()))
+                return f"[error] snapshot failed; write rolled back: {e}"
             _redo_stack.clear()
         redirected = f" (redirected from {path})" if str(p.resolve()) != str(Path(path).expanduser().resolve()) else ""
         # Inject anchor map — model biết structure ngay, không cần read/glob lại turn sau
@@ -1663,6 +1728,18 @@ def tool_delete(path, conn=None, sid=None):
     đơn) nên nếu raise thì không có record nào bị ghi nửa chừng — không cần
     dọn dẹp gì thêm ở phía caller.
     """
+    if not isinstance(path, str):
+        return "[error: path must be a string]"
+    # Establish the active project before resolving an absolute path. Without
+    # this call the first delete in a session could run while the sandbox was
+    # still in its permissive placeholder state and remove a file outside the
+    # project. Unlike write, delete deliberately rejects (rather than
+    # redirects) paths outside the project.
+    if conn and sid:
+        try:
+            _ensure_project_dir(path)
+        except Exception as e:
+            return f"[sandbox] Không khởi tạo được project_dir; huỷ xoá: {e}"
     p = _resolve_read_path(path)
     err = _check_sandbox_read(str(p))
     if err:
@@ -1673,10 +1750,9 @@ def tool_delete(path, conn=None, sid=None):
         return (f"[error] '{path}' là thư mục, tool này chỉ xoá file đơn lẻ "
                 f"để tránh xoá nhầm hàng loạt. Xoá từng file bên trong nếu cần.")
     try:
-        before = p.read_text(encoding="utf-8", errors="replace")
-    except Exception:
-        before = None  # file nhị phân hoặc không đọc được text — vẫn xoá được,
-                        # nhưng undo sẽ không khôi phục đúng nội dung gốc.
+        before = snapshot_encode_bytes(p.read_bytes())
+    except Exception as e:
+        return f"[error] Không đọc được file để lưu snapshot an toàn; huỷ xoá: {e}"
 
     resolved = str(p)
     snap = None
@@ -1690,6 +1766,13 @@ def tool_delete(path, conn=None, sid=None):
     try:
         p.unlink()
     except Exception as e:
+        if snap is not None:
+            try:
+                (conn or _project_dir_conn).execute(
+                    "DELETE FROM file_snapshot WHERE id=?", (snap["id"],))
+                (conn or _project_dir_conn).commit()
+            except Exception:
+                pass
         return f"[error deleting {path}: {e}]"
 
     _file_cache.pop(resolved, None)
@@ -1698,20 +1781,41 @@ def tool_delete(path, conn=None, sid=None):
     if snap is not None:
         _undo_stack.append(snap)
         _redo_stack.clear()
-    return f"Deleted {resolved}" + ("" if before is not None else " (nội dung gốc không lưu được để undo — file không phải text UTF-8)")
+    return f"Deleted {resolved}"
 
 def tool_extract(src, start, end, dst, mode="move", conn=None, sid=None):
     """Lấy nguyên vẹn các dòng [start..end] (1-indexed, inclusive) từ src,
     append vào dst (tạo mới nếu chưa có). mode='move' (default) xoá vùng đó
     khỏi src; mode='copy' giữ src nguyên. Không qua model — tránh việc AI
     đọc rồi gõ lại nội dung khi tách/refactor file."""
+    if not all(isinstance(v, str) for v in (src, dst)):
+        return "[error: src and dst must be strings]"
+    if mode not in ("move", "copy"):
+        return "[error: mode must be 'move' or 'copy']"
+    try:
+        start, end = int(start), int(end)
+    except (TypeError, ValueError):
+        return "[error: start/end must be integers]"
     sp = _resolve_read_path(src)
     err = _check_sandbox_read(str(sp))
     if err:
         return err
     if not sp.exists():
         return f"[not found: {src}]"
+    try:
+        if sp.stat().st_size > 50 * 1024 * 1024:
+            return "[policy] Source file quá lớn cho extract (>50 MiB); dùng công cụ streaming phù hợp."
+    except OSError as e:
+        return f"[error: cannot stat source: {e}]"
     dp = _resolve_to_sandbox(dst)
+    if sp.resolve() == dp.resolve():
+        return "[error: src and dst must be different files]"
+    dst_written = False
+    src_written = False
+    dst_snap = None
+    src_snap = None
+    dst_before = None
+    src_before = None
     try:
         src_lines = sp.read_text().splitlines(keepends=True)
         n = len(src_lines)
@@ -1722,6 +1826,8 @@ def tool_extract(src, start, end, dst, mode="move", conn=None, sid=None):
         chunk_text = "".join(chunk)
 
         dp.parent.mkdir(parents=True, exist_ok=True)
+        if dp.exists() and dp.stat().st_size > 50 * 1024 * 1024:
+            return "[policy] Destination file quá lớn cho extract (>50 MiB); hãy xử lý/chia nhỏ trước."
         dst_before = dp.read_text() if dp.exists() else None
         if dst_before is not None and dst_before and not dst_before.endswith("\n"):
             dst_after = dst_before + "\n" + chunk_text
@@ -1750,15 +1856,31 @@ def tool_extract(src, start, end, dst, mode="move", conn=None, sid=None):
                         f"(mtime={mtime:.0f}, last_read={last_read:.0f}). "
                         f"Read it again before extracting with mode='move'.")
 
-        dp.write_text(dst_after)
-        _cache_put(str(dp), dst_after, _current_sid)
+        _atomic_write_text(dp, dst_after)
+        dst_written = True
+        _cache_put(str(dp), dst_after, _active_session_id())
         _file_read_time[str(dp.resolve())] = time.time()
         _recent_writes.add(str(dp.resolve()))
         # C11/C27 FIX: save snapshot cho dst để /undo restore được dst (cả copy lẫn move)
+        extract_group = str(uuid.uuid4()) if conn and sid else None
         if conn and sid:
-            _undo_stack.append(snapshot_save(
-                conn, sid, str(dp.resolve()), dst_before, dst_after))
-            _redo_stack.clear()
+            try:
+                dst_snap = snapshot_save(
+                    conn, sid, str(dp.resolve()), dst_before, dst_after, extract_group)
+                _undo_stack.append(dst_snap)
+            except Exception as e:
+                if dst_before is None:
+                    dp.unlink(missing_ok=True)
+                else:
+                    _atomic_write_text(dp, dst_before)
+                if dst_before is None:
+                    _file_cache.pop(str(dp.resolve()), None)
+                    _file_read_time.pop(str(dp.resolve()), None)
+                    _recent_writes.discard(str(dp.resolve()))
+                else:
+                    _cache_put(str(dp), dst_before, _active_session_id())
+                    _file_read_time[str(dp.resolve())] = time.time()
+                return f"[error] snapshot failed; extract rolled back: {e}"
 
         result = f"Extracted lines {start}-{end} of {sp} → {dp} ({len(chunk)} lines)"
 
@@ -1766,26 +1888,108 @@ def tool_extract(src, start, end, dst, mode="move", conn=None, sid=None):
             src_before = "".join(src_lines)
             new_src_lines = src_lines[:start-1] + src_lines[end:]
             src_after = "".join(new_src_lines)
-            sp.write_text(src_after)
+            _atomic_write_text(sp, src_after)
+            src_written = True
             _file_read_time[str(sp.resolve())] = time.time()
             _recent_writes.add(str(sp.resolve()))
-            _cache_put(str(sp), src_after, _current_sid)
+            _cache_put(str(sp), src_after, _active_session_id())
             if conn and sid:
-                _undo_stack.append(snapshot_save(
-                    conn, sid, str(sp.resolve()), src_before, src_after))
-                # Note: _redo_stack already cleared above for dst snapshot
+                try:
+                    src_snap = snapshot_save(
+                        conn, sid, str(sp.resolve()), src_before, src_after, extract_group)
+                    _undo_stack.append(src_snap)
+                except Exception as e:
+                    # Roll back both files and remove the destination snapshot
+                    # already created for this compound operation.
+                    _atomic_write_text(sp, src_before)
+                    if dst_before is None:
+                        dp.unlink(missing_ok=True)
+                    else:
+                        _atomic_write_text(dp, dst_before)
+                    _cache_put(str(sp), src_before, _active_session_id())
+                    _file_read_time[str(sp.resolve())] = time.time()
+                    if dst_before is None:
+                        _file_cache.pop(str(dp.resolve()), None)
+                        _file_read_time.pop(str(dp.resolve()), None)
+                        _recent_writes.discard(str(dp.resolve()))
+                    else:
+                        _cache_put(str(dp), dst_before, _active_session_id())
+                        _file_read_time[str(dp.resolve())] = time.time()
+                    if dst_snap is not None:
+                        try:
+                            _undo_stack.remove(dst_snap)
+                            conn.execute("DELETE FROM file_snapshot WHERE id=?", (dst_snap["id"],))
+                            conn.commit()
+                        except Exception:
+                            pass
+                    return f"[error] snapshot failed; extract rolled back: {e}"
             result += f"\n[removed from {sp}, {len(new_src_lines)} lines remain]"
 
+        if conn and sid:
+            # Only invalidate redo after every file and every snapshot in the
+            # compound operation has committed successfully.
+            _redo_stack.clear()
         return result
     except Exception as e:
-        return f"[error: {e}]"
+        # A destination write happens before a source write in move mode.
+        # Any unexpected failure between those steps must restore both disk
+        # state and snapshot metadata; otherwise extract can leave a partial
+        # copy despite reporting an error.
+        rollback_errors = []
+        try:
+            if src_written and src_before is not None:
+                _atomic_write_text(sp, src_before)
+        except Exception as rollback_error:
+            rollback_errors.append(f"source rollback failed: {rollback_error}")
+        try:
+            if dst_written:
+                if dst_before is None:
+                    dp.unlink(missing_ok=True)
+                else:
+                    _atomic_write_text(dp, dst_before)
+        except Exception as rollback_error:
+            rollback_errors.append(f"destination rollback failed: {rollback_error}")
+        if conn and sid:
+            for snap in (src_snap, dst_snap):
+                if snap is None:
+                    continue
+                try:
+                    if snap in _undo_stack:
+                        _undo_stack.remove(snap)
+                    conn.execute("DELETE FROM file_snapshot WHERE id=?", (snap["id"],))
+                    conn.commit()
+                except Exception as rollback_error:
+                    rollback_errors.append(f"snapshot rollback failed: {rollback_error}")
+        rollback_states = []
+        if src_written:
+            rollback_states.append((sp, src_before))
+        if dst_written:
+            rollback_states.append((dp, dst_before))
+        for path_obj, before_text in rollback_states:
+            resolved_path = str(path_obj.resolve())
+            if before_text is None:
+                _file_cache.pop(resolved_path, None)
+                _file_read_time.pop(resolved_path, None)
+                _recent_writes.discard(resolved_path)
+            else:
+                _cache_put(str(path_obj), before_text, _active_session_id())
+                _file_read_time[resolved_path] = time.time()
+                _recent_writes.discard(resolved_path)
+        suffix = f"; {'; '.join(rollback_errors)}" if rollback_errors else ""
+        return f"[error: extract failed and was rolled back: {e}{suffix}]"
 
 def tool_edit(path, old_str, new_str, conn=None, sid=None):
+    if not all(isinstance(v, str) for v in (path, old_str, new_str)):
+        return "[error: path, old_str and new_str must be strings]"
     if _contains_compaction_marker(old_str, new_str):
         return _COMPACTION_MARKER_ERROR
+    if len(old_str.encode("utf-8", errors="replace")) > 5 * 1024 * 1024 or len(new_str.encode("utf-8", errors="replace")) > 5 * 1024 * 1024:
+        return "[error: old_str/new_str exceeds 5 MiB; use a narrower edit or apply_patch]"
     p = _resolve_to_sandbox(path)
     if not p.exists(): return f"[not found: {p}]"
     try:
+        if p.stat().st_size > 50 * 1024 * 1024:
+            return "[policy] File quá lớn cho edit (>50 MiB); dùng extract hoặc chia nhỏ thao tác."
         # FileTime safety: must have read the file after last external modification
         resolved = str(p.resolve())
         last_read = _file_read_time.get(resolved, 0)
@@ -1820,14 +2024,19 @@ def tool_edit(path, old_str, new_str, conn=None, sid=None):
             return hint
         if count > 1:  return f"[error: found {count} times — must be unique]"
         after = text.replace(old_str, new_str, 1)
-        p.write_text(after)
+        _atomic_write_text(p, after)
         # Update read time after our own write so next edit doesn't false-alarm
         _file_read_time[resolved] = time.time()
         # Update cache với content mới — AI thấy thay đổi ngay trong cache block
-        _cache_put(str(p), after, _current_sid)
+        _cache_put(str(p), after, _active_session_id())
         if conn and sid:
-            _undo_stack.append(snapshot_save(
-                conn, sid, str(p.resolve()), text, after))
+            try:
+                _undo_stack.append(snapshot_save(
+                    conn, sid, str(p.resolve()), text, after))
+            except Exception as e:
+                _atomic_write_text(p, text)
+                _cache_put(str(p), text, _active_session_id())
+                return f"[error] snapshot failed; edit rolled back: {e}"
             _redo_stack.clear()
         # Trả về context snippet quanh vùng thay đổi — AI không cần read lại để verify
         lines_before = text.splitlines()
@@ -1867,15 +2076,34 @@ def tool_multiedit(path, edits, conn=None, sid=None):
     Fix: ap toan bo edit len mot buffer trong RAM truoc; chi khi TAT CA edit
     hop le moi ghi xuong dia mot lan va tao dung mot undo-snapshot duy nhat.
     """
+    if not isinstance(path, str):
+        return "[error: path must be a string]"
+    if not isinstance(edits, list) or len(edits) > 50:
+        return "[error: edits must be a list of at most 50 items]"
+    if not edits:
+        return "[error: no edits provided]"
+    for i, edit in enumerate(edits):
+        if not isinstance(edit, dict):
+            return f"[error: edits[{i}] must be an object with old_str and new_str]"
+        old_str, new_str = edit.get("old_str"), edit.get("new_str")
+        if not isinstance(old_str, str) or not isinstance(new_str, str):
+            return f"[error: edits[{i}].old_str and new_str must be strings]"
+        if len(old_str.encode("utf-8", errors="replace")) > 5 * 1024 * 1024 \
+                or len(new_str.encode("utf-8", errors="replace")) > 5 * 1024 * 1024:
+            return f"[error: edits[{i}] old_str/new_str exceeds 5 MiB]"
     if _contains_compaction_marker(*[
-        v for e in (edits or []) for v in (e.get("old_str"), e.get("new_str"))
+        v for e in edits for v in (e.get("old_str"), e.get("new_str"))
     ]):
         return _COMPACTION_MARKER_ERROR
+    if sum(len(e["old_str"].encode("utf-8", errors="replace"))
+           + len(e["new_str"].encode("utf-8", errors="replace")) for e in edits) > 10 * 1024 * 1024:
+        return "[error: combined edit content exceeds 10 MiB]"
     p = _resolve_to_sandbox(path)
     if not p.exists(): return f"[not found: {p}]"
-    if not edits: return "[error: no edits provided]"
     try:
         resolved = str(p.resolve())
+        if p.stat().st_size > 50 * 1024 * 1024:
+            return "[policy] File quá lớn cho multiedit (>50 MiB); dùng extract hoặc chia nhỏ thao tác."
         last_read = _file_read_time.get(resolved, 0)
         mtime = p.stat().st_mtime
         if mtime > last_read + 1:
@@ -1914,13 +2142,19 @@ def tool_multiedit(path, edits, conn=None, sid=None):
 
         # Tat ca edit hop le - commit mot lan duy nhat.
         after = buf
-        p.write_text(after)
+        _atomic_write_text(p, after)
         _file_read_time[resolved] = time.time()
         _recent_writes.add(resolved)
-        _cache_put(str(p), after, _current_sid)
+        _cache_put(str(p), after, _active_session_id())
         if conn and sid:
-            _undo_stack.append(snapshot_save(
-                conn, sid, resolved, before, after))
+            try:
+                _undo_stack.append(snapshot_save(
+                    conn, sid, resolved, before, after))
+            except Exception as e:
+                _atomic_write_text(p, before)
+                _cache_put(str(p), before, _active_session_id())
+                _recent_writes.discard(resolved)
+                return f"[error] snapshot failed; multiedit rolled back: {e}"
             _redo_stack.clear()
 
         final_lines = after.splitlines()

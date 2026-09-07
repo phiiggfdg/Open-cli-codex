@@ -11,12 +11,24 @@ Agents:  build (full), plan (read-only)
 Perms:   per-tool allow/ask/deny
 """
 
-import os, sys, json, re, sqlite3, uuid, time, subprocess, shlex, signal
+import os, sys, json, re, sqlite3, uuid, time, subprocess, shlex, signal, hashlib
 import difflib, urllib.request, urllib.parse, urllib.error, threading, shutil
-import http.cookiejar
+import http.cookiejar, base64, tempfile, atexit, socket, ipaddress
 import html as _html
 from pathlib import Path
 from datetime import datetime
+
+_HTTP_BODY_LIMIT = 16 * 1024 * 1024
+
+def _read_response_limited(resp, limit=_HTTP_BODY_LIMIT) -> bytes:
+    chunks, total = [], 0
+    while True:
+        chunk = resp.read(min(65536, limit + 1 - total))
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk); total += len(chunk)
+        if total > limit:
+            raise RuntimeError(f"HTTP response exceeds {limit:,} bytes")
 
 # ── Màu — Open CLI Codex · amber-on-dark hacker palette ─────────────────────
 R="\033[0m"; BOLD="\033[1m"

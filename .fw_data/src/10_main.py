@@ -1161,6 +1161,7 @@ def main():
 
         if user.lower() == "/sequential":
             _tool_mode = "sequential"
+            if state is not None: state.tool_mode = "sequential"
             _system_static_cache.clear()  # rebuild vì _tool_mode ko còn trong static, nhưng giữ để safe
             out = (f"{YELLOW}✓ Sequential mode — từng bước, verify mỗi bước.\n"
                    f"{DIM}  Tốn token hơn nhưng an toàn hơn cho project lớn.\n"
@@ -1171,6 +1172,7 @@ def main():
 
         if user.lower() == "/batch":
             _tool_mode = "batch"
+            if state is not None: state.tool_mode = "batch"
             _system_static_cache.clear()  # rebuild vì _tool_mode ko còn trong static, nhưng giữ để safe
             out = f"{GREEN}✓ Batch mode — gộp tool calls, tiết kiệm token. {DIM}(mặc định){R}\n"
             if state is not None: state.emit(EV_INFO, text=out, raw=True)
@@ -1457,7 +1459,7 @@ def main():
             _lines = []
             for path, s in seen.items():
                 before = (s["before"] or "").splitlines(keepends=True)
-                after  = s["after"].splitlines(keepends=True)
+                after  = (s.get("after") or "").splitlines(keepends=True)
                 diff   = list(difflib.unified_diff(before, after,
                               fromfile=f"a/{path}", tofile=f"b/{path}", lineterm=""))
                 if diff:
@@ -1507,8 +1509,8 @@ def main():
 
         if user.lower() == "/perms":
             merged = dict(DEFAULT_PERMS)
+            merged.update(state.custom_perms if state is not None else _custom_perms)
             if agent == AGENT_PLAN: merged.update(PLAN_PERMS)
-            merged.update(_custom_perms)
             _lines = [f"\n{BOLD}Permissions (agent={agent}):{R}"]
             for t, p in sorted(merged.items()):
                 cl = GREEN if p==PERM_ALLOW else (YELLOW if p==PERM_ASK else RED)
@@ -1523,7 +1525,11 @@ def main():
             if len(parts) == 3:
                 _, tool_name, level = parts
                 if level in (PERM_ALLOW, PERM_ASK, PERM_DENY):
-                    _custom_perms[tool_name] = level
+                    if state is not None:
+                        state.custom_perms[tool_name] = level
+                        state.tool_allow_all.discard(tool_name)
+                    else:
+                        _custom_perms[tool_name] = level
                     if tool_name == "bash" and level == PERM_ASK:
                         _bash_allow_all = False  # reset allow-all khi user set lại bash=ask
                         if state is not None: state.bash_allow_all = False
@@ -1699,11 +1705,7 @@ def main():
             continue
 
         if user.lower() == "/skills":
-            found = []
-            for sd in SKILLS_DIRS:
-                if sd.exists():
-                    for f in sd.rglob("*.md"):
-                        found.append(str(f.relative_to(sd)))
+            found = _list_available_skills()
             _lines = []
             if found:
                 _lines.append(f"\n{BOLD}Skills:{R}")
@@ -1738,10 +1740,11 @@ def main():
         if user.lower() == "/init":
             print(f"\n{BOLD}{CYAN}[init]{R} Đang phân tích project...{R}")
             # Scan project structure
-            tree_lines = _dir_tree(Path.cwd(), max_depth=3)
+            _work_root = _workspace_root()
+            tree_lines = _dir_tree(_work_root, max_depth=3)
             tree_str   = "\n".join(tree_lines[:80])
             # Check for existing AGENTS.md
-            agents_path = Path.cwd() / "AGENTS.md"
+            agents_path = _work_root / "AGENTS.md"
             existing = ""
             if agents_path.exists():
                 existing = f"\n\nExisting AGENTS.md:\n{agents_path.read_text()[:2000]}"
@@ -1749,11 +1752,11 @@ def main():
             hints = []
             for f in ["package.json","pyproject.toml","Cargo.toml","go.mod",
                       "Makefile","requirements.txt","setup.py","pom.xml"]:
-                if (Path.cwd() / f).exists(): hints.append(f)
+                if (_work_root / f).exists(): hints.append(f)
             hint_str = ", ".join(hints) if hints else "none detected"
             init_prompt = f"""Analyze this project and create or improve an AGENTS.md file.
 
-Project directory: {Path.cwd()}
+Project directory: {_work_root}
 Detected config files: {hint_str}
 
 Directory tree:
@@ -1825,17 +1828,24 @@ Write the AGENTS.md content directly. Be concise but complete."""
             parts = user.split(maxsplit=2)
             sub   = parts[1].lower() if len(parts) > 1 else ""
             servers = mcp_servers_load()
+            if not isinstance(servers, dict):
+                print(f"{RED}  Cấu hình mcp_servers không hợp lệ (phải là object). "
+                      f"Hãy sửa config trước khi dùng /mcp.{R}\n")
+                continue
 
             if sub in ("", "list", "status"):
                 if not servers:
                     print(f"{DIM}  Chưa có MCP server nào. Dùng:{R}")
-                    print(f"  {CYAN}/mcp add <name> <url>{R}")
+                    print(f"  {CYAN}/mcp add <name> <url> [\"Header=Value with spaces\"]{R}")
                     print(f"\n{DIM}  vd: /mcp add notion https://mcp.notion.com/mcp{R}\n")
                     continue
                 print(f"\n{CYAN}{BOLD}MCP servers:{R}")
                 with Spinner("Đang kết nối MCP"):
                     mcp_refresh_all(verbose=False)
                 for name, srv in servers.items():
+                    if not isinstance(srv, dict):
+                        print(f"  {WHITE}{name}{R}  {RED}● cấu hình không hợp lệ{R}")
+                        continue
                     status = _MCP_STATUS.get(name, "?")
                     n      = len(_MCP_TOOL_CACHE.get(name, []))
                     if status == "connected":
@@ -1853,7 +1863,8 @@ Write the AGENTS.md content directly. Be concise but complete."""
                         print(f"    {DIM}└ {_MCP_LAST_ERROR[name]}{R}")
                     if status == "connected" and n:
                         for t in _MCP_TOOL_CACHE[name][:6]:
-                            print(f"    {DIM}- mcp__{name}__{t.get('name','')}{R}")
+                            if isinstance(t, dict):
+                                print(f"    {DIM}- mcp__{name}__{t.get('name','')}{R}")
                         if n > 6:
                             print(f"    {DIM}  ... +{n-6} more{R}")
                 print()
@@ -1861,9 +1872,13 @@ Write the AGENTS.md content directly. Be concise but complete."""
 
             if sub == "add":
                 if len(parts) < 3:
-                    print(f"{YELLOW}  cú pháp: /mcp add <name> <url> [header: Authorization=Bearer xxx]{R}\n")
+                    print(f"{YELLOW}  cú pháp: /mcp add <name> <url> [\"Authorization=Bearer xxx\"]{R}\n")
                     continue
-                rest = parts[2].split()
+                try:
+                    rest = shlex.split(parts[2])
+                except ValueError as e:
+                    print(f"{RED}  Header/quote không hợp lệ: {e}{R}\n")
+                    continue
                 if len(rest) < 2:
                     print(f"{YELLOW}  cú pháp: /mcp add <name> <url>{R}\n")
                     continue
@@ -1873,7 +1888,11 @@ Write the AGENTS.md content directly. Be concise but complete."""
                     if "=" in kv:
                         k, v = kv.split("=", 1)
                         headers[k] = v
-                mcp_add_server(name, url, headers)
+                try:
+                    mcp_add_server(name, url, headers)
+                except ValueError as e:
+                    print(f"{RED}  MCP config không hợp lệ: {e}{R}\n")
+                    continue
                 print(f"{DIM}  [mcp] đang kết nối {name}...{R}", end="", flush=True)
                 tools = mcp_fetch_tools(name, mcp_servers_load()[name], force=True)
                 status = _MCP_STATUS.get(name, "error")
@@ -1913,7 +1932,7 @@ Write the AGENTS.md content directly. Be concise but complete."""
             try:
                 r = subprocess.run(
                     ["git", "diff", "--staged"],
-                    capture_output=True, text=True, timeout=10, cwd=os.getcwd()
+                    capture_output=True, text=True, timeout=10, cwd=str(_workspace_root())
                 )
                 diff = r.stdout.strip()
             except Exception as e:
@@ -1944,7 +1963,7 @@ Write the AGENTS.md content directly. Be concise but complete."""
             if confirm in ("y", "yes"):
                 r2 = subprocess.run(
                     ["git", "commit", "-m", msg],
-                    capture_output=True, text=True, cwd=os.getcwd()
+                    capture_output=True, text=True, cwd=str(_workspace_root())
                 )
                 if r2.returncode == 0:
                     print(f"{GREEN}✓ Committed.{R}")
@@ -1957,7 +1976,7 @@ Write the AGENTS.md content directly. Be concise but complete."""
                     if edited:
                         r2 = subprocess.run(
                             ["git", "commit", "-m", edited],
-                            capture_output=True, text=True, cwd=os.getcwd()
+                            capture_output=True, text=True, cwd=str(_workspace_root())
                         )
                         if r2.returncode == 0:
                             print(f"{GREEN}✓ Committed.{R}")
@@ -1976,14 +1995,14 @@ Write the AGENTS.md content directly. Be concise but complete."""
             try:
                 r = subprocess.run(
                     ["git", "diff", "HEAD"],
-                    capture_output=True, text=True, timeout=10, cwd=os.getcwd()
+                    capture_output=True, text=True, timeout=10, cwd=str(_workspace_root())
                 )
                 diff = r.stdout.strip()
                 if not diff:
                     # Fallback: staged only
                     r2 = subprocess.run(
                         ["git", "diff", "--staged"],
-                        capture_output=True, text=True, timeout=10, cwd=os.getcwd()
+                        capture_output=True, text=True, timeout=10, cwd=str(_workspace_root())
                     )
                     diff = r2.stdout.strip()
             except Exception:

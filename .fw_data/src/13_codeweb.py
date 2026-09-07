@@ -301,7 +301,10 @@ After code changes, run the narrowest relevant syntax check when available (e.g.
 # Misc
 - Broad grep → `grep -m 50`. No large log reads.
 - Simplest solution that works — no overengineering.
-- Do not add features, files, or abstractions beyond what was asked."""
+- Preserve useful existing behavior and compatibility. Add or update functionality
+  when it directly improves the requested outcome, reliability, safety, or maintainability.
+  Remove behavior only when it is demonstrably obsolete/superseded and no active caller
+  depends on it; avoid unrelated feature expansion or speculative abstractions."""
 
 # Không còn tool riêng nào cho agent codeweb — đã bỏ "preview_check" (vô
 # dụng: model hiếm khi gọi đúng lúc, ảnh chụp gửi lên chỉ tốn token, và cơ
@@ -447,6 +450,8 @@ def codeweb_maybe_auto_preview(tool_name, args, state):
         p = resolved
         if not p.exists() or p.is_dir():
             return
+        if p.stat().st_size > 5 * 1024 * 1024:
+            return  # avoid flooding the preview transport with an oversized page
         content = p.read_text(errors="replace")
     except Exception:
         return

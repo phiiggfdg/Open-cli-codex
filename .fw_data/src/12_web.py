@@ -213,9 +213,21 @@ def _ws_recv_frame(conn: socket.socket, poll_timeout: float = 0.5,
                 # ping/pong -- không phải data frame, bỏ qua và đọc tiếp
                 # (không reset started_frame: vẫn coi là cùng 1 lượt đọc
                 # message đang chờ, không cần poll_timeout ngắn lại).
+                if not fin or len(payload) > 125:
+                    return None
                 continue
             if message_opcode is None:
+                if opcode not in (0x1, 0x2):
+                    # A continuation frame cannot start a message; reject
+                    # malformed protocol input instead of treating it as a
+                    # text payload and desynchronising the next frame.
+                    return None
                 message_opcode = opcode
+            elif opcode != 0x0:
+                # Once fragmented, only continuation frames are legal until
+                # FIN.  Closing the local connection is safer than merging
+                # unrelated frames into one JSON message.
+                return None
             total_len += len(payload)
             if total_len > _MAX_WS_MESSAGE_BYTES:
                 # Vượt giới hạn -- đóng kết nối sạch thay vì tích luỹ thêm
@@ -325,6 +337,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 st.bus._ask_handlers.remove(ask_handler)
             except (ValueError, AttributeError):
                 pass
+            for pid, pending in list(pending_registry.items()):
+                pending.remove_waiter(pid)
+                pending_registry.pop(pid, None)
 
         def _send_session_init(st):
             try:
@@ -406,6 +421,11 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                     msg = json.loads(payload.decode("utf-8"))
                 except Exception:
                     continue
+                if not isinstance(msg, dict):
+                    # JSON arrays/scalars are valid JSON but not valid WS
+                    # protocol messages.  Ignore them without dereferencing
+                    # `.get()` and killing the connection thread.
+                    continue
                 mtype = msg.get("type")
                 try:
                     if mtype == "input":
@@ -472,6 +492,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                         pending = pending_registry.pop(pid, None)
                         if pending is not None:
                             pending.resolve(msg.get("value"))
+                            pending.remove_waiter(pid)
                     elif mtype == "codeweb_preview_ack":
                         # /codeweb: JS báo NGƯỢC lại server rằng 1 preview (auto
                         # HOẶC thủ công) vừa PASS ở phía client -- server không

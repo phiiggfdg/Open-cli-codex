@@ -135,6 +135,10 @@ def _sandbox_resolve_read(path: str) -> str:
     return str(_resolve_read_path(path))
 
 def tool_glob(pattern, cwd=None):
+    if not isinstance(pattern, str) or not pattern:
+        return "[error: glob pattern must be a non-empty string]"
+    if len(pattern) > 4096:
+        return "[policy] glob pattern exceeds 4096 characters"
     if cwd:
         base = _resolve_read_path(cwd)
     elif _project_dir is not None:
@@ -155,24 +159,27 @@ def tool_glob(pattern, cwd=None):
     if shutil.which("fd"):
         try:
             r = subprocess.run(
-                ["fd", "--glob", pattern, "--base-directory", str(base),
-                 "--exclude", FW_DATA_NAME, "--exclude", "fw.py"],
+                ["fd", "--glob", "--base-directory", str(base),
+                 "--max-results", "300",
+                 "--exclude", FW_DATA_NAME, "--exclude", "fw.py", "--", pattern],
                 capture_output=True, text=True, timeout=10)
             if r.returncode == 0:
                 out = r.stdout.strip()
                 lines = [l for l in out.splitlines() if l.strip() not in ("fw.py", "./fw.py")]
                 lines = [l for l in lines if _inside_base(base / l)]
-                return "\n".join(lines) or "(no matches)"
+                return "\n".join(lines[:300]) or "(no matches)"
             fd_error = f"fd exit {r.returncode}: {r.stderr.strip()[:300]}"
         except Exception as e:
             fd_error = f"fd {type(e).__name__}: {e}"
     try:
-        matches = sorted(base.glob(pattern))
-        # Lọc bỏ .fw_data và fw.py — không bao giờ xuất hiện trong kết quả
-        matches = [m for m in matches
-                   if FW_DATA_NAME not in m.parts
-                   and not (m.parent == base and m.name == "fw.py")
-                   and _inside_base(m)]
+        matches = []
+        for m in base.glob(pattern):
+            if (FW_DATA_NAME not in m.parts
+                    and not (m.parent == base and m.name == "fw.py")
+                    and _inside_base(m)):
+                matches.append(m)
+                if len(matches) >= 300:
+                    break
         return "\n".join(str(m.relative_to(base)) for m in matches[:300]) or "(no matches)"
     except Exception as e:
         if fd_error:
@@ -202,6 +209,20 @@ def tool_grep(pattern, path=None, glob=None, ignore_case=False, fixed_string=Fal
     Các tham số này CỘNG DỒN — có thể kết hợp tự do, vd:
       ignore_case=True + word=True + context=2  ~=  grep -iwC2
     """
+    if not isinstance(pattern, str) or not pattern:
+        return "[error: grep pattern must be a non-empty string]"
+    if len(pattern) > 4096:
+        return "[policy] grep pattern exceeds 4096 characters"
+    if glob is not None and (not isinstance(glob, str) or len(glob) > 4096):
+        return "[error: grep glob must be a string of at most 4096 characters]"
+    try:
+        context = max(0, int(context or 0))
+    except (TypeError, ValueError):
+        return "[error: grep context must be an integer]"
+    try:
+        max_count = None if max_count in (None, "") else max(1, int(max_count))
+    except (TypeError, ValueError):
+        return "[error: grep max_count must be an integer]"
     if path:
         base_p = _resolve_read_path(path)
     elif _project_dir is not None:
@@ -229,12 +250,15 @@ def tool_grep(pattern, path=None, glob=None, ignore_case=False, fixed_string=Fal
             if context and context > 0: cmd += ["-C", str(context)]
             if max_count:    cmd += ["-m", str(max_count)]
             if multiline:    cmd += ["--multiline", "--multiline-dotall"]
-            cmd += [pattern, base]
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            cmd += ["--", pattern, base]
+            r = _run_bounded_capture(cmd, timeout=15)
             # rg exit code: 0 = có match, 1 = không match (hợp lệ), 2+ = lỗi thật
             # (pattern regex sai, glob sai, path không tồn tại...)
             if r.returncode in (0, 1):
-                return r.stdout.strip() or "(no matches)"
+                output = r.stdout.strip()
+                if len(output) > 200_000:
+                    output = output[:200_000] + "\n... [grep output truncated at 200,000 chars]"
+                return output or "(no matches)"
             rg_errors.append(f"rg exit {r.returncode}: {r.stderr.strip()[:300]}")
         except Exception as e:
             rg_errors.append(f"rg {type(e).__name__}: {e}")
@@ -290,14 +314,17 @@ def tool_grep(pattern, path=None, glob=None, ignore_case=False, fixed_string=Fal
             if files_only:   cmd += ["-l"]
             if context and context > 0: cmd += ["-C", str(context)]
             if max_count:    cmd += ["-m", str(max_count)]
-        cmd += [pattern, base]
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        cmd += ["--", pattern, base]
+        r = _run_bounded_capture(cmd, timeout=15)
         # grep exit code: 0 = match, 1 = không match (hợp lệ), 2+ = lỗi thật
         if r.returncode in (0, 1):
             out = r.stdout.strip()
             if multiline:
                 out = out.replace("\x00", "\n---\n")
-            return out or "(no matches)"
+            output = out
+            if len(output) > 200_000:
+                output = output[:200_000] + "\n... [grep output truncated at 200,000 chars]"
+            return output or "(no matches)"
         err_msg = f"grep exit {r.returncode}: {r.stderr.strip()[:300]}"
         if rg_errors:
             err_msg = f"[error: {err_msg} | rg also failed: {'; '.join(rg_errors)}]"
@@ -322,7 +349,10 @@ def tool_view_symbol(path, symbol):
     if not p.exists():
         return f"[not found: {path}]"
     try:
-        lines = p.read_text(errors="replace").splitlines()
+        if p.stat().st_size > 20 * 1024 * 1024:
+            return "[policy] File quá lớn cho view_symbol (>20 MiB); dùng grep với symbol trước."
+        raw_content = p.read_text(errors="replace")
+        lines = raw_content.splitlines()
     except Exception as e:
         return f"[error: {e}]"
 
@@ -359,14 +389,8 @@ def tool_view_symbol(path, symbol):
             break
 
     if start_line is None:
-        # Fallback: tìm bất kỳ dòng nào chứa symbol
-        for i, line in enumerate(lines):
-            if re.search(rf"\b{re.escape(symbol)}\b", line):
-                start_line = i
-                break
-
-    if start_line is None:
-        return f"[symbol '{symbol}' not found in {path}]"
+        return (f"[symbol '{symbol}' definition not found in {path}] "
+                "Use grep for plain-text occurrences.")
 
     # Tìm dòng kết thúc block — dựa vào indent hoặc brace counting
     ext = p.suffix.lower()
@@ -466,7 +490,8 @@ def tool_view_symbol(path, symbol):
     # Track read time
     _file_read_time[str(p.resolve())] = time.time()
     # Cache full file content khi view_symbol (đã đọc toàn bộ lines rồi)
-    _cache_put(str(p), "\n".join(lines), _current_sid)
+    if len(raw_content.encode("utf-8", errors="replace")) <= 2 * 1024 * 1024:
+        _cache_put(str(p), raw_content, _active_session_id())
     return out
 
 
@@ -482,7 +507,43 @@ _WEBFETCH_STRIP_TAGS = (
 # thay vì toàn bộ <body> (tránh menu/sidebar lẫn vào phần đầu kết quả).
 _WEBFETCH_MAIN_TAGS = ("main", "article")
 
+_WEB_RESPONSE_LIMIT = 5 * 1024 * 1024
+
+def _read_http_limited(resp, limit=_WEB_RESPONSE_LIMIT) -> bytes:
+    chunks, total = [], 0
+    while True:
+        chunk = resp.read(min(65536, limit + 1 - total))
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+        total += len(chunk)
+        if total > limit:
+            raise RuntimeError(f"HTTP response exceeds {limit:,} bytes")
+
+def _validate_public_http_url(url: str) -> None:
+    if not isinstance(url, str) or not url.strip():
+        raise ValueError("URL must be a non-empty string")
+    if len(url) > 4096:
+        raise ValueError("URL exceeds 4096 characters")
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError("URL must be an absolute http(s) URL")
+    if parsed.username or parsed.password:
+        raise ValueError("credentials in URL are not allowed")
+    try:
+        infos = socket.getaddrinfo(parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80))
+    except socket.gaierror as e:
+        raise ValueError(f"cannot resolve host: {e}") from e
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0].split("%", 1)[0])
+        if not ip.is_global:
+            raise ValueError(f"private/local address is blocked: {ip}")
+
 def tool_webfetch(url):
+    if not isinstance(url, str) or not url.strip():
+        return "[error: URL must be a non-empty string]"
+    if len(url) > 4096:
+        return "[policy] URL exceeds 4096 characters"
     # Redirect handler THỦ CÔNG thay vì để urllib tự follow redirect.
     #
     # Lý do không dùng urllib.request.urlopen() mặc định: nó tự theo dõi URL
@@ -540,6 +601,7 @@ def tool_webfetch(url):
     resp = None
     try:
         for _ in range(MAX_REDIRECTS):
+            _validate_public_http_url(current)
             n = visit_count.get(current, 0)
             cookies_now = frozenset((c.name, c.value) for c in cj)
 
@@ -564,12 +626,17 @@ def tool_webfetch(url):
                 loc = resp_headers.get("Location") if resp_headers else None
                 if not loc:
                     raise urllib.error.HTTPError(current, status, "redirect with no Location header", resp_headers, None)
+                if err is not None:
+                    try:
+                        err.close()
+                    except Exception:
+                        pass
                 current = urllib.parse.urljoin(current, loc)
                 continue
 
             if status and 200 <= status < 300:
                 ctype = resp_headers.get("Content-Type", "") if resp_headers else ""
-                raw_bytes = resp.read()
+                raw_bytes = _read_http_limited(resp)
                 break
 
             # Lỗi thật (4xx/5xx) — không phải redirect, ném lên như HTTPError bình thường.
@@ -580,7 +647,7 @@ def tool_webfetch(url):
             raise RuntimeError("redirect loop: too many redirects (" + " -> ".join(chain) + " -> ...)")
 
         # Không phải HTML/text (pdf, image, binary...) — báo rõ thay vì trả rác nhị phân.
-        if ctype and not any(t in ctype for t in ("text/html", "text/plain", "application/xhtml", "xml")):
+        if ctype and not any(t in ctype.lower() for t in ("text/html", "text/plain", "application/xhtml", "xml")):
             return f"[error: unsupported content-type '{ctype}', cannot extract text]"
 
         raw = raw_bytes.decode("utf-8", errors="replace")
@@ -633,6 +700,12 @@ def tool_webfetch(url):
         return f"[error: {e.reason}]"
     except Exception as e:
         return f"[error: {e}]"
+    finally:
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:
+                pass
 
 
 
@@ -640,6 +713,10 @@ def tool_websearch(query, num=5):
     """SearXNG HTML scrape (multi-instance fallback) — fallback to DuckDuckGo HTML scrape."""
     import urllib.parse
     errors = []  # thu thập lỗi từng nhánh để debug khi cả 2 fail
+    if not isinstance(query, str) or not query.strip():
+        return "[error: websearch query must be a non-empty string]"
+    if len(query) > 4096:
+        return "[policy] websearch query exceeds 4096 characters"
 
     # BUG FIX (nhẹ, off-by-one): trước đây `int(num)` được gọi rải rác ở 6 nơi
     # khác nhau trong hàm (`len(results) >= int(num)`), mỗi lần convert lại từ
@@ -673,12 +750,6 @@ def tool_websearch(query, num=5):
     _SEARXNG_INSTANCES = [
         "https://metacat.online",
         "https://nyc1.sx.ggtyler.dev",
-        "https://ooglester.com",
-        "https://search.080609.xyz",
-        "https://search.canine.tools",
-        "https://search.catboy.house",
-        "https://search.im-in.space",
-        "https://search.indst.eu",
     ]
     _SEARXNG_UA = (
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -694,7 +765,7 @@ def tool_websearch(query, num=5):
                 "Accept-Language": "en-US,en;q=0.9",
             })
             with urllib.request.urlopen(req, timeout=8) as resp:
-                html = resp.read().decode("utf-8", errors="replace")
+                html = _read_http_limited(resp).decode("utf-8", errors="replace")
 
             results = []
             seen_urls = set()
@@ -756,7 +827,7 @@ def tool_websearch(query, num=5):
             "Accept-Language": "en-US,en;q=0.9",
         })
         with urllib.request.urlopen(req, timeout=10) as resp:
-            html = resp.read().decode("utf-8", errors="replace")
+            html = _read_http_limited(resp).decode("utf-8", errors="replace")
 
         results = []
         seen_urls = set()
@@ -889,6 +960,8 @@ def tool_todowrite(todos):
     if not isinstance(todos, list):
         return (f"[error: 'todos' must be a list of todo items, got {type(todos).__name__}. "
                 f"No changes made — todo list and turn quota unaffected.]")
+    if len(todos) > 100:
+        return "[error: todo list is limited to 100 items; no changes made.]"
     _REQUIRED_FIELDS = ("id", "content", "status", "priority")
     _VALID_STATUS   = ("pending", "in_progress", "completed")
     _VALID_PRIORITY = ("high", "medium", "low")
@@ -901,6 +974,10 @@ def tool_todowrite(todos):
             return (f"[error: todos[{i}] missing required field(s): {missing}. "
                     f"Each todo item needs {_REQUIRED_FIELDS}. No changes made — "
                     f"todo list and turn quota unaffected.]")
+        if not isinstance(t.get("id"), str) or len(t["id"]) > 128:
+            return f"[error: todos[{i}].id must be a string of at most 128 chars. No changes made.]"
+        if not isinstance(t.get("content"), str) or len(t["content"]) > 2000:
+            return f"[error: todos[{i}].content must be a string of at most 2000 chars. No changes made.]"
         if t["status"] not in _VALID_STATUS:
             return (f"[error: todos[{i}]['status'] = {t['status']!r} is invalid. "
                     f"Must be one of {_VALID_STATUS}. No changes made.]")
@@ -955,6 +1032,11 @@ def tool_question(question, options=None, state=None):
     vẫn nhận được nếu còn subscribe); không có state (gọi tool trực tiếp
     ngoài luồng agent, hiếm) -> giữ nguyên input() cũ.
     """
+    if not isinstance(question, str) or not question.strip():
+        return "[question error: question must be a non-empty string]"
+    if options is not None and not isinstance(options, list):
+        return "[question error: options must be a list of strings]"
+    question = question[:4000]
     if state is not None:
         # BUG FIX: nhánh này gọi state.ask(...) mà KHÔNG có try/except nào
         # bao quanh (khác hẳn nhánh CLI bên dưới, có bọc
@@ -985,12 +1067,13 @@ def tool_question(question, options=None, state=None):
         _ASK_TIMEOUT_SECONDS = 1800  # 30 phút — đủ dài cho người thật suy nghĩ, không vô hạn
         try:
             if options and isinstance(options, list):
-                options = [o.strip() for o in options if isinstance(o, str) and o.strip()]
+                options = [o.strip()[:300] for o in options
+                           if isinstance(o, str) and o.strip()][:20]
             if options:
                 ans = state.ask(
                     prompt=question,
                     kind="choice",
-                    default=options[0] if options else None,
+                    default=None,
                     timeout=_ASK_TIMEOUT_SECONDS,
                     extra={"options": options},
                 )
@@ -999,7 +1082,7 @@ def tool_question(question, options=None, state=None):
                                  timeout=_ASK_TIMEOUT_SECONDS)
         except Exception as e:
             return f"[question error: {e} — treated as no answer]"
-        ans = (ans or "").strip()
+        ans = str(ans or "").strip()
         return ans if ans else "(no answer)"
 
     print(f"\n{BOLD}{BLUE}❓ AI hỏi:{R} {question}")
@@ -1008,7 +1091,7 @@ def tool_question(question, options=None, state=None):
     # để chọn. Lọc bỏ option rỗng/chỉ-khoảng-trắng trước khi hiển thị; nếu lọc
     # xong không còn gì, coi như không có options (rơi về free-form input).
     if options and isinstance(options, list):
-        options = [o.strip() for o in options if isinstance(o, str) and o.strip()]
+        options = [o.strip()[:300] for o in options if isinstance(o, str) and o.strip()][:20]
     if options and isinstance(options, list) and len(options) > 0:
         for i, opt in enumerate(options, 1):
             print(f"  {YELLOW}{i}.{R} {opt}")
@@ -1039,7 +1122,10 @@ def _list_available_skills(exclude_name=None):
     for sd in SKILLS_DIRS:
         if sd.exists():
             sd_resolved = sd.resolve()
-            for f in sd.rglob("*.md"):
+            # Only actual skill entrypoints: <name>/SKILL.md and optional
+            # top-level <name>.md. Reference docs must not appear as skills.
+            files = list(sd.glob("*.md")) + list(sd.glob("*/SKILL.md"))
+            for f in files:
                 try:
                     f.resolve().relative_to(sd_resolved)
                 except ValueError:
@@ -1053,7 +1139,13 @@ def _list_available_skills(exclude_name=None):
 def tool_skill(name):
     """Load a SKILL.md file by name from known skills directories."""
     # Normalise: strip .md suffix and trailing slashes, try variations
-    clean_name = re.sub(r"\.md$", "", str(name).strip(), flags=re.IGNORECASE).rstrip("/")
+    if not isinstance(name, str):
+        return "[skill error: name must be a string]"
+    clean_name = re.sub(r"\.md$", "", name.strip(), flags=re.IGNORECASE).rstrip("/")
+    if not clean_name:
+        return "[skill error: name must be non-empty]"
+    if len(clean_name) > 256:
+        return "[policy] skill name exceeds 256 characters"
     candidates = [clean_name, f"{clean_name}.md", f"{clean_name}/SKILL.md",
                   f"{clean_name.upper()}/SKILL.md", f"{clean_name}.skill.md"]
     for skills_dir in SKILLS_DIRS:
@@ -1081,6 +1173,8 @@ def tool_skill(name):
                 continue  # thoát khỏi skills_dir — bỏ qua candidate này
             if p.exists() and p.is_file():
                 try:
+                    if p.stat().st_size > 2 * 1024 * 1024:
+                        return "[policy] skill content exceeds 2 MiB"
                     content = p.read_text()
                     # BUG FIX: cùng bug-class đã fix ở tool_todowrite/
                     # tool_question/tool_verify (print() trần, tách biệt
@@ -1108,7 +1202,7 @@ def tool_skill(name):
     return f"[skill not found: '{name}'. {hint}]"
 
 def tool_verify(path: str, reason: str = "") -> str:
-    """Hỏi user có muốn verify file/output không.
+    """Ask the user for an actual observation; never claim verification by reading source.
 
     BUG ĐÃ SỬA: hàm này trước đây tự print()/input() thẳng, tách biệt hoàn
     toàn khỏi EventBus/state.ask() -- cùng loại bug đã sửa ở tool_todowrite
@@ -1124,34 +1218,31 @@ def tool_verify(path: str, reason: str = "") -> str:
     Giữ nguyên print()/input() y hệt cũ khi không có state (hiếm, CLI chạy
     ngoài agent_turn) để không đổi hành vi trường hợp đó.
     """
+    if not isinstance(path, str) or not path.strip():
+        return "[verify error: path must be a non-empty string]"
+    if not isinstance(reason, str):
+        return "[verify error: reason must be a string]"
+    path = path[:4096]
+    reason = reason[:2000]
     reason_str = f" — {reason}" if reason else ""
     _st = current_state()
     if _st is not None:
         ans = _st.ask(
-            prompt=f"⊙ Verify {path}{reason_str}?",
-            kind="confirm",
-            default="n",
-        ) or "n"
-        ans = str(ans).strip().lower()
+            prompt=(f"⊙ Hãy kiểm tra {path}{reason_str} và mô tả kết quả thực tế "
+                    "(hoặc ghi 'skip' nếu chưa thể kiểm tra)."),
+            kind="text", default=None, timeout=1800,
+        )
+        observation = str(ans or "").strip()
     else:
         reason_str_cli = f"  {DIM}{reason}{R}" if reason else ""
         print(f"\n{CYAN}⊙ Verify?{R}  {BOLD}{path}{R}{reason_str_cli}")
         try:
-            ans = input(f"  {DIM}[y/N]: {R}").strip().lower()
+            observation = input(f"  {DIM}Mô tả kết quả (hoặc 'skip'): {R}").strip()
         except (EOFError, KeyboardInterrupt):
-            return "verification skipped"
-    if ans in ("y", "yes"):
-        p = _resolve_read_path(path)
-        err = _check_sandbox_read(str(p))
-        if err:
-            return err
-        if p.is_dir():
-            return tool_read(str(p), depth=2)
-        elif p.is_file():
-            return tool_read(str(p), limit=30)
-        else:
-            return f"[verify] not found: {p}"
-    return "verification skipped by user"
+            observation = ""
+    if not observation or observation.lower() == "skip":
+        return "[verify] No user observation was provided; verification remains incomplete."
+    return f"[verify] User observation for {path}: {observation}"
 
 
 def tool_lsp(operation, file=None, line=None, character=None, query=None):
@@ -1165,6 +1256,20 @@ def tool_lsp(operation, file=None, line=None, character=None, query=None):
       workspace_symbol— search symbols by name across project
     """
     import ast as _ast
+
+    if not isinstance(operation, str):
+        return "[lsp] operation must be a string"
+    if file is not None and not isinstance(file, str):
+        return "[lsp] file must be a string"
+    if query is not None and not isinstance(query, str):
+        return "[lsp] query must be a string"
+    try:
+        line = max(1, int(line or 1))
+        character = max(0, int(character or 0))
+    except (TypeError, ValueError):
+        return "[lsp] line and character must be integers"
+    if query is not None and len(query) > 512:
+        return "[policy] lsp query exceeds 512 characters"
 
     # ── helpers ──────────────────────────────────────────────────────────────
     def _resolve_lsp_file(path):
@@ -1181,6 +1286,8 @@ def tool_lsp(operation, file=None, line=None, character=None, query=None):
         if err:
             return None
         try:
+            if p.stat().st_size > 20 * 1024 * 1024:
+                return None
             return p.read_text(errors="replace")
         except Exception as e:
             return None
@@ -1239,7 +1346,12 @@ def tool_lsp(operation, file=None, line=None, character=None, query=None):
         if line < 1 or line > len(src_lines):
             return ""
         row = src_lines[line - 1]
-        col = min(character, len(row) - 1)
+        if not row:
+            return ""
+        try:
+            col = max(0, min(int(character or 0), len(row) - 1))
+        except (TypeError, ValueError):
+            col = 0
         start = col
         while start > 0 and (row[start-1].isalnum() or row[start-1] == "_"):
             start -= 1
@@ -1261,13 +1373,11 @@ def tool_lsp(operation, file=None, line=None, character=None, query=None):
             return f"[lsp] Cannot read {file}"
         tree = _parse(src)
         if tree is None:
-            # Fallback: regex for non-Python or syntax errors
+            # Fallback: the shared language regex index for non-Python or
+            # temporarily incomplete source files.
             lines = src.splitlines()
-            out = []
-            for i, ln in enumerate(lines, 1):
-                s = ln.strip()
-                if s.startswith("def ") or s.startswith("async def ") or s.startswith("class "):
-                    out.append(f"  {i:4d}  {s[:80]}")
+            out = [f"  {info['line']:4d}  {name}" for name, info in
+                   _parse_symbols(src, Path(file).suffix).items()]
             return f"Symbols in {file} ({len(out)} found):\n" + "\n".join(out) if out else f"[lsp] No symbols found in {file}"
         symbols = _all_symbols(tree, src.splitlines())
         if not symbols:
@@ -1336,6 +1446,10 @@ def tool_lsp(operation, file=None, line=None, character=None, query=None):
                     if s["name"] == name:
                         snippet = src_lines[s["line"]-1].strip()
                         return f"Definition of `{name}`:\n  {file}:{s['line']}  {snippet}"
+            # Language-agnostic regex index for JS/TS/Go/Rust/etc.
+            for sname, sinfo in _parse_symbols(src, Path(file).suffix).items():
+                if sname == name:
+                    return f"Definition of `{name}`:\n  {file}:{sinfo['line']}  {src_lines[sinfo['line']-1].strip()}"
         if not name:
             return "[lsp] No symbol at cursor"
         # Grep fallback across project (cũng dùng khi không truyền file).
@@ -1382,9 +1496,19 @@ def tool_lsp(operation, file=None, line=None, character=None, query=None):
         pattern = query or ""
         if not pattern:
             return "[lsp] workspace_symbol requires query"
-        result = tool_grep(f"def {pattern}", ".")
-        if "(no matches)" in result:
-            result = tool_grep(pattern, ".")
-        return result[:1500] if result else "[lsp] No matches"
+        hits = []
+        for candidate in _workspace_reference_files(max_files=400):
+            try:
+                if candidate.stat().st_size > 20 * 1024 * 1024:
+                    continue
+                src = candidate.read_text(errors="replace")
+                for sname, sinfo in _parse_symbols(src, candidate.suffix).items():
+                    if pattern.lower() in sname.lower():
+                        hits.append(f"{candidate}:{sinfo['line']}  {sname}")
+            except Exception:
+                continue
+            if len(hits) >= 100:
+                break
+        return "\n".join(hits[:100]) if hits else "[lsp] No matches"
 
     return f"[lsp] Unknown operation: {operation}. Supported: documentSymbol, hover, definition, references, workspace_symbol"

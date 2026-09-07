@@ -19,22 +19,53 @@ def todos_save(conn, sid, todos):
     conn.commit()
 
 # ── File snapshots (undo/redo) ───────────────────────────────────────────────
-def snapshot_save(conn, sid, path, before, after):
+_SNAPSHOT_BINARY_PREFIX = "<<<FW_BINARY_BASE64_V1>>>"
+
+def snapshot_encode_bytes(data: bytes) -> str:
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return _SNAPSHOT_BINARY_PREFIX + base64.b64encode(data).decode("ascii")
+
+def snapshot_decode(value):
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        return value
+    if not isinstance(value, str):
+        raise ValueError(f"unsupported snapshot value type: {type(value).__name__}")
+    if value.startswith(_SNAPSHOT_BINARY_PREFIX):
+        try:
+            return base64.b64decode(value[len(_SNAPSHOT_BINARY_PREFIX):], validate=True)
+        except (ValueError, TypeError, base64.binascii.Error):
+            raise ValueError("corrupt binary snapshot payload")
+    return value.encode("utf-8")
+
+def snapshot_save(conn, sid, path, before, after, group_id=None):
     # A new edit after undo creates a new history branch; stale redo entries
     # must not become available again after a restart.
-    conn.execute("DELETE FROM file_snapshot WHERE session_id=? AND undone=1", (sid,))
     snap = {
         "id": str(uuid.uuid4()), "session_id": sid, "path": path,
         "before": before, "after": after, "created_at": int(time.time()),
-        "undone": 0,
+        "undone": 0, "group_id": group_id,
     }
-    conn.execute("""INSERT INTO file_snapshot
-                    (id,session_id,path,before,after,created_at,undone)
-                    VALUES (?,?,?,?,?,?,?)""",
-                 tuple(snap[k] for k in (
-                     "id", "session_id", "path", "before", "after",
-                     "created_at", "undone")))
-    conn.commit()
+    try:
+        conn.execute("DELETE FROM file_snapshot WHERE session_id=? AND undone=1", (sid,))
+        conn.execute("""INSERT INTO file_snapshot
+                        (id,session_id,path,before,after,created_at,undone,group_id)
+                        VALUES (?,?,?,?,?,?,?,?)""",
+                     tuple(snap[k] for k in (
+                         "id", "session_id", "path", "before", "after",
+                         "created_at", "undone", "group_id")))
+        conn.commit()
+    except Exception:
+        # Never leave a failed snapshot transaction open: a later unrelated
+        # commit could otherwise persist a partial redo deletion or insert.
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
     return snap
 
 def snapshots_load(conn, sid):
@@ -344,10 +375,10 @@ TOOLS = [
   }},
   {"type":"function","function":{
     "name":"apply_patch",
-    "description":"Best tool for modifying code efficiently. Use when: changing more than 3 lines, editing multiple locations in one file, or restructuring code. Single call replaces multiple edit calls.",
+    "description":"Atomic patching for a substantial or structural change in one existing file. Prefer edit for one exact replacement and multiedit for 2-5 independent exact replacements. Supports multiple unified-diff hunks and the common *** Begin Patch / *** Update File wrapper; every hunk must target the same path. On any failure the file remains unchanged.",
     "parameters":{"type":"object","properties":{
       "path": {"type":"string","description":"File to patch"},
-      "patch":{"type":"string","description":"Unified diff patch (--- a/file, +++ b/file, @@ ... @@ format)"}
+      "patch":{"type":"string","description":"Unified diff with @@ hunks. Include 2-3 unchanged context lines around each change when possible. File headers (---/+++) or a single *** Begin Patch wrapper are optional."}
     },"required":["path","patch"]}
   }},
   {"type":"function","function":{
@@ -475,12 +506,12 @@ TOOLS = [
   }},
   {"type":"function","function":{
     "name":"file_index",
-    "description":"Call at the start of coding tasks that involve reading or editing existing files. Skip for conversational input, questions about the system, or new-file-only tasks. Returns file paths + symbol names + line numbers (persists across sessions). File listed → use view_symbol directly. File not listed → grep(\"##==\") then grep symbols before any read.",
+    "description":"Call at the start of coding tasks that involve reading or editing existing files. It refreshes a bounded symbol index for the active workspace and persists it across sessions. File listed → use view_symbol directly; file not listed → targeted grep/lsp before read.",
     "parameters":{"type":"object","properties":{},"required":[]}
   }},
   {"type":"function","function":{
     "name":"verify",
-    "description":"Ask the user to visually inspect a file or UI output. Do NOT use for running automated tests — use bash for that. Call when human confirmation is needed before proceeding. See system prompt Tools policy for when this replaces re-reading.",
+    "description":"Ask the user to inspect a file/UI/output and describe the real observed result. Never read source and claim that proves visual/runtime success; use bash for automated tests.",
     "parameters":{"type":"object","properties":{
       "path":   {"type":"string","description":"File or directory path to verify"},
       "reason": {"type":"string","description":"Why you want to verify (optional)"}

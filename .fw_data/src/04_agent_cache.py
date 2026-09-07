@@ -14,6 +14,7 @@ DEFAULT_PERMS = {
     "delete":      PERM_ALLOW,  # undo-stack bảo vệ giống write/edit
     "extract":     PERM_ALLOW,
     "edit":        PERM_ALLOW,
+    "multiedit":   PERM_ALLOW,
     "apply_patch": PERM_ALLOW,
     "read":        PERM_ALLOW,
     "glob":        PERM_ALLOW,
@@ -27,6 +28,12 @@ DEFAULT_PERMS = {
     "delegate":    PERM_ALLOW,
     "skill":       PERM_ALLOW,
     "lsp":         PERM_ALLOW,
+    "view_symbol": PERM_ALLOW,
+    "file_index":  PERM_ALLOW,
+    "verify":      PERM_ALLOW,
+    # External MCP tools are untrusted and may have side effects. A specific
+    # /perm rule can still allow a trusted server/tool explicitly.
+    "mcp__*":      PERM_ASK,
 }
 
 # Plan-mode overrides (read-only)
@@ -36,6 +43,7 @@ PLAN_PERMS = {
     "delete":      PERM_DENY,
     "extract":     PERM_DENY,
     "edit":        PERM_DENY,
+    "multiedit":   PERM_DENY,
     "apply_patch": PERM_DENY,
 }
 
@@ -81,9 +89,15 @@ def load_agents_md(extra_dirs: list[Path] | None = None) -> str:
             return ""
 
     found = []
-    # project-level: traverse up từ cwd
-    cwd = Path.cwd()
-    for parent in [cwd, *cwd.parents]:
+    # Project rules must follow the active workspace, not the directory from
+    # which this CLI happened to be launched.
+    root = (_project_dir.resolve() if _project_dir is not None else Path.cwd().resolve())
+    candidates = [root, *root.parents]
+    for extra in (extra_dirs or []):
+        ep = Path(extra).expanduser().resolve()
+        if ep not in candidates:
+            candidates.append(ep)
+    for parent in candidates:
         for name in ("AGENTS.md", "CLAUDE.md"):
             p = parent / name
             if p.exists():
@@ -500,6 +514,15 @@ _project_dir_conn = None
 _project_dir_sid  = ""
 _project_dir_is_placeholder: bool = False  # True khi set là cwd eager-init, chưa tạo subdir thật
 
+def _active_session_id() -> str:
+    try:
+        st = current_state()
+        if st is not None and getattr(st, "sid", None):
+            return st.sid
+    except Exception:
+        pass
+    return globals().get("_current_sid", "")
+
 def _project_dir_str() -> str:
     """Tra ve full absolute path cua project_dir hien tai.
     Luon dung _project_dir neu co (ke ca placeholder) — dam bao cache key
@@ -579,8 +602,9 @@ def _resolve_to_sandbox(path: str) -> Path:
 
     # Đã nằm trong project_dir rồi → không đổi
     try:
-        p_orig.resolve().relative_to(proj.resolve())
-        return p_orig.resolve()
+        resolved = p_orig.resolve()
+        resolved.relative_to(proj.resolve())
+        return resolved
     except ValueError:
         pass
 
@@ -589,7 +613,9 @@ def _resolve_to_sandbox(path: str) -> Path:
         parts = p_orig.parts
         if parts and parts[0] == proj.name:
             stripped = Path(*parts[1:]) if len(parts) > 1 else Path(".")
-            return (proj / stripped).resolve()
+            candidate = (proj / stripped).resolve()
+            candidate.relative_to(proj.resolve())
+            return candidate
 
     # Nằm trong cwd nhưng ngoài project_dir → giữ relative path từ cwd
     try:
@@ -600,7 +626,13 @@ def _resolve_to_sandbox(path: str) -> Path:
         # Absolute hoàn toàn ngoài cwd → chỉ lấy phần tên file/subpath
         rel = Path(*p_orig.parts[1:]) if p_orig.is_absolute() else Path(p_orig.name)
 
-    return (proj / rel).resolve()
+    candidate = (proj / rel).resolve()
+    try:
+        candidate.relative_to(proj.resolve())
+    except ValueError as e:
+        # A parent component may be a symlink escaping the workspace.
+        raise ValueError(f"sandbox path escapes project via symlink: {path}") from e
+    return candidate
 
 # ════════════════════════════════════════════════════════════════════════════
 # DATABASE
@@ -648,7 +680,8 @@ def db_connect():
             before      TEXT,
             after       TEXT,
             created_at  INTEGER NOT NULL,
-            undone      INTEGER NOT NULL DEFAULT 0
+            undone      INTEGER NOT NULL DEFAULT 0,
+            group_id    TEXT
         );
         CREATE TABLE IF NOT EXISTS checkpoint (
             id          TEXT PRIMARY KEY,
@@ -677,6 +710,9 @@ def db_connect():
         conn.execute(
             "ALTER TABLE file_snapshot ADD COLUMN undone INTEGER NOT NULL DEFAULT 0")
         conn.commit()
+    if "group_id" not in snapshot_cols:
+        conn.execute("ALTER TABLE file_snapshot ADD COLUMN group_id TEXT")
+        conn.commit()
     # Migration: DB cũ có thể đã tạo file_snapshot với `after TEXT NOT NULL`
     # (bug gốc). tool_delete() cần ghi after=NULL để đánh dấu "sau khi xoá
     # thì không còn nội dung" — SQLite chặn insert NULL vào cột NOT NULL nên
@@ -694,11 +730,12 @@ def db_connect():
                 before      TEXT,
                 after       TEXT,
                 created_at  INTEGER NOT NULL,
-                undone      INTEGER NOT NULL DEFAULT 0
+                undone      INTEGER NOT NULL DEFAULT 0,
+                group_id    TEXT
             );
             INSERT INTO file_snapshot_new
-                (id, session_id, path, before, after, created_at, undone)
-                SELECT id, session_id, path, before, after, created_at, undone
+                (id, session_id, path, before, after, created_at, undone, group_id)
+                SELECT id, session_id, path, before, after, created_at, undone, group_id
                 FROM file_snapshot;
             DROP TABLE file_snapshot;
             ALTER TABLE file_snapshot_new RENAME TO file_snapshot;
