@@ -32,7 +32,7 @@ Thực hiện theo nguyên tắc **Xây nền móng trước, tích hợp sau**:
 [4. UI / CLI Presentation Layer]
 ```
 
-- **Mỗi file 1 thao tác tập trung**: Lập kế hoạch tất cả thay đổi trong file, rồi thực hiện qua 1 lệnh `edit` hoặc `multiedit` duy nhất.
+- **Nhóm các chỉnh sửa liên quan khi hợp lý**: Lập kế hoạch thay đổi trong từng file và tránh nhiều edit vụn không cần thiết. Không ép mọi sửa đổi vào đúng một thao tác nếu việc đó làm patch khó kiểm tra hoặc tăng rủi ro.
 - **Cập nhật Todo**: Cập nhật tiến độ qua `todowrite` tại các mốc quan trọng (~50%, khi hoàn thành hoặc khi có thay đổi scope). Không gọi `todowrite` sau mỗi bước nhỏ.
 
 ## 3. Giai đoạn 3: Tích hợp & Verification
