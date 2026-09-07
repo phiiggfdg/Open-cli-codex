@@ -41,7 +41,7 @@ Ví dụ phản hồi đúng:
 - Khi cân nhắc gọi subagent (tool `task`), phân chia nhiệm vụ song song hoặc điều phối agent → gọi `skill(name="multi-agent")`.
 - Task lớn, nhiều module hoặc phạm vi chưa rõ → gọi `skill(name="spec-driven")` trước khi lập kế hoạch và sửa code.
 - Khi làm việc với PowerPoint (`.pptx`) → gọi `skill(name="powerpoint")` trước khi tạo hoặc chỉnh sửa file.
-- Khi người dùng yêu cầu Canva, thiết kế slide/UI để import vào Canva hoặc PPTX thiên về visual → gọi `skill(name="canva")` trước (hỏi ý tưởng, chốt thẩm mỹ rồi gọi tiếp `powerpoint`).
+- Khi người dùng yêu cầu Canva, thiết kế slide/UI để import vào Canva hoặc PPTX thiên về visual → gọi `skill(name="canva")` trước; chỉ hỏi ý tưởng khi brief còn thiếu, rồi chốt/tóm tắt hướng thẩm mỹ và gọi tiếp `powerpoint`.
 - Khi làm website cần tìm ảnh, icon, font hoặc CDN → gọi `skill(name="web-assets")` trước.
 - Khi dựng scene 3D/2D bằng code (geometry, transform, camera, lighting, animation), mô phỏng hệ hình học (Rubik, board game, robot arm...), debug render sai → gọi `skill(name="computer-graphics")`.
 - Khi user gõ đúng các từ "review", "kiểm tra", "xem lỗi" VÀ không kèm yêu cầu sửa trực tiếp → gọi `skill(name="code-review")` trước khi trả lời.
@@ -55,7 +55,7 @@ Ví dụ phản hồi đúng:
 
 ## Thứ tự ưu tiên & Phối hợp Skill (Composition & Precedence)
 
-Khi một task liên quan đến nhiều skill, phối hợp theo giai đoạn (KHÔNG load nhiều skill cùng lúc trong 1 turn):
+Khi một task liên quan đến nhiều skill, phối hợp theo giai đoạn. Không load song song hoặc dồn nhiều skill trước khi cần; load tuần tự khi task thật sự chuyển sang giai đoạn tương ứng:
 - **Bug / Sửa lỗi**: Gọi `debugging` trước (Reproduce → Isolate → Fix).
 - **Task lớn / Chưa rõ yêu cầu**: Gọi `spec-driven` trước (làm rõ yêu cầu) ➔ Gọi `code-discovery` (khi cần định vị kiến trúc) ➔ Gọi `large-change` (khi bắt đầu triển khai theo tầng).
 - **Tái cấu trúc / Refactor**: Gọi `file-refactoring` trước (chiến lược trích xuất/tách file) ➔ Gọi `code-discovery` (nếu chưa định vị rõ symbol).
@@ -66,7 +66,7 @@ Khi một task liên quan đến nhiều skill, phối hợp theo giai đoạn (
 ## Môi trường: Termux / Android
 
 - Không có quyền root: không dùng `apt`, `systemctl`, hay bất kỳ lệnh nào cần `sudo`.
-- Ngoài các lệnh mutation đã bị chặn ở system prompt, cấm thêm `sed -i`.
+- Bash dùng allowlist trong system prompt; command không được liệt kê (bao gồm `sed`) bị chặn. Chỉnh file bằng `edit`/`multiedit`/`apply_patch`, không dùng `sed -i`.
 
 ## Git & Working Tree
 
@@ -83,4 +83,4 @@ Luôn áp dụng, không cần gọi skill riêng — giả định working tree
 3. Đúng layer và kiến trúc.
 4. Ít tool call nhất.
 5. Ít code và ít token nhất.
-- Mỗi turn, trước khi gọi tool, giải thích ngắn gọn (1-2 câu) đang làm gì và vì sao.
+- Với công việc nhiều bước hoặc tool call có thể khiến người dùng phải chờ, giải thích ngắn gọn (1-2 câu) đang làm gì và vì sao trước lượt tool; bỏ qua preamble cho thao tác nhanh, hiển nhiên.
