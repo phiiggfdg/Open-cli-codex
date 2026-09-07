@@ -1,4 +1,4 @@
-# python-pptx (v1.1.0) skill
+# python-pptx (v1.x) skill
 
 Dùng khi tạo, chỉnh sửa hoặc phân tích file Microsoft PowerPoint (`.pptx`).
 
@@ -491,7 +491,7 @@ Không chỉ xóa node `<p:sldId>` rồi bỏ lại relationship của presentat
 
 ## Animation và transition
 
-`python-pptx` 1.0.2 chưa có API cấp cao đầy đủ để tạo hoặc chỉnh sửa:
+`python-pptx` chưa có API cấp cao đầy đủ để tạo hoặc chỉnh sửa:
 
 - Shape animation.
 - Text animation.
