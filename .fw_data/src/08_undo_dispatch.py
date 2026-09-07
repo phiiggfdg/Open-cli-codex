@@ -5,11 +5,11 @@ def _sync_file_state_after_restore(path: "Path", content: str | None) -> None:
         resolved = str(path.resolve())
         if content is None:
             _file_cache.pop(resolved, None)
-            _file_read_time.pop(resolved, None)
+            _forget_file_observation(path)
             _recent_writes.discard(resolved)
             return
         _cache_put(str(path), content, _active_session_id())
-        _file_read_time[resolved] = time.time()
+        _record_file_observation(path, content)
         _recent_writes.add(resolved)
     except Exception:
         pass
@@ -29,14 +29,20 @@ def _snapshot_path(path: str) -> "Path":
         raise ValueError(f"snapshot path is outside current project: {p}") from e
     return p
 
-def _snapshot_restore(path: "Path", value) -> None:
+def _snapshot_restore(path: "Path", value, mode=None) -> None:
     data = _snapshot_expected_bytes(value)
     if data is None:
         path.unlink(missing_ok=True)
         return
     path.parent.mkdir(parents=True, exist_ok=True)
+    if mode is None:
+        try:
+            mode = path.stat().st_mode & 0o7777
+        except OSError:
+            mode = 0o644
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
     try:
+        os.fchmod(fd, int(mode) & 0o7777)
         with os.fdopen(fd, "wb") as f:
             f.write(data)
             f.flush()
@@ -67,7 +73,7 @@ def do_undo():
                 return (f"[undo conflict] '{item['path']}' changed after this action. "
                         "Undo was not applied; review the current file first.")
         for item, p in zip(group, paths):
-            _snapshot_restore(p, item["before"])
+            _snapshot_restore(p, item["before"], item.get("before_mode"))
         if _project_dir_conn:
             try:
                 for item in group:
@@ -85,7 +91,13 @@ def do_undo():
             item["undone"] = 1; _redo_stack.append(item)
             restored = snapshot_decode(item["before"])
             try: _sync_file_state_after_restore(p, restored.decode("utf-8") if restored is not None else None)
-            except UnicodeDecodeError: _file_cache.pop(str(p), None)
+            except UnicodeDecodeError:
+                # Binary snapshots cannot populate the text cache; clear the
+                # old text observation as well so the next mutation must
+                # explicitly re-read the restored bytes.
+                _file_cache.pop(str(p), None)
+                _forget_file_observation(p)
+                _recent_writes.discard(str(p.resolve()))
         return (f"Undo: restored {snap['path']}" if snap["before"] is not None
                 else f"Undo: deleted {snap['path']}") + (f" (+{len(group)-1} related files)" if len(group)>1 else "")
     except Exception as e:
@@ -114,7 +126,8 @@ def do_redo():
             if current != _snapshot_expected_bytes(item["before"]):
                 return (f"[redo conflict] '{item['path']}' changed after undo. "
                         "Redo was not applied; review the current file first.")
-        for item, p in zip(group, paths): _snapshot_restore(p, item["after"])
+        for item, p in zip(group, paths):
+            _snapshot_restore(p, item["after"], item.get("after_mode"))
         if _project_dir_conn:
             try:
                 for item in group:
@@ -132,7 +145,10 @@ def do_redo():
             item["undone"] = 0; _undo_stack.append(item)
             applied = snapshot_decode(item["after"])
             try: _sync_file_state_after_restore(p, applied.decode("utf-8") if applied is not None else None)
-            except UnicodeDecodeError: _file_cache.pop(str(p), None)
+            except UnicodeDecodeError:
+                _file_cache.pop(str(p), None)
+                _forget_file_observation(p)
+                _recent_writes.discard(str(p.resolve()))
         return (f"Redo: applied {snap['path']}" if snap["after"] is not None
                 else f"Redo: deleted {snap['path']}") + (f" (+{len(group)-1} related files)" if len(group)>1 else "")
     except Exception as e:
@@ -172,17 +188,89 @@ def _patch_snippet(after: str, patch: str) -> str:
 _UNIFIED_HUNK_RE = re.compile(
     r"^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@(?:.*)$"
 )
+_BARE_HUNK_RE = re.compile(r"^@@(?:\s+.*)?$")
 
 
 def _prepare_patch_text(patch: str, requested_path: str) -> str:
-    """Accept plain unified diffs and the common ``*** Begin Patch`` wrapper."""
+    """Accept unified diffs and common ``*** Update File``/bare-@@ wrappers."""
     lines = patch.splitlines(keepends=True)
     if sum(1 for line in lines if line.startswith("diff --git ")) > 1:
         raise ValueError("patch contains changes for more than one file")
-    header_pairs = sum(
-        1 for i in range(len(lines) - 1)
-        if lines[i].startswith("--- ") and lines[i + 1].startswith("+++ ")
-    )
+    # Count file headers only outside hunk bodies. Removed content beginning
+    # with "-- " is encoded as "--- ", and an adjacent added "++ " line as
+    # "+++ "; a naive prefix count rejects that valid change as a second file.
+    def _looks_like_file_header_pair(index: int) -> bool:
+        if index + 1 >= len(lines):
+            return False
+        old_text = lines[index].rstrip("\r\n")[4:].split("\t", 1)[0].strip()
+        new_text = lines[index + 1].rstrip("\r\n")[4:].split("\t", 1)[0].strip()
+        if old_text.startswith("a/"):
+            old_text = old_text[2:]
+        if new_text.startswith("b/"):
+            new_text = new_text[2:]
+        old_text = old_text.lstrip("./")
+        new_text = new_text.lstrip("./")
+        if old_text != new_text:
+            return False
+        # Header paths normally identify the requested file.  An equal pair
+        # is still sufficient to reject a second file in a plain diff; when
+        # the pair appears inside a bare hunk the caller additionally requires
+        # that another hunk header follows, so a real content line is not
+        # mistaken for metadata.
+        return bool(old_text)
+
+    header_pairs = 0
+    old_left = new_left = 0
+    in_hunk = False
+    i = 0
+    while i < len(lines):
+        text = lines[i].rstrip("\r\n")
+        hm = _UNIFIED_HUNK_RE.match(text)
+        if hm:
+            old_left = int(hm.group(2) or 1)
+            new_left = int(hm.group(4) or 1)
+            in_hunk = True
+        elif not in_hunk and _BARE_HUNK_RE.match(text):
+            # The OpenAI/GitHub ``*** Update File`` dialect often uses a bare
+            # ``@@`` separator with no line numbers.  Its body is resolved by
+            # context in _apply_unified_hunks; keep the header-pair scanner in
+            # hunk mode so content such as ``--- old`` is not mistaken for a
+            # second file header.
+            old_left = new_left = None
+            in_hunk = True
+        elif in_hunk:
+            if (old_left is None and text.startswith("--- ")
+                    and _looks_like_file_header_pair(i)
+                    and (i + 2 >= len(lines)
+                         or _BARE_HUNK_RE.match(lines[i + 2].rstrip("\r\n")))):
+                # Bare hunks have no declared line counts, so this is the
+                # only point at which a following ---/+++ pair can be
+                # recognized as a second file rather than hunk content.
+                header_pairs += 1
+                in_hunk = False
+                old_left = new_left = 0
+                i += 1
+            elif text == r"\ No newline at end of file":
+                pass
+            elif old_left is None or new_left is None:
+                # Bare hunks end when the next hunk header is encountered;
+                # there is no declared count to decrement here.
+                pass
+            elif text.startswith(" "):
+                old_left -= 1; new_left -= 1
+            elif text.startswith("-"):
+                old_left -= 1
+            elif text.startswith("+"):
+                new_left -= 1
+            if (old_left is not None and new_left is not None
+                    and old_left <= 0 and new_left <= 0):
+                in_hunk = False
+        elif (text.startswith("--- ") and _looks_like_file_header_pair(i)
+              and (old_left is not None or i + 2 >= len(lines)
+                   or _BARE_HUNK_RE.match(lines[i + 2].rstrip("\r\n")))):
+            header_pairs += 1
+            i += 1
+        i += 1
     if header_pairs > 1:
         raise ValueError("patch contains more than one file-header pair")
     out = []
@@ -215,19 +303,21 @@ def _prepare_patch_text(patch: str, requested_path: str) -> str:
 
 
 def _parse_unified_hunks(patch: str) -> list[dict]:
-    """Parse standard unified hunks without trusting their line counts blindly."""
+    """Parse numbered or bare unified hunks without trusting counts blindly."""
     lines = patch.splitlines()
     hunks = []
     i = 0
     while i < len(lines):
         header = _UNIFIED_HUNK_RE.match(lines[i])
-        if not header:
+        bare_header = None if header else _BARE_HUNK_RE.match(lines[i])
+        if not header and not bare_header:
             i += 1
             continue
-        old_start = int(header.group(1))
-        new_start = int(header.group(3))
-        declared_old = int(header.group(2) or 1)
-        declared_new = int(header.group(4) or 1)
+        bare = header is None
+        old_start = int(header.group(1)) if header else 0
+        new_start = int(header.group(3)) if header else 0
+        declared_old = int(header.group(2) or 1) if header else None
+        declared_new = int(header.group(4) or 1) if header else None
         body = []
         new_no_newline = False
         i += 1
@@ -248,11 +338,19 @@ def _parse_unified_hunks(patch: str) -> list[dict]:
             raise ValueError(f"empty hunk at old line {old_start}")
         old_lines = [text for tag, text in body if tag != "+"]
         new_lines = [text for tag, text in body if tag != "-"]
+        if (not bare and
+                (len(old_lines) != declared_old or len(new_lines) != declared_new)):
+            raise ValueError(
+                f"hunk at old line {old_start} declares "
+                f"{declared_old}/{declared_new} lines but contains "
+                f"{len(old_lines)}/{len(new_lines)}"
+            )
         hunks.append({
             "old_start": old_start,
             "new_start": new_start,
             "declared_old": declared_old,
             "declared_new": declared_new,
+            "bare": bare,
             "old": old_lines,
             "new": new_lines,
             "new_no_newline": new_no_newline,
@@ -270,17 +368,23 @@ def _apply_unified_hunks(before: str, patch: str) -> str:
     original = before.splitlines()
     current = list(original)
     offset = 0
+    cursor = 0
     final_newline = original_had_newline
 
     for hunk_no, hunk in enumerate(hunks, 1):
         old = hunk["old"]
         new = hunk["new"]
-        expected = max(0, min(len(current), hunk["old_start"] - 1 + offset))
+        if hunk.get("bare"):
+            expected = max(0, min(len(current), cursor))
+        else:
+            expected = max(0, min(len(current), hunk["old_start"] - 1 + offset))
         if old:
             candidates = [
                 pos for pos in range(0, len(current) - len(old) + 1)
                 if current[pos:pos + len(old)] == old
             ]
+            if hunk.get("bare"):
+                candidates = [pos for pos in candidates if pos >= cursor]
             if not candidates:
                 raise ValueError(
                     f"hunk {hunk_no} context was not found; reload the file and regenerate that hunk"
@@ -297,11 +401,11 @@ def _apply_unified_hunks(before: str, patch: str) -> str:
             # old line is the only safe anchor, adjusted for earlier hunks.
             pos = expected
 
-        touched_original_eof = (
-            hunk["old_start"] - 1 + len(old) >= len(original)
-        )
+        current_len_before = len(current)
+        touched_original_eof = pos + len(old) >= current_len_before
         current[pos:pos + len(old)] = new
         offset += len(new) - len(old)
+        cursor = pos + len(new)
         if touched_original_eof:
             final_newline = not hunk["new_no_newline"]
 
@@ -347,25 +451,23 @@ def tool_apply_patch(path, patch, conn=None, sid=None):
         return _COMPACTION_MARKER_ERROR
     if len(patch.encode("utf-8", errors="replace")) > 10 * 1024 * 1024:
         return "[error: patch exceeds 10 MiB]"
-    p = _resolve_to_sandbox(path)
+    try:
+        p = _resolve_to_sandbox(path, allow_redirect=False)
+    except ValueError as e:
+        return f"[sandbox] {e}"
     if not p.exists(): return f"[not found: {p}]"
     try:
         if p.stat().st_size > 50 * 1024 * 1024:
             return "[policy] File quá lớn cho apply_patch (>50 MiB); chia nhỏ thao tác trước."
-        # FileTime safety: cùng cơ chế đã có ở tool_edit — chặn patch ghi đè
-        # lên file đã bị sửa từ ngoài (process khác, user tự sửa tay, git
-        # checkout...) mà agent chưa đọc lại. Trước đây tool_apply_patch
-        # thiếu hẳn check này dù cùng mức rủi ro ghi-đè-file với tool_edit.
         resolved = str(p.resolve())
-        last_read = _file_read_time.get(resolved, 0)
-        mtime = p.stat().st_mtime
-        if mtime > last_read + 1:
-            return (f"[error] File '{path}' has been modified since it was last read "
-                    f"(mtime={mtime:.0f}, last_read={last_read:.0f}). "
-                    f"Use the read tool to reload it before applying the patch.")
-
+        before_mode = p.stat().st_mode & 0o7777
         with open(p, "r", encoding="utf-8", newline="") as f:
             before = f.read()
+        # Compare the exact observed content, not wall-clock timestamps. This
+        # remains correct on FAT/network filesystems and under clock skew.
+        if not _file_matches_observation(p, before):
+            return (f"[error] File '{path}' differs from the version last read. "
+                    "Use the read tool to reload it before applying the patch.")
         prepared_patch = _prepare_patch_text(patch, path)
 
         # GNU/BSD patch remains the most compatible implementation, but it
@@ -385,15 +487,20 @@ def tool_apply_patch(path, patch, conn=None, sid=None):
                     f"change — likely an empty hunk or a patch that was already "
                     f"applied. No changes were made to {path}.]")
         _atomic_write_text(p, after)
-        _file_read_time[str(p.resolve())] = time.time()
+        _record_file_observation(p, after)
         _cache_put(str(p), after, _active_session_id())
+        _recent_writes.add(str(p.resolve()))
         if conn and sid:
             try:
                 _undo_stack.append(snapshot_save(
-                    conn, sid, str(p.resolve()), before, after))
+                    conn, sid, str(p.resolve()), before, after,
+                    before_mode=before_mode,
+                    after_mode=p.stat().st_mode & 0o7777))
             except Exception as e:
-                _snapshot_restore(p, before)
+                _snapshot_restore(p, before, before_mode)
                 _cache_put(str(p), before, _active_session_id())
+                _record_file_observation(p, before)
+                _recent_writes.discard(str(p.resolve()))
                 return f"[error] snapshot failed; patch rolled back: {e}"
             _redo_stack.clear()
         return f"Patch applied to {path}\n" + _patch_snippet(after, patch)
@@ -1356,7 +1463,7 @@ def _run_subagent_loop(sub_messages, sub_sys, allowed, model, api_key, conn, sid
                                       "content": _head_tail(str(out_model), TOOL_OUTPUT_MAX_CHARS,
                                                             label=f"{log_prefix}:{name}")})
                 if (_tool_may_mutate_state(name, args)
-                        and not _tool_was_definitely_blocked(str(out_model))):
+                        and not _tool_was_definitely_blocked(name, str(out_model))):
                     _sub_epoch += 1
         else:
             break
@@ -1564,17 +1671,46 @@ _SENSITIVE_PATH_RE = re.compile(
     r"private[_-]?keys?|auth|production|prod)(?:[._-][^/\\]*)?)(?:$|[/\\])|"
     r"(?:^|[/\\])(?:\.github/workflows|\.gitlab-ci|migrations?|deploy|production)(?:[/\\]|$)", re.I)
 
+def _path_targets_sensitive(value) -> bool:
+    """Check both the user spelling and canonical targets, including symlinks."""
+    raw = str(value or "")
+    candidates = {raw}
+    try:
+        root = _workspace_root().resolve()
+        p = Path(raw).expanduser()
+        if p.is_absolute():
+            candidates.add(str(p.resolve()))
+        else:
+            if p.parts and p.parts[0] == root.name:
+                p = Path(*p.parts[1:]) if len(p.parts) > 1 else Path(".")
+            candidates.add(str((root / p).resolve()))
+            candidates.add(str((Path.cwd().resolve() / p).resolve()))
+    except Exception:
+        pass
+    for candidate in candidates:
+        if _SENSITIVE_PATH_RE.search(candidate):
+            return True
+        try:
+            if _path_is_cli_internal(Path(candidate)):
+                return True
+        except Exception:
+            pass
+    return False
+
 def _tool_targets_sensitive(name, args) -> bool:
     if name.startswith("mcp__"):
         return True
     if name == "bash":
         command = str((args or {}).get("command", "")).lower()
-        return any(x in command for x in ("pip install", "npm install", "pnpm add", "yarn add",
-                                          "git checkout", "git restore", "git rebase",
-                                          "git branch -d", "git stash drop", "serve:"))
+        return bool(re.search(
+            r"(?:\b(?:pip|pip3)\s+(?:install|uninstall)|"
+            r"\b(?:npm|pnpm|yarn)\s+(?:install|uninstall|update|add|remove|link)|"
+            r"\b(?:git)\s+(?:checkout|restore|rebase|commit|merge|revert|"
+            r"cherry-pick|stash|branch|tag|fetch|pull|push)|"
+            r"\bmake\s+install\b|\bserve\s*:)", command, re.IGNORECASE
+        ))
     for key in ("path", "src", "dst"):
-        value = str((args or {}).get(key, ""))
-        if _SENSITIVE_PATH_RE.search(value):
+        if _path_targets_sensitive((args or {}).get(key, "")):
             return True
     return False
 
@@ -1588,7 +1724,11 @@ def _check_permission(name, args, agent=None):
     # Plan mode is a hard read-only floor: custom /perm rules cannot weaken it.
     if ag == AGENT_PLAN:
         perms.update(PLAN_PERMS)
-        if name.startswith("mcp__") and _mcp_name_may_mutate(name):
+        # MCP tools are dynamic and their names are untrusted.  A verb such
+        # as ``save`` or ``insert`` can be missed by any heuristic, so Plan
+        # denies every remote tool unless its published schema explicitly
+        # carries the MCP readOnlyHint annotation.
+        if name.startswith("mcp__") and not mcp_tool_explicitly_readonly(name):
             perms[name] = PERM_DENY
     # Exact match first, then wildcard (e.g. "mymcp_*": "ask")
     level = perms.get(name)

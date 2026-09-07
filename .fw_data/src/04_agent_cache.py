@@ -31,8 +31,8 @@ DEFAULT_PERMS = {
     "view_symbol": PERM_ALLOW,
     "file_index":  PERM_ALLOW,
     "verify":      PERM_ALLOW,
-    # External MCP tools are untrusted and may have side effects. A specific
-    # /perm rule can still allow a trusted server/tool explicitly.
+    # External MCP tools are untrusted and may have side effects. They remain
+    # confirmation-gated even when a broad local permission is configured.
     "mcp__*":      PERM_ASK,
 }
 
@@ -358,13 +358,34 @@ def _cache_log(op: str, path: str, extra: str = ""):
     print(f"  {color}[cache {op}]{R} {DIM}{rel}{R}{extra_str}")
 
 def _content_hash(content: str) -> str:
-    """
-    Hash content để detect thay đổi chính xác hơn mtime.
-    File nhỏ (< 50KB): hash full. File lớn: sample first+last 4KB.
-    """
+    """Hash the complete text so middle-of-file edits cannot evade cache checks."""
     import hashlib
-    sample = content[:4096] + content[-4096:] if len(content) > 50_000 else content
-    return hashlib.md5(sample.encode(errors="replace")).hexdigest()[:12]
+    return hashlib.blake2b(
+        content.encode("utf-8", errors="replace"), digest_size=16
+    ).hexdigest()
+
+
+def _record_file_observation(path, content: str) -> None:
+    """Remember the exact text version the agent most recently observed."""
+    p = Path(path).expanduser().resolve()
+    key = str(p)
+    try:
+        _file_read_time[key] = p.stat().st_mtime
+    except OSError:
+        _file_read_time[key] = time.time()
+    _file_read_hash[key] = _content_hash(content)
+
+
+def _forget_file_observation(path) -> None:
+    key = str(Path(path).expanduser().resolve())
+    _file_read_time.pop(key, None)
+    _file_read_hash.pop(key, None)
+
+
+def _file_matches_observation(path, content: str) -> bool:
+    key = str(Path(path).expanduser().resolve())
+    expected = _file_read_hash.get(key)
+    return expected is not None and expected == _content_hash(content)
 
 def _cache_put(path: str, content: str, sid: str = ""):
     """Lưu file vào cache sau khi đọc hoặc ghi. Cập nhật access time cho LRU."""
@@ -411,8 +432,9 @@ def _cache_invalidate(path: str):
     trong ngưỡng "chưa đổi" nên hash check bị bỏ qua hoàn toàn, và tool_read
     sau đó im lặng trả về NỘI DUNG CŨ từ cache dù disk đã khác. Test tái hiện
     được cả khi KHÔNG ép mtime giả tạo, chỉ cần ghi đè file cùng giây.
-    Fix: bỏ fast-path, luôn hash-check. Chi phí chấp nhận được vì _content_hash
-    đã tự sample 4KB đầu+cuối cho file >50KB, không đọc toàn bộ file lớn.
+    Fix: bỏ fast-path, luôn hash-check. Chi phí chấp nhận được vì các file
+    đọc được qua cache đều đã bị giới hạn kích thước; hash toàn bộ nội dung
+    đảm bảo thay đổi ở giữa file không thể lọt qua.
 
     BUG FIX #2 (index.json không đồng bộ với _file_cache khi external edit):
     trước đây hàm này chỉ pop _file_cache, không đụng gì tới index.json (đọc
@@ -466,6 +488,11 @@ def _cache_invalidate(path: str):
 
     except Exception as e:
         _cache_log("?", key, f"check error: {e}")
+        # Validation errors must fail closed. Keeping an entry here lets
+        # tool_read's read-after-write fast path return content that could not
+        # be verified against disk at all.
+        _file_cache.pop(key, None)
+        _index_drop_stale_entry(key)
 
 def _index_drop_stale_entry(abs_path_key: str):
     """Xoá 1 entry khỏi index.json theo abs path (best-effort, không raise).
@@ -588,7 +615,20 @@ def _resolve_read_path(path: str | Path) -> Path:
     return (proj / p_orig).resolve()
 
 
-def _resolve_to_sandbox(path: str) -> Path:
+def _path_is_cli_internal(path: Path) -> bool:
+    """True for the loader and private runtime tree hidden from file tools."""
+    p = path.expanduser().resolve()
+    cwd = Path.cwd().resolve()
+    if p == cwd / "fw.py":
+        return True
+    try:
+        p.relative_to(cwd / FW_DATA_NAME)
+        return True
+    except ValueError:
+        return False
+
+
+def _resolve_to_sandbox(path: str, allow_redirect: bool = True) -> Path:
     """
     Tự động redirect path vào project_dir (tạo nếu chưa có).
     - Nếu path đã nằm trong project_dir → giữ nguyên.
@@ -597,41 +637,41 @@ def _resolve_to_sandbox(path: str) -> Path:
       giữ lại cấu trúc thư mục con tương đối nếu có.
     Dùng chung cho write / edit / multiedit / apply_patch / delete / extract dst.
     """
-    proj = _ensure_project_dir(path)
+    proj = _ensure_project_dir(path).resolve()
     p_orig = Path(path).expanduser()
 
-    # Đã nằm trong project_dir rồi → không đổi
-    try:
-        resolved = p_orig.resolve()
-        resolved.relative_to(proj.resolve())
-        return resolved
-    except ValueError:
-        pass
-
-    # Nếu path bắt đầu bằng tên của proj (vd '9aa25482/01_ui.py') → strip để tránh double nesting
-    if not p_orig.is_absolute():
+    if p_orig.is_absolute():
+        candidate = p_orig.resolve()
+    else:
         parts = p_orig.parts
         if parts and parts[0] == proj.name:
-            stripped = Path(*parts[1:]) if len(parts) > 1 else Path(".")
-            candidate = (proj / stripped).resolve()
-            candidate.relative_to(proj.resolve())
-            return candidate
-
-    # Nằm trong cwd nhưng ngoài project_dir → giữ relative path từ cwd
+            p_orig = Path(*parts[1:]) if len(parts) > 1 else Path(".")
+        candidate = (proj / p_orig).resolve()
+    # Never turn an explicit request for the loader/private runtime tree into
+    # a harmless-looking redirected project path.  That makes the result
+    # misleading and leaves a second copy of an internal file in the sandbox;
+    # callers should receive a clear protection error instead.
+    if _path_is_cli_internal(candidate):
+        raise ValueError(f"protected CLI internal path: {path}")
     try:
-        rel = p_orig.resolve().relative_to(Path.cwd().resolve())
-        if rel.parts and rel.parts[0] == proj.name:
-            rel = Path(*rel.parts[1:]) if len(rel.parts) > 1 else Path(".")
-    except ValueError:
-        # Absolute hoàn toàn ngoài cwd → chỉ lấy phần tên file/subpath
-        rel = Path(*p_orig.parts[1:]) if p_orig.is_absolute() else Path(p_orig.name)
-
-    candidate = (proj / rel).resolve()
-    try:
-        candidate.relative_to(proj.resolve())
+        candidate.relative_to(proj)
     except ValueError as e:
-        # A parent component may be a symlink escaping the workspace.
-        raise ValueError(f"sandbox path escapes project via symlink: {path}") from e
+        if not allow_redirect:
+            raise ValueError(f"sandbox path is outside project: {path}") from e
+        # Preserve create-destination compatibility: write/extract may redirect
+        # an outside request into the project, but existing-file mutations pass
+        # allow_redirect=False and are always rejected instead.
+        if p_orig.is_absolute():
+            rel = Path(*p_orig.parts[1:])
+        else:
+            rel = Path(p_orig.name)
+        candidate = (proj / rel).resolve()
+        try:
+            candidate.relative_to(proj)
+        except ValueError as nested_error:
+            raise ValueError(f"sandbox path escapes project via symlink: {path}") from nested_error
+    if _path_is_cli_internal(candidate):
+        raise ValueError(f"protected CLI internal path: {path}")
     return candidate
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -681,7 +721,9 @@ def db_connect():
             after       TEXT,
             created_at  INTEGER NOT NULL,
             undone      INTEGER NOT NULL DEFAULT 0,
-            group_id    TEXT
+            group_id    TEXT,
+            before_mode INTEGER,
+            after_mode  INTEGER
         );
         CREATE TABLE IF NOT EXISTS checkpoint (
             id          TEXT PRIMARY KEY,
@@ -731,16 +773,26 @@ def db_connect():
                 after       TEXT,
                 created_at  INTEGER NOT NULL,
                 undone      INTEGER NOT NULL DEFAULT 0,
-                group_id    TEXT
+                group_id    TEXT,
+                before_mode INTEGER,
+                after_mode  INTEGER
             );
             INSERT INTO file_snapshot_new
-                (id, session_id, path, before, after, created_at, undone, group_id)
-                SELECT id, session_id, path, before, after, created_at, undone, group_id
+                (id, session_id, path, before, after, created_at, undone, group_id,
+                 before_mode, after_mode)
+                SELECT id, session_id, path, before, after, created_at, undone, group_id,
+                       NULL, NULL
                 FROM file_snapshot;
             DROP TABLE file_snapshot;
             ALTER TABLE file_snapshot_new RENAME TO file_snapshot;
         """)
         conn.commit()
+    snapshot_cols = [r[1] for r in conn.execute(
+        "PRAGMA table_info(file_snapshot)").fetchall()]
+    if "before_mode" not in snapshot_cols:
+        conn.execute("ALTER TABLE file_snapshot ADD COLUMN before_mode INTEGER")
+    if "after_mode" not in snapshot_cols:
+        conn.execute("ALTER TABLE file_snapshot ADD COLUMN after_mode INTEGER")
     conn.commit()
     return conn
 

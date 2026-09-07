@@ -41,22 +41,26 @@ def snapshot_decode(value):
             raise ValueError("corrupt binary snapshot payload")
     return value.encode("utf-8")
 
-def snapshot_save(conn, sid, path, before, after, group_id=None):
+def snapshot_save(conn, sid, path, before, after, group_id=None,
+                  before_mode=None, after_mode=None):
     # A new edit after undo creates a new history branch; stale redo entries
     # must not become available again after a restart.
     snap = {
         "id": str(uuid.uuid4()), "session_id": sid, "path": path,
         "before": before, "after": after, "created_at": int(time.time()),
         "undone": 0, "group_id": group_id,
+        "before_mode": before_mode, "after_mode": after_mode,
     }
     try:
         conn.execute("DELETE FROM file_snapshot WHERE session_id=? AND undone=1", (sid,))
         conn.execute("""INSERT INTO file_snapshot
-                        (id,session_id,path,before,after,created_at,undone,group_id)
-                        VALUES (?,?,?,?,?,?,?,?)""",
+                        (id,session_id,path,before,after,created_at,undone,group_id,
+                         before_mode,after_mode)
+                        VALUES (?,?,?,?,?,?,?,?,?,?)""",
                      tuple(snap[k] for k in (
                          "id", "session_id", "path", "before", "after",
-                         "created_at", "undone", "group_id")))
+                         "created_at", "undone", "group_id",
+                         "before_mode", "after_mode")))
         conn.commit()
     except Exception:
         # Never leave a failed snapshot transaction open: a later unrelated
@@ -320,9 +324,9 @@ TOOLS = [
     "description":"Read file with line numbers or list directory as tree. Output includes an auto-generated Anchor map (functions/classes/CSS rules/headings near your offset) — check it first before grepping again. Prefer a small offset+limit over whole-file reads on large files; see system prompt Discovery policy for the full search order.",
     "parameters":{"type":"object","properties":{
       "path":  {"type":"string"},
-      "offset":{"type":"integer","description":"Start line 1-indexed (files only)"},
-      "limit": {"type":"integer","description":"Max lines to read. Always pass explicitly. Hard cap 700 — values above are rejected outright; use grep/view_symbol to narrow down instead of raising this."},
-      "depth": {"type":"integer","description":"Max tree depth for directories (default 4)"}
+      "offset":{"type":"integer","minimum":1,"description":"Start line 1-indexed (files only)"},
+      "limit": {"type":"integer","minimum":1,"maximum":700,"description":"Max lines to read. Always pass explicitly. Hard cap 700 — use grep/view_symbol to narrow down instead of raising this."},
+      "depth": {"type":"integer","minimum":0,"maximum":20,"description":"Max tree depth for directories (default 4)"}
     },"required":["path"]}
   }},
   {"type":"function","function":{
@@ -378,7 +382,7 @@ TOOLS = [
     "description":"Atomic patching for a substantial or structural change in one existing file. Prefer edit for one exact replacement and multiedit for 2-5 independent exact replacements. Supports multiple unified-diff hunks and the common *** Begin Patch / *** Update File wrapper; every hunk must target the same path. On any failure the file remains unchanged.",
     "parameters":{"type":"object","properties":{
       "path": {"type":"string","description":"File to patch"},
-      "patch":{"type":"string","description":"Unified diff with @@ hunks. Include 2-3 unchanged context lines around each change when possible. File headers (---/+++) or a single *** Begin Patch wrapper are optional."}
+      "patch":{"type":"string","description":"Unified diff with numbered @@ hunks, or the common bare-@@ form inside a single *** Begin Patch / *** Update File wrapper. Include 2-3 unchanged context lines around each change when possible. File headers (---/+++) are optional."}
     },"required":["path","patch"]}
   }},
   {"type":"function","function":{

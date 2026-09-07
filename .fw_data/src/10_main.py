@@ -965,6 +965,7 @@ def main():
             # cờ "_BASH_CONFIRMED" cần reset theo session nữa.)
             _bash_allow_all = False
             _file_read_time.clear()
+            _file_read_hash.clear()
             # Giữ web_bridge cũ (nếu web đang mở/armed) sang state mới, để
             # kết nối WS hiện có không bị "mồ côi" khi đổi session -- chỉ
             # đổi nội dung phiên (sid/model/messages...), không đổi ai đang

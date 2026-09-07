@@ -38,8 +38,14 @@ def _explain_tool_action(name: str, args: dict) -> str:
         if name == "write":
             p    = args.get("path", "?")
             size = len(args.get("content", ""))
-            existing = Path(p).exists()
-            action = "Overwrite" if existing else "Create new file"
+            try:
+                existing = _resolve_read_path(p).exists()
+            except Exception:
+                existing = False
+            if existing:
+                return (f"{YELLOW}Cannot create — file already exists:{R} "
+                        f"{BOLD}{p}{R}  {DIM}Use edit/multiedit/apply_patch instead{R}")
+            action = "Create new file"
             return f"{YELLOW}{action}:{R} {BOLD}{p}{R}  {DIM}({size:,} chars){R}"
 
         if name == "extract":
@@ -488,7 +494,7 @@ def tool_view_symbol(path, symbol):
     out += f"\n\nNOTE: Line numbers are display-only. For edit old_str, use ONLY the text after the tab."
 
     # Track read time
-    _file_read_time[str(p.resolve())] = time.time()
+    _record_file_observation(p, raw_content)
     # Cache full file content khi view_symbol (đã đọc toàn bộ lines rồi)
     if len(raw_content.encode("utf-8", errors="replace")) <= 2 * 1024 * 1024:
         _cache_put(str(p), raw_content, _active_session_id())
@@ -917,8 +923,10 @@ _todos_sid: str = ""
 _todos_conn = None
 _todowrite_calls_this_turn: int = 0  # hard limit: reset mỗi agent_turn
 
-# FileTime tracking: {resolved_path: timestamp} — ensures AI reads before editing
+# File observation tracking. The content hash is authoritative; timestamp is
+# retained for diagnostics/backward compatibility only.
 _file_read_time: dict = {}
+_file_read_hash: dict = {}
 _recent_writes: set = set()  # block read-after-write waste; reset mỗi agent_turn
 
 

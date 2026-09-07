@@ -3096,7 +3096,9 @@ _LOCAL_MUTATING_TOOLS = {
 # with identical arguments. Hard-blocking them creates false positives and the
 # warning often costs more tokens than their short result.
 _DEDUP_EXEMPT_TOOLS = {
-    "question", "verify", "webfetch", "websearch", "task", "todowrite", "file_index",
+    # Reads are cheap and content-version validated by tool_read; suppressing
+    # an identical read before that validation could hide an external edit.
+    "read", "question", "verify", "webfetch", "websearch", "task", "todowrite", "file_index",
 }
 
 # MCP schemas are dynamic. Only names that clearly describe a side effect keep
@@ -3107,7 +3109,9 @@ _MCP_MUTATION_HINT_RE = re.compile(
     r"rename|send|post|publish|upload|finalize|restore|execute|run|start|stop|"
     r"manage|mutate|archive|close|merge|approve|assign|invite|upsert|set|trigger|"
     r"deploy|commit|submit|cancel|enable|disable|link|unlink|comment|reply|react|"
-    r"like|follow|unfollow|schedule|unschedule|transfer|grant|revoke)(?:_|$)",
+    r"like|follow|unfollow|schedule|unschedule|transfer|grant|revoke|save|insert|"
+    r"append|prepend|put|copy|duplicate|clone|fork|import|attach|detach|lock|"
+    r"unlock|share|mark|sync|resync|reset|clear|seed|hydrate)(?:_|$)",
     re.IGNORECASE,
 )
 
@@ -3218,16 +3222,26 @@ def _normalize_runtime_tool_calls(raw_tcs):
     return clean, warnings
 
 
-def _tool_was_definitely_blocked(result: str) -> bool:
+def _tool_was_definitely_blocked(name: str, result: str | None = None) -> bool:
     """True only when execution certainly never reached a mutation.
 
     Ordinary tool errors remain conservative because a script, MCP call or
     multi-file operation can fail after a partial side effect.
     """
+    # Keep the old one-argument helper shape usable for callers/tests that
+    # only need the conservative generic classification.
+    if result is None:
+        result, name = name, ""
     text = (result or "").lstrip().lower()
+    if name in {"apply_patch", "edit", "multiedit"}:
+        # These handlers read, validate, and commit exactly once; all error
+        # paths roll back before returning. Treating every structured error as
+        # definitely blocked keeps mutation_epoch/dedup state truthful.
+        if text.startswith(("[error", "[not found", "[policy", "[sandbox", "[permission", "[unknown tool")):
+            return True
     return text.startswith((
         "[permission denied", "[unknown tool", "[tool_error: missing required arg",
-        "[task denied", "[policy]",
+        "[task denied", "[policy]", "[sandbox]", "[not found",
         # BUG FIX: guard marker chống copy-paste history-compaction
         # placeholder (06_tools_fs.py, _COMPACTION_MARKER_ERROR) return NGAY
         # dòng đầu tool_write/tool_edit/tool_apply_patch, TRƯỚC bất kỳ ghi
@@ -3252,7 +3266,7 @@ def _tool_failure_signature(result: str) -> str | None:
     low = text.lower()
     if not low.startswith((
         "[error", "[permission denied", "[unknown tool", "[tool_error:",
-        "[task denied", "[policy]",
+        "[task denied", "[policy]", "[sandbox]", "[not found",
     )):
         return None
     # Dedup is a framework shortcut, not the original tool failure. It already
@@ -3728,7 +3742,7 @@ def _agent_turn_inner(messages, model, api_key, conn, sid, max_steps, agent, sta
             _epoch_before_tool = _mutation_epoch
             out_model, out_history = run_tool(name, args, model, api_key, conn, sid, state=state)
             _sequential_taken = True
-            _definitely_blocked = _tool_was_definitely_blocked(out_model)
+            _definitely_blocked = _tool_was_definitely_blocked(name, out_model)
             if _may_mutate_state and not _definitely_blocked:
                 _mutation_epoch += 1
             if _may_mutate_local and not _definitely_blocked:

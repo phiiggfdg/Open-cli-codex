@@ -13,6 +13,11 @@ _MCP_LAST_ERROR: dict = {}     # {server_name: "HTTP 403: error code: 1010..."}
 _MCP_SESSION_IDS: dict = {}
 _MCP_INITIALIZED: set = set()
 _MCP_TOOL_ROUTE: dict = {}
+# Only an MCP server's explicit ``annotations.readOnlyHint=true`` is trusted
+# to classify a dynamic tool as safe in Plan mode.  Names/description
+# heuristics remain useful for duplicate-call suppression, but cannot grant
+# permission to an unknown remote operation.
+_MCP_READONLY_TOOLS: set[str] = set()
 _MCP_REQUEST_ID = 0
 _MCP_MAX_RESPONSE = 8 * 1024 * 1024
 _MCP_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -70,8 +75,16 @@ def mcp_add_server(name: str, url: str, headers: dict | None = None, transport: 
     mcp_servers_save(servers)
     _MCP_TOOL_CACHE.pop(name, None)
     _MCP_STATUS.pop(name, None)
+    _MCP_LAST_ERROR.pop(name, None)
     _MCP_SESSION_IDS.pop(name, None)
     _MCP_INITIALIZED.discard(name)
+    # A replaced server may expose a different tool set/annotation.  Do not
+    # leave old routes (or an old read-only classification) usable until the
+    # next refresh; stale metadata could route a call to the wrong operation.
+    for route_name, route in list(_MCP_TOOL_ROUTE.items()):
+        if isinstance(route, tuple) and route and route[0] == name:
+            _MCP_TOOL_ROUTE.pop(route_name, None)
+            _MCP_READONLY_TOOLS.discard(route_name)
 
 def mcp_remove_server(name: str):
     servers = mcp_servers_load()
@@ -88,6 +101,11 @@ def mcp_remove_server(name: str):
     for route_name, route in list(_MCP_TOOL_ROUTE.items()):
         if isinstance(route, tuple) and route and route[0] == name:
             _MCP_TOOL_ROUTE.pop(route_name, None)
+            _MCP_READONLY_TOOLS.discard(route_name)
+
+def mcp_tool_explicitly_readonly(name: str) -> bool:
+    """Return whether a published MCP schema explicitly declares read-only."""
+    return isinstance(name, str) and name in _MCP_READONLY_TOOLS
 
 def _mcp_read_limited(resp, limit=_MCP_MAX_RESPONSE) -> bytes:
     chunks, total = [], 0
@@ -269,6 +287,7 @@ def mcp_tools_as_openai_format() -> list:
     (OpenAI format) với tên mcp__<server>__<tool>, để merge vào api_tools."""
     out = []
     _MCP_TOOL_ROUTE.clear()
+    _MCP_READONLY_TOOLS.clear()
     servers = mcp_servers_load()
     if not isinstance(servers, dict):
         return out
@@ -306,6 +325,11 @@ def mcp_tools_as_openai_format() -> list:
             except Exception:
                 schema = {"type": "object", "properties": {}}
             _MCP_TOOL_ROUTE[full_name] = (name, tool_name)
+            annotations = t.get("annotations")
+            if isinstance(annotations, dict) and (
+                    annotations.get("readOnlyHint") is True
+                    or annotations.get("read_only") is True):
+                _MCP_READONLY_TOOLS.add(full_name)
             out.append({
                 "type": "function",
                 "function": {

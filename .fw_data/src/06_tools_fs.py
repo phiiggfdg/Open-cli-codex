@@ -19,6 +19,7 @@ _BASH_DENY_PATTERNS = [
     r"\brm\s+-rf\s+\$HOME", # rm -rf $HOME
     r"\bchmod\s+[0-7]*\s+/",
     r"\bchown\b.*\s+/",
+    r"^\s*sed(?:\s|$)",     # file mutation must use edit/multiedit/apply_patch
 ]
 _BASH_DENY_RE = re.compile("|".join(_BASH_DENY_PATTERNS))
 
@@ -797,7 +798,14 @@ def _read_output_cap(limit: int) -> int:
     thường) và trần (không vượt READ_OUTPUT_MAX_CHARS dù limit=700 trên file
     toàn dòng cực dài, ví dụ minified/generated code).
     """
-    est = int(limit) * READ_CHARS_PER_LINE_EST
+    try:
+        if isinstance(limit, bool):
+            raise ValueError
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = READ_DEFAULT_LIMIT
+    limit = max(1, min(limit, READ_LIMIT_MAX))
+    est = limit * READ_CHARS_PER_LINE_EST
     return max(READ_OUTPUT_MIN_CHARS, min(est, READ_OUTPUT_MAX_CHARS))
 
 def _head_tail(text: str, max_chars: int, label="tool output") -> str:
@@ -826,7 +834,7 @@ def _history_tool_call_key(name: str, args: dict) -> tuple | None:
             normalized.setdefault("limit", READ_DEFAULT_LIMIT)
             normalized.setdefault("depth", 4)
         elif name == "glob":
-            normalized["cwd"] = normalized.get("cwd") or ""
+            normalized["cwd"] = normalized.get("cwd") or "."
         elif name == "grep":
             defaults = {
                 "path": None, "glob": None, "ignore_case": False,
@@ -847,6 +855,18 @@ def _history_tool_call_key(name: str, args: dict) -> tuple | None:
                 "target_files": sorted(normalized.get("target_files") or []),
                 "target_location": normalized.get("target_location") or "",
             }
+        # History keys must identify the actual file, not the spelling used by
+        # the model.  ``foo.py`` and ``./foo.py`` (or a project-name prefix)
+        # therefore share evidence, while invalid paths simply fall back to
+        # no history key instead of making an unsafe guess.
+        if name in {"read", "grep", "view_symbol"}:
+            raw_path = normalized.get("path")
+            if name == "grep" and not raw_path:
+                raw_path = "."
+            if raw_path:
+                normalized["path"] = str(_resolve_read_path(raw_path))
+        elif name == "glob" and normalized.get("cwd"):
+            normalized["cwd"] = str(_resolve_read_path(normalized["cwd"]))
         canonical = json.dumps(normalized, sort_keys=True, separators=(",", ":"),
                                ensure_ascii=False)
     except (TypeError, ValueError):
@@ -937,7 +957,21 @@ def _prune_tool_results(messages: list, keep_full_turns: int | None = None) -> l
                     tc_id_to_key[tc.get("id", "")] = key
 
     # Duyệt ngược: exact call mới nhất giữ đầy đủ, bản exact cũ hơn → stub.
-    seen_file_tool: set[tuple] = set()
+    # A canonical query alone is not enough for a read: the same call can
+    # legitimately return a new file version after an external edit. Keep a
+    # small set of result markers per key so only byte-identical evidence is
+    # collapsed.
+    def _result_marker(message: dict, key: tuple):
+        content = str(message.get("content", ""))
+        if key and key[0] == "read":
+            version_match = re.search(
+                r"(?:^|\n)Version:\s*([0-9a-f]{32})\b", content, re.IGNORECASE
+            )
+            if version_match:
+                return ("version", version_match.group(1).lower())
+        return ("content", _content_hash(content))
+
+    seen_file_tool: dict[tuple, set[tuple]] = {}
     dedup_stub: set[int] = set()
     for idx in range(len(messages) - 1, -1, -1):
         m = messages[idx]
@@ -947,10 +981,12 @@ def _prune_tool_results(messages: list, keep_full_turns: int | None = None) -> l
         key = tc_id_to_key.get(tc_id)
         if key is None:
             continue
-        if key in seen_file_tool:
+        marker = _result_marker(m, key)
+        markers = seen_file_tool.setdefault(key, set())
+        if marker in markers:
             dedup_stub.add(idx)
         else:
-            seen_file_tool.add(key)
+            markers.add(marker)
 
     # ── Bước 3: dedup range chồng lấn cho `read` cùng path ────────────────────
     # Bước 2 chỉ bắt exact-match tham số. Nhưng thực tế AI thường đọc cùng
@@ -962,7 +998,7 @@ def _prune_tool_results(messages: list, keep_full_turns: int | None = None) -> l
     # (cũ hơn) trên CÙNG path, bản cũ chỉ còn là tập con thông tin của bản
     # mới → stub bản cũ. Range lệch nhau (không bao trọn) vẫn giữ nguyên cả
     # hai, vì có thể là 2 đoạn thật sự khác nhau của file.
-    read_ranges: list[tuple[int, str, int, int]] = []  # (idx, path, start, end)
+    read_ranges: list[tuple[int, str, int, int, str]] = []  # (idx,path,start,end,version)
     for m_idx, m in enumerate(messages):
         if m.get("role") != "tool":
             continue
@@ -976,27 +1012,36 @@ def _prune_tool_results(messages: list, keep_full_turns: int | None = None) -> l
         path = normalized.get("path")
         if path is None:
             continue
-        # Chỉ áp dụng range-overlap cho FILE read (offset/limit có ý nghĩa
-        # thật). Không cách nào phân biệt file/dir chỉ từ args đã lưu, nhưng
-        # vô hại: 2 lần đọc cùng 1 "path" là thư mục sẽ luôn có cùng
-        # start=1 (offset mặc định), nên range luôn giống hệt nhau — rơi
-        # đúng vào trường hợp bao trọn hợp lệ (bản sau thay thế bản trước),
-        # không có rủi ro stub nhầm sang path khác vì đã lọc theo path ở trên.
-        offset = int(normalized.get("offset", 1))
-        limit  = int(normalized.get("limit", READ_DEFAULT_LIMIT))
-        start, end = offset, offset + limit
-        read_ranges.append((m_idx, path, start, end))
+        # Use the *delivered* line range and content version, not the
+        # requested limit.  `read` may soft-truncate a whole-file request to
+        # 80 lines, and a later version of the same path must never erase
+        # evidence from the earlier version.
+        content = str(m.get("content", ""))
+        line_match = re.search(
+            r"(?:^|\n)Lines\s+(\d+)-(\d+)\s+of\s+\d+", content
+        )
+        version_match = re.search(
+            r"(?:^|\n)Version:\s*([0-9a-f]{32})\b", content, re.IGNORECASE
+        )
+        if not line_match or not version_match:
+            continue
+        start = int(line_match.group(1))
+        end = int(line_match.group(2)) + 1  # inclusive output → half-open range
+        version = version_match.group(1).lower()
+        read_ranges.append((m_idx, path, start, end, version))
 
     range_stub: set[int] = set()
     # So từng cặp theo cùng path; vì read_ranges đã theo thứ tự message
     # (tăng dần idx = tăng dần thời gian), "sau" luôn ở vị trí j > i.
     for i in range(len(read_ranges)):
-        idx_i, path_i, s_i, e_i = read_ranges[i]
+        idx_i, path_i, s_i, e_i, version_i = read_ranges[i]
         if idx_i in stub_indices or idx_i in range_stub:
             continue  # đã bị stub lý do khác, khỏi so tiếp cho nhanh
         for j in range(i + 1, len(read_ranges)):
-            idx_j, path_j, s_j, e_j = read_ranges[j]
+            idx_j, path_j, s_j, e_j, version_j = read_ranges[j]
             if path_j != path_i:
+                continue
+            if version_j != version_i:
                 continue
             if s_j <= s_i and e_j >= e_i:
                 # bản sau (j) bao trọn bản trước (i) → bản trước thừa
@@ -1405,13 +1450,31 @@ def _workspace_references(name: str, seed_file: str | None = None,
     return "\n".join(out)
 
 def tool_read(path, offset=1, limit=READ_DEFAULT_LIMIT, depth=4, state=None):
+    if not isinstance(path, str):
+        return "[error: path must be a string]"
+    # The JSON schema declares integers, but providers can still send booleans
+    # or numeric strings.  Coercing those silently changes the requested range
+    # (True→1, "10"→10) and makes policy/audit output misleading; reject them
+    # before resolving or touching the filesystem.
+    if any(isinstance(value, bool) or not isinstance(value, int)
+           for value in (offset, limit, depth)):
+        return "[error: offset, limit and depth must be integers]"
+    if offset < 1:
+        return "[error: offset must be at least 1]"
+    if limit < 1:
+        return "[error: limit must be at least 1]"
+    if limit > READ_LIMIT_MAX:
+        return (f"[policy] limit={limit} quá lớn (tối đa {READ_LIMIT_MAX}).\n"
+                "Dùng grep/view_symbol để thu hẹp vị trí trước.")
+    if depth < 0 or depth > 20:
+        return "[error: depth must be between 0 and 20]"
     p = _resolve_read_path(path)
     err = _check_sandbox_read(str(p))
     if err: return err
     if not p.exists(): return f"[not found: {path}]"
     if p.is_dir():
         lines = [f"{p.resolve()}/"]
-        lines += _dir_tree(p, "", max_depth=int(depth))
+        lines += _dir_tree(p, "", max_depth=depth)
         count = sum(1 for l in lines if not l.endswith("/") and "..." not in l)
         lines.append(f"\n({count} files shown, depth={depth})")
         return "\n".join(lines)
@@ -1428,7 +1491,7 @@ def tool_read(path, offset=1, limit=READ_DEFAULT_LIMIT, depth=4, state=None):
     # user tự sửa tay, git checkout...) ngay sau write/edit gần nhất nhưng
     # trước khi _cache_validate_all() chạy lại (nó chỉ chạy lazy, sau bước có
     # write — xem 09_api_system.py); và (b) không cập nhật _file_read_time,
-    # khiến edit's FileTime safety check (tool_edit) dùng timestamp lỗi thời
+    # khiến edit's version-safety check (tool_edit) dùng observation lỗi thời
     # nếu thứ tự gọi đổi trong tương lai. Giờ luôn validate cache bằng hash
     # trước khi quyết định dùng, và luôn cập nhật read-time khi trả từ cache.
     if resolved_key in _recent_writes and resolved_key in _file_cache:
@@ -1443,14 +1506,15 @@ def tool_read(path, offset=1, limit=READ_DEFAULT_LIMIT, depth=4, state=None):
         out = (
             f"[policy] '{path}' đã được write/edit trong turn này — trả từ cache, "
             f"không đọc lại disk (content đã biết, xem rule re-read).\n"
-            f"File: {p}\nLines {start+1}-{min(end, ctotal)} of {ctotal}\n"
+            f"File: {p}\nVersion: {_content_hash(cached['content'])}\n"
+            f"Lines {start+1}-{min(end, ctotal)} of {ctotal}\n"
             + "─" * 60 + "\n"
             + "\n".join(f"{start+1+i}\t{l}" for i, l in enumerate(sliced))
         )
         remaining = ctotal - end
         if remaining > 0:
             out += f"\n\n(+{remaining} more lines — call read with offset={end+1} if truly needed)"
-        _file_read_time[resolved_key] = time.time()
+        _record_file_observation(p, cached["content"])
         return _head_tail(out, _read_output_cap(int(limit)), label="read output")
     # Nếu vừa pop cache vì external edit, bỏ luôn khỏi _recent_writes để
     # nhánh đọc disk thật bên dưới chạy bình thường, không tự coi là "đã biết".
@@ -1482,20 +1546,12 @@ def tool_read(path, offset=1, limit=READ_DEFAULT_LIMIT, depth=4, state=None):
         # (Update: verify-gate hỏi user khi limit>135 đã bị bỏ hoàn toàn —
         # gây phiền, không phù hợp luồng agent tự động. Giờ chỉ còn 1 ngưỡng
         # hard-block duy nhất = 700, không hỏi, không credit.)
-        orig_limit = int(limit)
+        orig_limit = limit
         warn = ""
 
         # Hard block: AI tự ghi limit > READ_LIMIT_MAX (không còn verify-gate
         # hỏi user — đã bỏ theo yêu cầu, vì luồng hỏi/credit cũ gây phiền.
         # Giờ chỉ có 1 ngưỡng cứng duy nhất, vượt là từ chối thẳng, không hỏi lại.)
-        if orig_limit > READ_LIMIT_MAX:
-            return (
-                f"[policy] limit={orig_limit} quá lớn (tối đa {READ_LIMIT_MAX}).\n"
-                f"Dùng grep/view_symbol để tìm chính xác vị trí, "
-                f"rồi read với limit ≤ {READ_LIMIT_MAX} quanh dòng đó.\n"
-                f"Ví dụ: grep('keyword') → read(path, offset=N-5, limit=60)"
-            )
-
         # Large-file soft warning: nếu offset=1 và limit>=total (tức đọc hết
         # file lớn không cần thiết) → cắt xuống threshold để tiết kiệm token.
         _READ_LARGE_FILE_THRESHOLD = 80  # lines
@@ -1517,15 +1573,16 @@ def tool_read(path, offset=1, limit=READ_DEFAULT_LIMIT, depth=4, state=None):
         # Line numbers shown as annotation ONLY — do NOT include them in old_str for edit.
         # The exact file content is the part after the tab on each line.
         out = warn
-        out += f"File: {p}\nLines {start+1}-{min(end, total)} of {total}\n"
+        out += (f"File: {p}\nVersion: {_content_hash(raw_content)}\n"
+                f"Lines {start+1}-{min(end, total)} of {total}\n")
         out += "NOTE: Line numbers below are display-only. For `edit` old_str, use ONLY the text after the line number, exactly as shown.\n"
         out += "─" * 60 + "\n"
         out += "\n".join(f"{start+1+i}\t{l}" for i, l in enumerate(sliced))
         remaining = total - end
         if remaining > 0:
             out += f"\n\n(+{remaining} more lines — call read with offset={end+1} or use grep to jump to the right section)"
-        # Track read time for FileTime safety check
-        _file_read_time[str(p.resolve())] = time.time()
+        # Track the exact content version for edit/apply/extract safety checks
+        _record_file_observation(p, raw_content)
         # Cache full content (không phải annotated output) để AI dùng lại
         if size <= 2 * 1024 * 1024:
             _cache_put(str(p), raw_content, _active_session_id())
@@ -1636,11 +1693,15 @@ def tool_write(path, content, conn=None, sid=None):
     # Fix: check size-limit trên `content` trước, không cần biết path resolve
     # tới đâu. Chỉ resolve sandbox khi request có khả năng thực sự ghi file.
     _WRITE_SIZE_LIMIT = 10 * 1024 * 1024
-    if len(content.encode("utf-8", errors="replace")) > _WRITE_SIZE_LIMIT:
-        return (f"[error] content too large ({len(content):,} chars). "
+    content_bytes = len(content.encode("utf-8", errors="replace"))
+    if content_bytes > _WRITE_SIZE_LIMIT:
+        return (f"[error] content too large ({content_bytes:,} bytes). "
                 f"Limit is {_WRITE_SIZE_LIMIT:,} bytes. "
                 f"If this is intentional, split into multiple files or use extract/apply_patch.")
-    p = _resolve_to_sandbox(path)
+    try:
+        p = _resolve_to_sandbox(path)
+    except ValueError as e:
+        return f"[sandbox] {e}"
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         # Exclusive create ("x" mode) — loại race condition TOCTOU giữa check
@@ -1668,18 +1729,20 @@ def tool_write(path, content, conn=None, sid=None):
                     pass
             raise
         before = None  # write chỉ chạy tới đây khi file chưa từng tồn tại
-        # Track write time so subsequent edits don't false-alarm on FileTime check
-        _file_read_time[str(p.resolve())] = time.time()
+        # Track the exact version so subsequent edits do not false-alarm
+        _record_file_observation(p, content)
         # Update cache ngay — AI không cần read lại file vừa tạo/ghi
         _cache_put(str(p), content, _active_session_id())
         _recent_writes.add(str(p.resolve()))  # block read-after-write
         if conn and sid:
             try:
                 _undo_stack.append(snapshot_save(
-                    conn, sid, str(p.resolve()), before, content))
+                    conn, sid, str(p.resolve()), before, content,
+                    before_mode=None, after_mode=p.stat().st_mode & 0o7777))
             except Exception as e:
                 p.unlink(missing_ok=True)
                 _file_cache.pop(str(p.resolve()), None)
+                _forget_file_observation(p)
                 _recent_writes.discard(str(p.resolve()))
                 return f"[error] snapshot failed; write rolled back: {e}"
             _redo_stack.clear()
@@ -1688,7 +1751,7 @@ def tool_write(path, content, conn=None, sid=None):
         lines = content.splitlines()
         total = len(lines)
         amap = _anchor_map(lines)
-        return (f"Written {len(content)} bytes → {p} ({total} lines){redirected}"
+        return (f"Written {content_bytes} bytes → {p} ({total} lines){redirected}"
                 + (f"\n{amap}" if amap else ""))
     except UnicodeEncodeError as e:
         return f"[error: content contains characters that cannot be encoded as UTF-8: {e}]"
@@ -1758,7 +1821,9 @@ def tool_delete(path, conn=None, sid=None):
     snap = None
     if conn and sid:
         try:
-            snap = snapshot_save(conn, sid, resolved, before, None)
+            snap = snapshot_save(
+                conn, sid, resolved, before, None,
+                before_mode=p.stat().st_mode & 0o7777, after_mode=None)
         except Exception as e:
             return (f"[error] Không lưu được snapshot để undo, huỷ bỏ thao tác xoá "
                     f"(file '{path}' vẫn còn nguyên, chưa bị xoá): {e}")
@@ -1776,7 +1841,7 @@ def tool_delete(path, conn=None, sid=None):
         return f"[error deleting {path}: {e}]"
 
     _file_cache.pop(resolved, None)
-    _file_read_time.pop(resolved, None)
+    _forget_file_observation(p)
     _recent_writes.discard(resolved)
     if snap is not None:
         _undo_stack.append(snap)
@@ -1807,7 +1872,10 @@ def tool_extract(src, start, end, dst, mode="move", conn=None, sid=None):
             return "[policy] Source file quá lớn cho extract (>50 MiB); dùng công cụ streaming phù hợp."
     except OSError as e:
         return f"[error: cannot stat source: {e}]"
-    dp = _resolve_to_sandbox(dst)
+    try:
+        dp = _resolve_to_sandbox(dst)
+    except ValueError as e:
+        return f"[sandbox] {e}"
     if sp.resolve() == dp.resolve():
         return "[error: src and dst must be different files]"
     dst_written = False
@@ -1818,6 +1886,7 @@ def tool_extract(src, start, end, dst, mode="move", conn=None, sid=None):
     src_before = None
     try:
         src_lines = sp.read_text().splitlines(keepends=True)
+        src_before_mode = sp.stat().st_mode & 0o7777
         n = len(src_lines)
         if start < 1 or end < start or start > n:
             return f"[error: invalid range {start}-{end} for {sp} ({n} lines)]"
@@ -1829,6 +1898,7 @@ def tool_extract(src, start, end, dst, mode="move", conn=None, sid=None):
         if dp.exists() and dp.stat().st_size > 50 * 1024 * 1024:
             return "[policy] Destination file quá lớn cho extract (>50 MiB); hãy xử lý/chia nhỏ trước."
         dst_before = dp.read_text() if dp.exists() else None
+        dst_before_mode = (dp.stat().st_mode & 0o7777) if dp.exists() else None
         if dst_before is not None and dst_before and not dst_before.endswith("\n"):
             dst_after = dst_before + "\n" + chunk_text
         else:
@@ -1849,24 +1919,23 @@ def tool_extract(src, start, end, dst, mode="move", conn=None, sid=None):
         # (kể cả dst) để giữ toàn bộ thao tác atomic-đúng-nghĩa khi fail.
         if mode == "move":
             resolved_src = str(sp.resolve())
-            last_read = _file_read_time.get(resolved_src, 0)
-            mtime = sp.stat().st_mtime
-            if mtime > last_read + 1:
-                return (f"[error] File '{src}' has been modified since it was last read "
-                        f"(mtime={mtime:.0f}, last_read={last_read:.0f}). "
-                        f"Read it again before extracting with mode='move'.")
+            if not _file_matches_observation(sp, "".join(src_lines)):
+                return (f"[error] File '{src}' differs from the version last read. "
+                        "Read it again before extracting with mode='move'.")
 
         _atomic_write_text(dp, dst_after)
         dst_written = True
         _cache_put(str(dp), dst_after, _active_session_id())
-        _file_read_time[str(dp.resolve())] = time.time()
+        _record_file_observation(dp, dst_after)
         _recent_writes.add(str(dp.resolve()))
         # C11/C27 FIX: save snapshot cho dst để /undo restore được dst (cả copy lẫn move)
         extract_group = str(uuid.uuid4()) if conn and sid else None
         if conn and sid:
             try:
                 dst_snap = snapshot_save(
-                    conn, sid, str(dp.resolve()), dst_before, dst_after, extract_group)
+                    conn, sid, str(dp.resolve()), dst_before, dst_after, extract_group,
+                    before_mode=dst_before_mode,
+                    after_mode=dp.stat().st_mode & 0o7777)
                 _undo_stack.append(dst_snap)
             except Exception as e:
                 if dst_before is None:
@@ -1875,11 +1944,11 @@ def tool_extract(src, start, end, dst, mode="move", conn=None, sid=None):
                     _atomic_write_text(dp, dst_before)
                 if dst_before is None:
                     _file_cache.pop(str(dp.resolve()), None)
-                    _file_read_time.pop(str(dp.resolve()), None)
+                    _forget_file_observation(dp)
                     _recent_writes.discard(str(dp.resolve()))
                 else:
                     _cache_put(str(dp), dst_before, _active_session_id())
-                    _file_read_time[str(dp.resolve())] = time.time()
+                    _record_file_observation(dp, dst_before)
                 return f"[error] snapshot failed; extract rolled back: {e}"
 
         result = f"Extracted lines {start}-{end} of {sp} → {dp} ({len(chunk)} lines)"
@@ -1890,13 +1959,15 @@ def tool_extract(src, start, end, dst, mode="move", conn=None, sid=None):
             src_after = "".join(new_src_lines)
             _atomic_write_text(sp, src_after)
             src_written = True
-            _file_read_time[str(sp.resolve())] = time.time()
+            _record_file_observation(sp, src_after)
             _recent_writes.add(str(sp.resolve()))
             _cache_put(str(sp), src_after, _active_session_id())
             if conn and sid:
                 try:
                     src_snap = snapshot_save(
-                        conn, sid, str(sp.resolve()), src_before, src_after, extract_group)
+                    conn, sid, str(sp.resolve()), src_before, src_after, extract_group,
+                        before_mode=src_before_mode,
+                        after_mode=sp.stat().st_mode & 0o7777)
                     _undo_stack.append(src_snap)
                 except Exception as e:
                     # Roll back both files and remove the destination snapshot
@@ -1907,14 +1978,14 @@ def tool_extract(src, start, end, dst, mode="move", conn=None, sid=None):
                     else:
                         _atomic_write_text(dp, dst_before)
                     _cache_put(str(sp), src_before, _active_session_id())
-                    _file_read_time[str(sp.resolve())] = time.time()
+                    _record_file_observation(sp, src_before)
                     if dst_before is None:
                         _file_cache.pop(str(dp.resolve()), None)
-                        _file_read_time.pop(str(dp.resolve()), None)
+                        _forget_file_observation(dp)
                         _recent_writes.discard(str(dp.resolve()))
                     else:
                         _cache_put(str(dp), dst_before, _active_session_id())
-                        _file_read_time[str(dp.resolve())] = time.time()
+                        _record_file_observation(dp, dst_before)
                     if dst_snap is not None:
                         try:
                             _undo_stack.remove(dst_snap)
@@ -1969,11 +2040,11 @@ def tool_extract(src, start, end, dst, mode="move", conn=None, sid=None):
             resolved_path = str(path_obj.resolve())
             if before_text is None:
                 _file_cache.pop(resolved_path, None)
-                _file_read_time.pop(resolved_path, None)
+                _forget_file_observation(path_obj)
                 _recent_writes.discard(resolved_path)
             else:
                 _cache_put(str(path_obj), before_text, _active_session_id())
-                _file_read_time[resolved_path] = time.time()
+                _record_file_observation(path_obj, before_text)
                 _recent_writes.discard(resolved_path)
         suffix = f"; {'; '.join(rollback_errors)}" if rollback_errors else ""
         return f"[error: extract failed and was rolled back: {e}{suffix}]"
@@ -1985,20 +2056,20 @@ def tool_edit(path, old_str, new_str, conn=None, sid=None):
         return _COMPACTION_MARKER_ERROR
     if len(old_str.encode("utf-8", errors="replace")) > 5 * 1024 * 1024 or len(new_str.encode("utf-8", errors="replace")) > 5 * 1024 * 1024:
         return "[error: old_str/new_str exceeds 5 MiB; use a narrower edit or apply_patch]"
-    p = _resolve_to_sandbox(path)
+    try:
+        p = _resolve_to_sandbox(path, allow_redirect=False)
+    except ValueError as e:
+        return f"[sandbox] {e}"
     if not p.exists(): return f"[not found: {p}]"
     try:
         if p.stat().st_size > 50 * 1024 * 1024:
             return "[policy] File quá lớn cho edit (>50 MiB); dùng extract hoặc chia nhỏ thao tác."
-        # FileTime safety: must have read the file after last external modification
         resolved = str(p.resolve())
-        last_read = _file_read_time.get(resolved, 0)
-        mtime = p.stat().st_mtime
-        if mtime > last_read + 1:
-            return (f"[error] File '{path}' has been modified since it was last read "
-                    f"(mtime={mtime:.0f}, last_read={last_read:.0f}). "
-                    f"Use the read tool to reload it before editing.")
+        before_mode = p.stat().st_mode & 0o7777
         text  = p.read_text()
+        if not _file_matches_observation(p, text):
+            return (f"[error] File '{path}' differs from the version last read. "
+                    "Use the read tool to reload it before editing.")
         if old_str == "":
             # str.count("") trả len(text)+1 (>=1 luôn), nên count==0/count>1
             # không bắt được case này. File rỗng đặc biệt nguy hiểm: count==1
@@ -2013,7 +2084,7 @@ def tool_edit(path, old_str, new_str, conn=None, sid=None):
             snippet = snippet[:80] + ("…" if len(snippet) > 80 else "")
             hint = (
                 f"[error: old_str not found] The exact text you provided does not "
-                f"appear in '{path}' (last_read={last_read:.0f}, current mtime={mtime:.0f}).\n"
+                f"appear in '{path}'.\n"
                 f"old_str you sent (truncated): {snippet!r}\n"
                 f"This usually means: (1) the file was rewritten (e.g. via `write`) since "
                 f"your last `read`/`edit`, or (2) whitespace/line-ending differs from what "
@@ -2025,17 +2096,23 @@ def tool_edit(path, old_str, new_str, conn=None, sid=None):
         if count > 1:  return f"[error: found {count} times — must be unique]"
         after = text.replace(old_str, new_str, 1)
         _atomic_write_text(p, after)
-        # Update read time after our own write so next edit doesn't false-alarm
-        _file_read_time[resolved] = time.time()
+        # Record the exact content version after our own write so the next
+        # edit/apply can distinguish it from an external change.
+        _record_file_observation(p, after)
         # Update cache với content mới — AI thấy thay đổi ngay trong cache block
         _cache_put(str(p), after, _active_session_id())
+        _recent_writes.add(str(p.resolve()))
         if conn and sid:
             try:
                 _undo_stack.append(snapshot_save(
-                    conn, sid, str(p.resolve()), text, after))
+                    conn, sid, str(p.resolve()), text, after,
+                    before_mode=before_mode,
+                    after_mode=p.stat().st_mode & 0o7777))
             except Exception as e:
-                _atomic_write_text(p, text)
+                _snapshot_restore(p, text, before_mode)
                 _cache_put(str(p), text, _active_session_id())
+                _record_file_observation(p, text)
+                _recent_writes.discard(str(p.resolve()))
                 return f"[error] snapshot failed; edit rolled back: {e}"
             _redo_stack.clear()
         # Trả về context snippet quanh vùng thay đổi — AI không cần read lại để verify
@@ -2098,20 +2175,20 @@ def tool_multiedit(path, edits, conn=None, sid=None):
     if sum(len(e["old_str"].encode("utf-8", errors="replace"))
            + len(e["new_str"].encode("utf-8", errors="replace")) for e in edits) > 10 * 1024 * 1024:
         return "[error: combined edit content exceeds 10 MiB]"
-    p = _resolve_to_sandbox(path)
+    try:
+        p = _resolve_to_sandbox(path, allow_redirect=False)
+    except ValueError as e:
+        return f"[sandbox] {e}"
     if not p.exists(): return f"[not found: {p}]"
     try:
         resolved = str(p.resolve())
         if p.stat().st_size > 50 * 1024 * 1024:
             return "[policy] File quá lớn cho multiedit (>50 MiB); dùng extract hoặc chia nhỏ thao tác."
-        last_read = _file_read_time.get(resolved, 0)
-        mtime = p.stat().st_mtime
-        if mtime > last_read + 1:
-            return (f"[error] File \'{path}\' has been modified since it was last read "
-                    f"(mtime={mtime:.0f}, last_read={last_read:.0f}). "
-                    f"Use the read tool to reload it before editing.")
-
+        before_mode = p.stat().st_mode & 0o7777
         before = p.read_text()
+        if not _file_matches_observation(p, before):
+            return (f"[error] File '{path}' differs from the version last read. "
+                    "Use the read tool to reload it before editing.")
         buf = before
         results = []
         for i, edit in enumerate(edits):
@@ -2143,16 +2220,19 @@ def tool_multiedit(path, edits, conn=None, sid=None):
         # Tat ca edit hop le - commit mot lan duy nhat.
         after = buf
         _atomic_write_text(p, after)
-        _file_read_time[resolved] = time.time()
+        _record_file_observation(p, after)
         _recent_writes.add(resolved)
         _cache_put(str(p), after, _active_session_id())
         if conn and sid:
             try:
                 _undo_stack.append(snapshot_save(
-                    conn, sid, resolved, before, after))
+                    conn, sid, resolved, before, after,
+                    before_mode=before_mode,
+                    after_mode=p.stat().st_mode & 0o7777))
             except Exception as e:
-                _atomic_write_text(p, before)
+                _snapshot_restore(p, before, before_mode)
                 _cache_put(str(p), before, _active_session_id())
+                _record_file_observation(p, before)
                 _recent_writes.discard(resolved)
                 return f"[error] snapshot failed; multiedit rolled back: {e}"
             _redo_stack.clear()
