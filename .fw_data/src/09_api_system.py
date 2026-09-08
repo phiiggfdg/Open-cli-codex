@@ -3119,6 +3119,11 @@ _MCP_MUTATION_HINT_RE = re.compile(
 def _mcp_name_may_mutate(name: str) -> bool:
     if not name.startswith("mcp__"):
         return False
+    # Remote operations are side-effecting by default. A published explicit
+    # readOnlyHint is the only reason to relax duplicate-side-effect handling;
+    # name heuristics alone missed verbs such as pay/place/destroy/dispatch.
+    if not mcp_tool_explicitly_readonly(name):
+        return True
     action = name.rsplit("__", 1)[-1]
     action = re.sub(r"(?<!^)(?=[A-Z])", "_", action).replace("-", "_")
     return bool(_MCP_MUTATION_HINT_RE.search(action))
@@ -3142,24 +3147,166 @@ def _tool_may_mutate_local_files(name: str, args: dict) -> bool:
     return False
 
 
-def _dedup_should_block(name: str) -> bool:
+def _dedup_scope(name: str, args: dict) -> str:
+    """Classify dedup lifetime: none, state-dependent query, or side effect."""
+    if name == "bash":
+        return "none" if not _tool_may_mutate_state(name, args) else "effect"
+    # Files can be changed by the user/editor between steps. Let observation
+    # tools execute so they can detect that external state; history pruning
+    # still collapses byte-identical old evidence later.
+    if name in {"read", "glob", "grep", "view_symbol", "lsp", "file_index"}:
+        return "none"
     if name in _DEDUP_EXEMPT_TOOLS:
-        return False
+        return "none"
     if name.startswith("mcp__"):
-        return _mcp_name_may_mutate(name)
-    return True
+        return "effect" if _mcp_name_may_mutate(name) else "none"
+    if _tool_may_mutate_state(name, args):
+        return "effect"
+    return "state"
+
+
+_TOOL_ARG_DEFAULTS = {
+    "bash": {"timeout": 30},
+    "read": {"offset": 1, "limit": READ_DEFAULT_LIMIT, "depth": 4},
+    "extract": {"mode": "move"},
+    "glob": {"cwd": "."},
+    "grep": {
+        "path": None, "glob": None, "ignore_case": False,
+        "fixed_string": False, "invert": False, "word": False,
+        "context": 0, "max_count": None, "files_only": False,
+        "multiline": False,
+    },
+    "websearch": {"num": 5},
+    "question": {"options": None},
+    "task": {"tools": None, "max_steps": None},
+    "delegate": {
+        "target_files": None, "target_location": None,
+        "tools": None, "max_steps": None,
+    },
+    "lsp": {"file": None, "line": 1, "character": 0, "query": None},
+    "verify": {"reason": ""},
+}
+
+
+def _canonical_runtime_path(value, redirect_outside: bool = False) -> str:
+    """Canonicalize a path without creating files/directories."""
+    root = _workspace_root().resolve()
+    raw = Path(str(value or "")).expanduser()
+    if raw.is_absolute():
+        candidate = raw.resolve()
+    else:
+        if raw.parts and raw.parts[0] == root.name:
+            raw = Path(*raw.parts[1:]) if len(raw.parts) > 1 else Path(".")
+        candidate = (root / raw).resolve()
+    if redirect_outside:
+        try:
+            candidate.relative_to(root)
+        except ValueError:
+            rel = Path(*raw.parts[1:]) if raw.is_absolute() else Path(raw.name)
+            candidate = (root / rel).resolve()
+    return str(candidate)
+
+
+def _canonical_tool_args(name: str, args: dict) -> dict:
+    """Canonical semantic arguments shared by runtime/history dedup."""
+    normalized = _tool_known_args(name, args)
+    for field, value in _TOOL_ARG_DEFAULTS.get(name, {}).items():
+        normalized.setdefault(field, value)
+
+    if name in {"read", "delete", "edit", "multiedit", "apply_patch",
+                "view_symbol", "verify"} and normalized.get("path") is not None:
+        normalized["path"] = _canonical_runtime_path(normalized["path"])
+    elif name == "write" and normalized.get("path") is not None:
+        normalized["path"] = _canonical_runtime_path(normalized["path"], True)
+    elif name == "extract":
+        if normalized.get("src") is not None:
+            normalized["src"] = _canonical_runtime_path(normalized["src"])
+        if normalized.get("dst") is not None:
+            normalized["dst"] = _canonical_runtime_path(normalized["dst"], True)
+    elif name == "glob":
+        normalized["cwd"] = _canonical_runtime_path(normalized.get("cwd") or ".")
+    elif name == "grep":
+        normalized["path"] = _canonical_runtime_path(normalized.get("path") or ".")
+    elif name == "lsp" and normalized.get("file"):
+        normalized["file"] = _canonical_runtime_path(normalized["file"])
+
+    if name in {"task", "delegate"}:
+        tools = normalized.get("tools") or []
+        if isinstance(tools, list):
+            normalized["tools"] = sorted(set(str(tool) for tool in tools))
+        normalized["max_steps"] = _resolve_subagent_max_steps(normalized.get("max_steps"))
+    if name == "delegate":
+        files = normalized.get("target_files") or []
+        if isinstance(files, list):
+            normalized["target_files"] = sorted(set(
+                _canonical_runtime_path(path) for path in files
+            ))
+        normalized["target_location"] = normalized.get("target_location") or ""
+    if name == "question" and not normalized.get("options"):
+        normalized["options"] = None
+    if name == "websearch":
+        try:
+            normalized["num"] = max(1, min(int(normalized.get("num", 5)), 20))
+        except (TypeError, ValueError):
+            normalized["num"] = 5
+    if name == "multiedit" and isinstance(normalized.get("edits"), list):
+        normalized["edits"] = [
+            {key: item[key] for key in ("old_str", "new_str") if key in item}
+            if isinstance(item, dict) else item
+            for item in normalized["edits"]
+        ]
+    return normalized
 
 
 def _runtime_tool_call_signature(name: str, args: dict) -> str:
-    history_key = _history_tool_call_key(name, args)
+    normalized = _canonical_tool_args(name, args)
+    history_key = _history_tool_call_key(name, normalized)
     if history_key is not None:
         return f"{history_key[0]}:{history_key[1]}"
-    normalized = dict(args)
-    if name == "extract":
-        normalized.setdefault("mode", "move")
-    elif name == "bash":
-        normalized.setdefault("timeout", 30)
     return f"{name}:{json.dumps(normalized, sort_keys=True, separators=(',', ':'), ensure_ascii=False)}"
+
+
+def _dedup_resource_keys(name: str, args: dict) -> tuple[str, ...]:
+    """Resources whose generation makes a local mutation meaningful again."""
+    normalized = _canonical_tool_args(name, args)
+    if name in {"write", "delete", "edit", "multiedit", "apply_patch"}:
+        return (normalized.get("path", ""),)
+    if name == "extract":
+        return tuple(sorted({normalized.get("src", ""), normalized.get("dst", "")}))
+    return ()
+
+
+def _dedup_resource_snapshot(resource_epochs: dict, name: str, args: dict) -> tuple:
+    return tuple((key, resource_epochs.get(key, 0))
+                 for key in _dedup_resource_keys(name, args) if key)
+
+
+def _dedup_bump_resources(resource_epochs: dict, name: str, args: dict) -> None:
+    for key in _dedup_resource_keys(name, args):
+        if key:
+            resource_epochs[key] = resource_epochs.get(key, 0) + 1
+
+
+def _dedup_lookup(seen_state: dict, seen_effect: dict, resource_epochs: dict,
+                  name: str, args: dict, epoch: int) -> tuple[str, str, bool]:
+    """Single dedup decision path used by main and subagent loops."""
+    signature = _runtime_tool_call_signature(name, args)
+    scope = _dedup_scope(name, args)
+    effect_snapshot = _dedup_resource_snapshot(resource_epochs, name, args)
+    blocked = (
+        (scope == "effect" and seen_effect.get(signature) == effect_snapshot)
+        or (scope == "state" and seen_state.get(signature) == epoch)
+    )
+    return signature, scope, blocked
+
+
+def _dedup_record(seen_state: dict, seen_effect: dict, resource_epochs: dict,
+                  signature: str, scope: str, epoch: int,
+                  name: str, args: dict) -> None:
+    if scope == "effect":
+        seen_effect[signature] = _dedup_resource_snapshot(resource_epochs, name, args)
+    elif scope == "state":
+        seen_state[signature] = epoch
 
 
 def _normalize_runtime_tool_calls(raw_tcs):
@@ -3222,56 +3369,60 @@ def _normalize_runtime_tool_calls(raw_tcs):
     return clean, warnings
 
 
-def _tool_was_definitely_blocked(name: str, result: str | None = None) -> bool:
-    """True only when execution certainly never reached a mutation.
+def _tool_result_is_failure(result: str) -> bool:
+    """Recognize every structured failure contract emitted by built-in tools."""
+    low = (result or "").lstrip().lower()
+    prefixes = (
+        "[error", "[permission denied", "[unknown tool", "[tool_error:",
+        "[task error", "[task denied", "[delegate error", "[delegate denied",
+        "[subagent error", "[question error", "[verify error", "[skill error",
+        "[skill not found", "[error reading skill", "[mcp_error", "[not found",
+        "[policy]", "[sandbox]",
+    )
+    if low.startswith(prefixes):
+        return True
+    if low.startswith("todowrite skipped"):
+        return True
+    if low.startswith("[verify] no user observation"):
+        return True
+    if low.startswith(("[task] (unformatted output", "[delegate:")) and "[subagent error:" in low:
+        return True
+    if low.startswith("[lsp]"):
+        return any(marker in low for marker in (
+            " required", "cannot read", "not found", "no symbol", "no symbols",
+            "no matches", "must be", "unknown operation",
+        ))
+    return "[multiedit aborted" in low
 
-    Ordinary tool errors remain conservative because a script, MCP call or
-    multi-file operation can fail after a partial side effect.
-    """
-    # Keep the old one-argument helper shape usable for callers/tests that
-    # only need the conservative generic classification.
+
+def _tool_was_definitely_blocked(name: str, result: str | None = None) -> bool:
+    """True only when a mutation handler certainly left state unchanged."""
     if result is None:
         result, name = name, ""
     text = (result or "").lstrip().lower()
-    if name in {"apply_patch", "edit", "multiedit"}:
-        # These handlers read, validate, and commit exactly once; all error
-        # paths roll back before returning. Treating every structured error as
-        # definitely blocked keeps mutation_epoch/dedup state truthful.
-        if text.startswith(("[error", "[not found", "[policy", "[sandbox", "[permission", "[unknown tool")):
+    if name in {"write", "delete", "edit", "multiedit", "apply_patch", "todowrite"}:
+        if ("rollback failed:" not in text and
+                (_tool_result_is_failure(text) or text.startswith("todowrite skipped"))):
             return True
+    if name == "extract" and _tool_result_is_failure(text):
+        return "rollback failed:" not in text
+    if name in {"task", "delegate"} and text.startswith((
+            "[task error", "[task denied", "[delegate error", "[delegate denied")):
+        return True
+    if name in {"task", "delegate"} and "[subagent error:" in text:
+        return True
     return text.startswith((
         "[permission denied", "[unknown tool", "[tool_error: missing required arg",
-        "[task denied", "[policy]", "[sandbox]", "[not found",
-        # BUG FIX: guard marker chống copy-paste history-compaction
-        # placeholder (06_tools_fs.py, _COMPACTION_MARKER_ERROR) return NGAY
-        # dòng đầu tool_write/tool_edit/tool_apply_patch, TRƯỚC bất kỳ ghi
-        # đĩa nào — chắc chắn 100% không mutate, y hệt các case khác trong
-        # danh sách này. Trước đây thiếu prefix này khiến
-        # _tool_may_mutate_state("write",...) vẫn coi là "có thể đã mutate"
-        # (luôn True cho write/edit/apply_patch, không xem kết quả) →
-        # _mutation_epoch tăng dù không hề ghi gì → nếu model gọi lại đúng
-        # tool_call y hệt (cùng step do parallel_tool_calls, hoặc step kế
-        # tiếp), dedup-guard chặn nó và trả "[dedup] Skipped unchanged
-        # duplicate" — CHE MẤT lý do thật (marker sai) khỏi model, khiến
-        # model hiểu nhầm nguyên nhân là "trùng nội dung với file cũ" thay
-        # vì "tôi đang gửi placeholder rác" — quan sát thực tế gây vòng lặp
-        # 14 step không tự thoát được (model liên tục đổi hướng suy luận
-        # sai theo lỗi dedup thay vì sửa đúng vấn đề gốc).
+        "[policy]", "[sandbox]", "[not found",
         "[error] the content you provided is a history-compaction placeholder marker",
     ))
+
 
 def _tool_failure_signature(result: str) -> str | None:
     """Stable signature for tool failures that are useful for loop breaking."""
     text = (result or "").strip()
     low = text.lower()
-    if not low.startswith((
-        "[error", "[permission denied", "[unknown tool", "[tool_error:",
-        "[task denied", "[policy]", "[sandbox]", "[not found",
-    )):
-        return None
-    # Dedup is a framework shortcut, not the original tool failure. It already
-    # short-circuits before run_tool(), but keep this explicit for future moves.
-    if low.startswith("[dedup]"):
+    if not _tool_result_is_failure(text) or low.startswith("[dedup]"):
         return None
     return low
 
@@ -3301,22 +3452,15 @@ def _agent_turn_inner(messages, model, api_key, conn, sid, max_steps, agent, sta
     _requesty_turn_cost = 0.0   # Requesty: tích luỹ usage.cost (USD) qua các step
     steps    = 0
     # ── Dedup guard state ───────────────────────────────────────────────────
-    # Trước đây: set đơn giản (call_sig đã gọi -> chặn vĩnh viễn trong cả turn,
-    # dù turn có hàng chục step và trạng thái filesystem/git đã đổi nhiều lần
-    # ở giữa). Vấn đề: "git status" gọi ở step 1 rồi gọi lại y hệt ở step 10
-    # sau khi đã write/edit nhiều file -- bị chặn oan dù kết quả CHẮC CHẮN
-    # khác, vì key dedup chỉ so "tool+args" (text tĩnh), không biết gì về
-    # việc trạng thái đã đổi.
-    # Fix: dict {call_sig: epoch_lúc_gọi} thay vì set. _mutation_epoch tăng
-    # sau mỗi mutation attempt không bị chặn chắc chắn (đủ write/delete/
-    # extract/edit/apply_patch, todo/task, Bash không-readonly và MCP
-    # mutation có tên rõ). Khi gặp
-    # lại call_sig cũ: chỉ chặn nếu epoch KHÔNG đổi kể từ lần gọi trước (thật
-    # sự vô ích, không có gì khác đi). Nếu epoch đã tăng -> cho gọi lại (có
-    # thể có ích) và cập nhật epoch mới cho lần này.
-    # Lưu ý: KHÔNG nới lỏng vô điều kiện theo step -- nếu không có mutation
-    # nào ở giữa, dedup vẫn chặn y như cũ (tránh AI lặp vô ích tốn token).
-    _seen_calls_this_turn: dict = {}     # dedup: call_sig -> epoch lúc gọi
+    # State queries and side effects deliberately have different lifetimes.
+    # A state-query signature is valid only for its mutation epoch. A side
+    # effect remains blocked for the entire turn: editing an unrelated file or
+    # compacting history must never authorize sending/deleting/writing the same
+    # thing again. Observation tools that can see external edits are retryable
+    # and are deduplicated only later in history when their results are equal.
+    _seen_state_calls: dict = {}         # query signature -> mutation epoch
+    _seen_effect_calls: dict = {}        # signature -> relevant resource generations
+    _dedup_resource_epochs: dict = {}    # canonical local path -> generation
     _mutation_epoch = 0                  # tăng mỗi khi có tool đổi trạng thái
     _repeat_error_sig = None             # no-progress: (call_sig, failure_sig, epoch)
     _repeat_error_count = 0
@@ -3380,10 +3524,11 @@ def _agent_turn_inner(messages, model, api_key, conn, sid, max_steps, agent, sta
         _messages_before_compact = messages
         messages = maybe_compact(messages, model, api_key, conn, sid)
         if messages is not _messages_before_compact:
-            # Compaction may remove the earlier result that justified a
-            # duplicate guard. Never carry stale signatures across it.
-            _seen_calls_this_turn.clear()
-            _mutation_epoch += 1
+            # A summary can replace old query evidence, so allow observations
+            # to be refreshed. Side-effect signatures must survive compaction:
+            # summarizing history is not a state change and must never permit
+            # an email/upload/delete to run twice.
+            _seen_state_calls.clear()
         # Bug C fix: sau compact, marker AGENTS.md + git bị xoá khỏi history
         # → phải inject lại để prefix cache không bị phá ở step tiếp theo.
         messages = _inject_agents_md_once(messages)
@@ -3697,15 +3842,13 @@ def _agent_turn_inner(messages, model, api_key, conn, sid, max_steps, agent, sta
                 tool_results.append({"role":"tool","tool_call_id":tc.get("id",""),"content":skipped})
                 tool_results_history.append({"role":"tool","tool_call_id":tc.get("id",""),"content":skipped})
                 continue
-            # Dedup guard: block stable/side-effecting identical calls only when
-            # no observable mutation attempt happened in between. Dynamic,
-            # interactive and read-only MCP tools remain retryable.
-            # (_mutation_epoch không tăng) kể từ lần gọi y hệt trước đó trong
-            # cùng turn. Xem giải thích đầy đủ ở phần khởi tạo state phía trên.
-            _call_sig = _runtime_tool_call_signature(name, args)
-            _prev_epoch = _seen_calls_this_turn.get(_call_sig)
-            if (_prev_epoch is not None and _prev_epoch == _mutation_epoch
-                    and _dedup_should_block(name)):
+            # Shared main/subagent dedup policy. State queries use the current
+            # epoch; side effects keep a turn-long signature; observations and
+            # interactive tools remain retryable.
+            _call_sig, _dedup_kind, _duplicate = _dedup_lookup(
+                _seen_state_calls, _seen_effect_calls, _dedup_resource_epochs,
+                name, args, _mutation_epoch)
+            if _duplicate:
                 dupe_msg = (
                     f"[dedup] Skipped unchanged duplicate `{name}`; reuse its previous result."
                 )
@@ -3747,8 +3890,12 @@ def _agent_turn_inner(messages, model, api_key, conn, sid, max_steps, agent, sta
                 _mutation_epoch += 1
             if _may_mutate_local and not _definitely_blocked:
                 _had_writes_last_step = True
-            if _dedup_should_block(name) and not _definitely_blocked:
-                _seen_calls_this_turn[_call_sig] = _mutation_epoch
+            if _dedup_kind == "effect" and not _definitely_blocked:
+                _dedup_bump_resources(_dedup_resource_epochs, name, args)
+            if not _definitely_blocked:
+                _dedup_record(_seen_state_calls, _seen_effect_calls,
+                              _dedup_resource_epochs, _call_sig, _dedup_kind,
+                              _mutation_epoch, name, args)
             tool_results.append({
                 "role": "tool", "tool_call_id": tc.get("id", ""), "content": out_model
             })

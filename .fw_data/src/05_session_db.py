@@ -523,3 +523,17 @@ TOOLS = [
   }},
 
 ]
+
+# Reject model-invented fields at the schema boundary. Runtime dispatch stays
+# tolerant for providers that do not enforce JSON Schema, while runtime/history
+# signatures filter to these same properties so ignored noise cannot bypass
+# duplicate suppression.
+for _tool_spec in TOOLS:
+    _params = _tool_spec.get("function", {}).get("parameters")
+    if isinstance(_params, dict):
+        _params["additionalProperties"] = False
+        for _prop in (_params.get("properties") or {}).values():
+            if isinstance(_prop, dict) and _prop.get("type") == "array":
+                _items = _prop.get("items")
+                if isinstance(_items, dict) and _items.get("type") == "object":
+                    _items["additionalProperties"] = False

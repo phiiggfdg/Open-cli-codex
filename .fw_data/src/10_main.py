@@ -1511,7 +1511,10 @@ def main():
         if user.lower() == "/perms":
             merged = dict(DEFAULT_PERMS)
             merged.update(state.custom_perms if state is not None else _custom_perms)
-            if agent == AGENT_PLAN: merged.update(PLAN_PERMS)
+            if agent == AGENT_PLAN:
+                merged.update(PLAN_PERMS)
+                # Match the hard execution floor in _check_permission().
+                merged["mcp__*"] = PERM_DENY
             _lines = [f"\n{BOLD}Permissions (agent={agent}):{R}"]
             for t, p in sorted(merged.items()):
                 cl = GREEN if p==PERM_ALLOW else (YELLOW if p==PERM_ASK else RED)
@@ -2077,10 +2080,19 @@ Write the AGENTS.md content directly. Be concise but complete."""
                 # Override agent/model if specified
                 run_agent = cmd.get("agent") or agent
                 run_model = cmd.get("model") or model
+                # A command may specialize Build/Codeweb, but it must never
+                # weaken a session explicitly opened in hard read-only Plan.
+                if agent == AGENT_PLAN:
+                    run_agent = AGENT_PLAN
                 print(f"{DIM}  [/{cmd_name}] {cmd['description']}{R}")
                 if cmd.get("subtask"):
-                    # Run as subagent
-                    result = tool_task(template, model=run_model, api_key=api_key, conn=conn, sid=sid, state=state)
+                    # Use the same permission/dispatch path as a model-issued
+                    # task call. Directly invoking tool_task bypassed
+                    # `/perm task deny` and lost session-local permissions for
+                    # every tool used by the subagent.
+                    result, _result_history = run_tool(
+                        "task", {"description": template}, run_model, api_key,
+                        conn, sid, state=state)
                     print(f"\n{GREEN}{BOLD}AI:{R} {result}")
                     messages.append({"role":"user","content":f"[/{cmd_name}] {template}"})
                     messages.append({"role":"assistant","content":result})

@@ -968,6 +968,9 @@ def tool_todowrite(todos):
     if not isinstance(todos, list):
         return (f"[error: 'todos' must be a list of todo items, got {type(todos).__name__}. "
                 f"No changes made — todo list and turn quota unaffected.]")
+    if any(isinstance(item, dict) and _contains_compaction_marker(
+            item.get("id"), item.get("content")) for item in todos):
+        return _COMPACTION_MARKER_ERROR
     if len(todos) > 100:
         return "[error: todo list is limited to 100 items; no changes made.]"
     _REQUIRED_FIELDS = ("id", "content", "status", "priority")
@@ -1042,6 +1045,8 @@ def tool_question(question, options=None, state=None):
     """
     if not isinstance(question, str) or not question.strip():
         return "[question error: question must be a non-empty string]"
+    if _contains_compaction_marker(question):
+        return _COMPACTION_MARKER_ERROR
     if options is not None and not isinstance(options, list):
         return "[question error: options must be a list of strings]"
     question = question[:4000]

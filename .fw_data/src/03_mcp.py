@@ -13,10 +13,9 @@ _MCP_LAST_ERROR: dict = {}     # {server_name: "HTTP 403: error code: 1010..."}
 _MCP_SESSION_IDS: dict = {}
 _MCP_INITIALIZED: set = set()
 _MCP_TOOL_ROUTE: dict = {}
-# Only an MCP server's explicit ``annotations.readOnlyHint=true`` is trusted
-# to classify a dynamic tool as safe in Plan mode.  Names/description
-# heuristics remain useful for duplicate-call suppression, but cannot grant
-# permission to an unknown remote operation.
+# Explicit ``annotations.readOnlyHint=true`` is used only to avoid suppressing
+# repeat remote reads. It never grants Plan-mode execution: annotations are
+# server-provided hints, not an enforceable read-only boundary.
 _MCP_READONLY_TOOLS: set[str] = set()
 _MCP_REQUEST_ID = 0
 _MCP_MAX_RESPONSE = 8 * 1024 * 1024
@@ -351,15 +350,12 @@ def mcp_call_tool(full_name: str, args: dict) -> str:
     if not isinstance(args, dict):
         return "[mcp_error: tool arguments must be an object]"
     route = _MCP_TOOL_ROUTE.get(full_name)
-    server_name, tool_name = route if route else (None, None)
-    for sname in servers if route is None else ():
-        prefix = f"mcp__{sname}__"
-        if full_name.startswith(prefix):
-            server_name = sname
-            tool_name   = full_name[len(prefix):]
-            break
-    if not server_name:
-        return f"[mcp_error: không tìm thấy server cho tool '{full_name}']"
+    # Only call operations that were returned by tools/list and published to
+    # the model. Parsing a hallucinated mcp__server__operation name here used
+    # to bypass the route/annotation registry entirely.
+    if not route:
+        return f"[mcp_error: tool '{full_name}' was not published by this MCP session]"
+    server_name, tool_name = route
     server = servers.get(server_name)
     if not isinstance(server, dict) or not isinstance(server.get("url"), str):
         return f"[mcp_error: invalid config for server '{server_name}']"

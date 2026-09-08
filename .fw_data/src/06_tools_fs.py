@@ -332,7 +332,7 @@ def _serve_kill_existing(key: str) -> str | None:
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)  # cứng đầu -> kill hẳn
         except ProcessLookupError:
             pass  # đã chết giữa lúc kiểm tra -- không sao
-        except Exception:
+        except Exception as write_error:
             pass  # dọn best-effort, không để lỗi kill làm hỏng luồng start-mới
     return old_cmd
 
@@ -818,6 +818,22 @@ def _head_tail(text: str, max_chars: int, label="tool output") -> str:
     cut  = len(text) - max_chars
     return f"{head}\n\n... [{cut:,} chars omitted from middle of {label}] ...\n\n{tail}"
 
+def _tool_known_args(name: str, args: dict) -> dict:
+    """Return only arguments declared by the local tool schema.
+
+    MCP schemas are dynamic and keep their complete argument object. Local
+    dispatch ignores unknown keys, so signatures must ignore them too.
+    """
+    if not isinstance(args, dict) or name.startswith("mcp__"):
+        return dict(args) if isinstance(args, dict) else {}
+    for spec in globals().get("TOOLS", []):
+        fn = spec.get("function", {}) if isinstance(spec, dict) else {}
+        if fn.get("name") == name:
+            properties = (fn.get("parameters") or {}).get("properties") or {}
+            return {key: value for key, value in args.items() if key in properties}
+    return dict(args)
+
+
 def _history_tool_call_key(name: str, args: dict) -> tuple | None:
     """Canonical key for history dedup.
 
@@ -828,7 +844,7 @@ def _history_tool_call_key(name: str, args: dict) -> tuple | None:
     if name not in {"read", "grep", "glob", "view_symbol", "delegate"}:
         return None
     try:
-        normalized = dict(args)
+        normalized = _tool_known_args(name, args)
         if name == "read":
             normalized.setdefault("offset", 1)
             normalized.setdefault("limit", READ_DEFAULT_LIMIT)
@@ -848,12 +864,22 @@ def _history_tool_call_key(name: str, args: dict) -> tuple | None:
             # A delegate is a semantic request; only an exact same request is
             # safe to suppress. Different instructions may intentionally ask
             # for a second independent review of the same files.
+            _resolve_steps = globals().get("_resolve_subagent_max_steps")
+            _max_steps = normalized.get("max_steps")
+            if callable(_resolve_steps):
+                _max_steps = _resolve_steps(_max_steps)
+            _canonical_path = globals().get("_canonical_runtime_path")
+            _target_files = normalized.get("target_files") or []
+            if callable(_canonical_path):
+                _target_files = [_canonical_path(path) for path in _target_files]
             normalized = {
                 "task_type": normalized.get("task_type"),
                 "instruction": normalized.get("instruction") or "",
                 "expected_output": normalized.get("expected_output") or "",
-                "target_files": sorted(normalized.get("target_files") or []),
+                "target_files": sorted(set(_target_files)),
                 "target_location": normalized.get("target_location") or "",
+                "tools": sorted(set(normalized.get("tools") or [])),
+                "max_steps": _max_steps,
             }
         # History keys must identify the actual file, not the spelling used by
         # the model.  ``foo.py`` and ``./foo.py`` (or a project-name prefix)
@@ -875,22 +901,30 @@ def _history_tool_call_key(name: str, args: dict) -> tuple | None:
 
 
 def _compact_heavy_tool_call(tc: dict) -> dict:
-    """Strip generated file content from an old tool call, preserving metadata."""
+    """Strip large replay-unsafe payloads from an old tool call."""
     name = tc.get("function", {}).get("name", "")
-    if name not in {"write", "multiedit", "apply_patch", "edit"}:
+    if name not in {
+        "write", "multiedit", "apply_patch", "edit", "todowrite",
+        "task", "delegate", "question",
+    }:
         return tc
     try:
         args = json.loads(tc["function"]["arguments"])
         changed = False
         placeholder = _HISTORY_COMPACTED_MARKER
-        for field in ("content", "patch", "new_str"):
+        for field in (
+            "content", "patch", "old_str", "new_str", "todos",
+            "description", "instruction", "expected_output", "question",
+        ):
             if field in args:
                 args[field] = placeholder
                 changed = True
         for edit_item in args.get("edits", []):
-            if "new_str" in edit_item:
-                edit_item["new_str"] = placeholder
-                changed = True
+            if isinstance(edit_item, dict):
+                for field in ("old_str", "new_str"):
+                    if field in edit_item:
+                        edit_item[field] = placeholder
+                        changed = True
         if changed:
             return {
                 **tc,
@@ -1725,8 +1759,10 @@ def tool_write(path, content, conn=None, sid=None):
             if created:
                 try:
                     p.unlink(missing_ok=True)
-                except Exception:
-                    pass
+                except Exception as rollback_error:
+                    raise RuntimeError(
+                        f"write failed ({write_error}); rollback failed: {rollback_error}"
+                    ) from write_error
             raise
         before = None  # write chỉ chạy tới đây khi file chưa từng tồn tại
         # Track the exact version so subsequent edits do not false-alarm
@@ -1740,10 +1776,17 @@ def tool_write(path, content, conn=None, sid=None):
                     conn, sid, str(p.resolve()), before, content,
                     before_mode=None, after_mode=p.stat().st_mode & 0o7777))
             except Exception as e:
-                p.unlink(missing_ok=True)
+                try:
+                    p.unlink(missing_ok=True)
+                    rollback_error = None
+                except Exception as rollback_exc:
+                    rollback_error = rollback_exc
                 _file_cache.pop(str(p.resolve()), None)
                 _forget_file_observation(p)
                 _recent_writes.discard(str(p.resolve()))
+                if rollback_error is not None:
+                    return (f"[error] snapshot failed ({e}); write rollback failed: "
+                            f"{rollback_error}")
                 return f"[error] snapshot failed; write rolled back: {e}"
             _redo_stack.clear()
         redirected = f" (redirected from {path})" if str(p.resolve()) != str(Path(path).expanduser().resolve()) else ""
@@ -1836,8 +1879,9 @@ def tool_delete(path, conn=None, sid=None):
                 (conn or _project_dir_conn).execute(
                     "DELETE FROM file_snapshot WHERE id=?", (snap["id"],))
                 (conn or _project_dir_conn).commit()
-            except Exception:
-                pass
+            except Exception as rollback_error:
+                return (f"[error deleting {path}: {e}; snapshot rollback failed: "
+                        f"{rollback_error}]")
         return f"[error deleting {path}: {e}]"
 
     _file_cache.pop(resolved, None)
@@ -2109,7 +2153,11 @@ def tool_edit(path, old_str, new_str, conn=None, sid=None):
                     before_mode=before_mode,
                     after_mode=p.stat().st_mode & 0o7777))
             except Exception as e:
-                _snapshot_restore(p, text, before_mode)
+                try:
+                    _snapshot_restore(p, text, before_mode)
+                except Exception as rollback_error:
+                    return (f"[error] snapshot failed ({e}); edit rollback failed: "
+                            f"{rollback_error}")
                 _cache_put(str(p), text, _active_session_id())
                 _record_file_observation(p, text)
                 _recent_writes.discard(str(p.resolve()))
@@ -2230,7 +2278,11 @@ def tool_multiedit(path, edits, conn=None, sid=None):
                     before_mode=before_mode,
                     after_mode=p.stat().st_mode & 0o7777))
             except Exception as e:
-                _snapshot_restore(p, before, before_mode)
+                try:
+                    _snapshot_restore(p, before, before_mode)
+                except Exception as rollback_error:
+                    return (f"[error] snapshot failed ({e}); multiedit rollback failed: "
+                            f"{rollback_error}")
                 _cache_put(str(p), before, _active_session_id())
                 _record_file_observation(p, before)
                 _recent_writes.discard(resolved)

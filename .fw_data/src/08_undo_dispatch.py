@@ -425,7 +425,12 @@ def _try_system_patch_in_memory(before: str, patch: str, parent: "Path"):
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
             f.write(before)
         result = subprocess.run(
-            ["patch", "--batch", "--forward", "--unified", str(tmp)],
+            # Never let GNU/BSD patch silently drop context lines (its
+            # default fuzzy matching can apply the wrong hunk to a nearby
+            # region). Offsets are acceptable, but every supplied context
+            # line must match exactly; otherwise the in-memory fallback also
+            # performs exact matching and the real file remains untouched.
+            ["patch", "--batch", "--forward", "--unified", "-F", "0", str(tmp)],
             input=patch, text=True, capture_output=True, timeout=30,
         )
         if result.returncode == 0:
@@ -497,7 +502,11 @@ def tool_apply_patch(path, patch, conn=None, sid=None):
                     before_mode=before_mode,
                     after_mode=p.stat().st_mode & 0o7777))
             except Exception as e:
-                _snapshot_restore(p, before, before_mode)
+                try:
+                    _snapshot_restore(p, before, before_mode)
+                except Exception as rollback_error:
+                    return (f"[error] snapshot failed ({e}); patch rollback failed: "
+                            f"{rollback_error}")
                 _cache_put(str(p), before, _active_session_id())
                 _record_file_observation(p, before)
                 _recent_writes.discard(str(p.resolve()))
@@ -563,6 +572,8 @@ def tool_task(description, tools=None, model=None, api_key=None, conn=None, sid=
     global _task_depth
     if not isinstance(description, str) or not description.strip():
         return "[task error: description must be a non-empty string]"
+    if _contains_compaction_marker(description):
+        return _COMPACTION_MARKER_ERROR
     description = description[:12000]
     # BUG FIX (nghiêm trọng — unbounded recursive subagent spawning):
     # `allowed.discard("task")` (fix cũ, giữ nguyên bên dưới) chỉ ẩn schema
@@ -787,6 +798,8 @@ def tool_delegate(task_type, instruction, expected_output, target_files=None,
         return "[delegate error: instruction must be a non-empty string]"
     if not isinstance(expected_output, str) or not expected_output.strip():
         return "[delegate error: expected_output must be a non-empty string]"
+    if _contains_compaction_marker(instruction, expected_output):
+        return _COMPACTION_MARKER_ERROR
     instruction, expected_output = instruction[:12000], expected_output[:6000]
     if _task_depth >= _TASK_MAX_DEPTH:
         return (f"[delegate denied: subagent nesting depth limit ({_TASK_MAX_DEPTH}) "
@@ -1338,7 +1351,9 @@ def _run_subagent_loop(sub_messages, sub_sys, allowed, model, api_key, conn, sid
 
     steps = 0
     final_text = ""
-    _sub_seen_calls = {}
+    _sub_seen_state = {}
+    _sub_seen_effect = {}
+    _sub_resource_epochs = {}
     _sub_epoch = 0
     while steps < max_steps:
         # Subagents do not pass through the main-loop pruning threshold. Keep
@@ -1445,13 +1460,13 @@ def _run_subagent_loop(sub_messages, sub_sys, allowed, model, api_key, conn, sid
                     out = f"[tool_error: invalid JSON arguments for '{name}': {e}]"
                     sub_messages.append({"role":"tool","tool_call_id":tc.get("id",""),"content":out})
                     continue
-                sig = _runtime_tool_call_signature(name, args)
-                if _dedup_should_block(name) and _sub_seen_calls.get(sig) == _sub_epoch:
+                sig, dedup_kind, duplicate = _dedup_lookup(
+                    _sub_seen_state, _sub_seen_effect, _sub_resource_epochs,
+                    name, args, _sub_epoch)
+                if duplicate:
                     out = f"[dedup] Skipped unchanged duplicate call: {name}"
                     sub_messages.append({"role":"tool","tool_call_id":tc.get("id",""),"content":out})
                     continue
-                if _dedup_should_block(name):
-                    _sub_seen_calls[sig] = _sub_epoch
                 _sub_line = f"  {BLUE}[{log_prefix}:{name}]{R} {DIM}{json.dumps(args)[:80]}{R}"
                 if state is not None:
                     state.emit(EV_INFO, text=_sub_line, raw=True)
@@ -1462,9 +1477,15 @@ def _run_subagent_loop(sub_messages, sub_sys, allowed, model, api_key, conn, sid
                 sub_messages.append({"role":"tool","tool_call_id":tc.get("id",""),
                                       "content": _head_tail(str(out_model), TOOL_OUTPUT_MAX_CHARS,
                                                             label=f"{log_prefix}:{name}")})
-                if (_tool_may_mutate_state(name, args)
-                        and not _tool_was_definitely_blocked(name, str(out_model))):
+                definitely_blocked = _tool_was_definitely_blocked(name, str(out_model))
+                if _tool_may_mutate_state(name, args) and not definitely_blocked:
                     _sub_epoch += 1
+                if dedup_kind == "effect" and not definitely_blocked:
+                    _dedup_bump_resources(_sub_resource_epochs, name, args)
+                if not definitely_blocked:
+                    _dedup_record(_sub_seen_state, _sub_seen_effect,
+                                  _sub_resource_epochs, sig, dedup_kind,
+                                  _sub_epoch, name, args)
         else:
             break
         steps += 1
@@ -1667,9 +1688,15 @@ _bash_allow_all: bool = False  # set True khi user chọn "a" = allow all bash
 
 _SENSITIVE_PATH_RE = re.compile(
     r"(?:^|[/\\])(?:\.env(?:\.[^/\\]*)?|"
+    r"\.npmrc|\.pypirc|\.netrc|kubeconfig|"
+    r"id_(?:rsa|dsa|ecdsa|ed25519)(?:\.pub)?|"
+    r"[^/\\]+\.(?:pem|key|p12|pfx)|"
     r"(?:[^/\\]*[._-])?(?:secrets?|credentials?|passwords?|tokens?|"
     r"private[_-]?keys?|auth|production|prod)(?:[._-][^/\\]*)?)(?:$|[/\\])|"
-    r"(?:^|[/\\])(?:\.github/workflows|\.gitlab-ci|migrations?|deploy|production)(?:[/\\]|$)", re.I)
+    r"(?:^|[/\\])(?:\.ssh|\.gnupg|\.aws|\.github/workflows|\.gitlab-ci|"
+    r"\.circleci|migrations?|"
+    r"deploy|production)(?:[/\\]|$)|"
+    r"(?:^|[/\\])azure-pipelines\.ya?ml(?:$|[/\\])", re.I)
 
 def _path_targets_sensitive(value) -> bool:
     """Check both the user spelling and canonical targets, including symlinks."""
@@ -1714,9 +1741,12 @@ def _tool_targets_sensitive(name, args) -> bool:
             return True
     return False
 
-def _check_permission(name, args, agent=None):
+def _check_permission(name, args, agent=None, state=None):
     """Returns True if tool is allowed. Handles ask/deny/allow + wildcard patterns."""
-    state = current_state()   # SessionState | None — xem 01d_events.py
+    # Prefer the explicitly-routed session. The thread-local remains a
+    # compatibility fallback, but direct/custom-command calls must not lose
+    # their session permissions merely because they run outside agent_turn().
+    state = state if state is not None else current_state()
     ag = agent or (getattr(state, "agent", None) if state is not None else _current_agent) or AGENT_BUILD
     # Session-local overrides avoid leaking permissions across tabs/sessions.
     perms = dict(DEFAULT_PERMS)
@@ -1724,11 +1754,10 @@ def _check_permission(name, args, agent=None):
     # Plan mode is a hard read-only floor: custom /perm rules cannot weaken it.
     if ag == AGENT_PLAN:
         perms.update(PLAN_PERMS)
-        # MCP tools are dynamic and their names are untrusted.  A verb such
-        # as ``save`` or ``insert`` can be missed by any heuristic, so Plan
-        # denies every remote tool unless its published schema explicitly
-        # carries the MCP readOnlyHint annotation.
-        if name.startswith("mcp__") and not mcp_tool_explicitly_readonly(name):
+        # MCP annotations are server-provided hints, not an enforceable
+        # read-only boundary. A hard read-only Plan mode therefore cannot run
+        # remote code, even when a server labels an operation readOnlyHint.
+        if name.startswith("mcp__"):
             perms[name] = PERM_DENY
     # Exact match first, then wildcard (e.g. "mymcp_*": "ask")
     level = perms.get(name)
@@ -1744,17 +1773,20 @@ def _check_permission(name, args, agent=None):
         # Giờ: thu thập TẤT CẢ pattern khớp, chọn pattern có phần literal (loại
         # bỏ ký tự "*") dài nhất — tức cụ thể nhất — bất kể thứ tự nhập.
         best_pattern = None
-        best_specificity = -1
+        best_rank = (-1, -999, -1)
+        strictness = {PERM_ALLOW: 0, PERM_ASK: 1, PERM_DENY: 2}
         for pattern, plevel in perms.items():
             if "*" in pattern and fnmatch.fnmatch(name, pattern):
                 specificity = len(pattern.replace("*", ""))
-                if specificity > best_specificity:
-                    best_specificity = specificity
+                rank = (specificity, -pattern.count("*"), strictness.get(plevel, 1))
+                if rank > best_rank:
+                    best_rank = rank
                     best_pattern = pattern
                     level = plevel
     if level is None:
         level = PERM_ASK
-    if _tool_targets_sensitive(name, args) and level == PERM_ALLOW:
+    sensitive = _tool_targets_sensitive(name, args)
+    if sensitive and level == PERM_ALLOW:
         # Safety policy is not weakened by /perm allow or bash allow-all.
         level = PERM_ASK
     if level == PERM_DENY:
@@ -1770,7 +1802,7 @@ def _check_permission(name, args, agent=None):
         # is None) giữ hành vi cũ dùng global module-level.
         allow_all = state.bash_allow_all if state is not None else _bash_allow_all
         exact_allow = name in (state.tool_allow_all if state is not None else set())
-        if ((allow_all and name == "bash") or exact_allow) and not _tool_targets_sensitive(name, args):
+        if ((allow_all and name == "bash") or exact_allow) and not sensitive:
             return True
 
         explanation = _explain_tool_action(name, args)
@@ -1801,6 +1833,17 @@ def _check_permission(name, args, agent=None):
                 ans = "n"
 
         if ans in ("a", "all"):
+            if sensitive:
+                # Sensitive actions intentionally cannot inherit a blanket
+                # grant. Be explicit instead of claiming a session-wide allow
+                # that the next call will (correctly) ignore.
+                if state is not None:
+                    state.emit(EV_INFO, text=(
+                        f"✓ Allowed sensitive '{name}' for this call only; "
+                        "future sensitive calls will ask again."))
+                else:
+                    print(f"  {GREEN}✓ Allowed for this sensitive call only.{R}")
+                return True
             if name == "bash":
                 if state is not None:
                     state.bash_allow_all = True
@@ -1832,14 +1875,14 @@ def _dispatch_tool(name, args, model, api_key, conn, sid, state=None):
         # B3 FIX: trước đây return ngay tại đây, bỏ qua _check_permission()
         # hoàn toàn — /perm mcp__server_* deny/ask không có tác dụng gì dù
         # docstring _check_permission đã nói rõ hỗ trợ wildcard cho ca này.
-        if not _check_permission(name, args):
+        if not _check_permission(name, args, state=state):
             return f"[permission denied: {name}]"
         result = mcp_call_tool(name, args)
         return result
     # /codeweb: KHÔNG còn tool riêng nào cho agent này — đã bỏ "preview_check"
     # (xem 13_codeweb.py). Auto-preview ngầm (codeweb_maybe_auto_preview) vẫn
     # hoạt động độc lập, hook ở run_tool() bên dưới, không qua dispatch này.
-    if not _check_permission(name, args):
+    if not _check_permission(name, args, state=state):
         return f"[permission denied: {name}]"
     dispatch = {
         "bash":        lambda a: tool_bash(a["command"], a.get("timeout",30)),
@@ -1946,10 +1989,7 @@ def run_tool(name, args, model, api_key, conn, sid, state=None):
     # write/edit/multiedit/apply_patch — chuẩn hoá về args={"path": dst}
     # trước khi gọi, để codeweb_maybe_auto_preview không cần biết gì về sự
     # khác biệt tên field giữa các tool.
-    success = not str(result).lstrip().lower().startswith((
-        "[error", "[not found", "[permission", "[policy", "[tool_error",
-        "[sandbox", "[mcp_error", "[unknown tool",
-    ))
+    success = not _tool_result_is_failure(str(result))
     if success and name in ("write", "edit", "multiedit", "apply_patch", "extract"):
         try:
             _cw_args = args
