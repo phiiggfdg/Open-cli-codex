@@ -587,10 +587,11 @@ def _run_bounded_capture(argv, timeout: int, cwd=None, limit: int = 2 * 1024 * 1
 def tool_bash(command, timeout=30):
     if not isinstance(command, str):
         return "[error: command must be a string]"
-    try:
-        timeout = max(1, min(int(timeout), 3600))
-    except (TypeError, ValueError):
+    if timeout is None:
         timeout = 30
+    elif isinstance(timeout, bool) or not isinstance(timeout, int):
+        return "[error: timeout must be an integer]"
+    timeout = max(1, min(timeout, 3600))
     # Fast deny catches obviously dangerous text for both normal and serve mode;
     # the structured validator below enforces the complete command policy.
     if _BASH_DENY_RE.search(command):
@@ -1901,9 +1902,8 @@ def tool_extract(src, start, end, dst, mode="move", conn=None, sid=None):
         return "[error: src and dst must be strings]"
     if mode not in ("move", "copy"):
         return "[error: mode must be 'move' or 'copy']"
-    try:
-        start, end = int(start), int(end)
-    except (TypeError, ValueError):
+    if (isinstance(start, bool) or not isinstance(start, int)
+            or isinstance(end, bool) or not isinstance(end, int)):
         return "[error: start/end must be integers]"
     sp = _resolve_read_path(src)
     err = _check_sandbox_read(str(sp))

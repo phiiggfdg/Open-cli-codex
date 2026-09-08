@@ -313,10 +313,11 @@ def _session_cost_str() -> str:
 TOOLS = [
   {"type":"function","function":{
     "name":"bash",
-    "description":"Run one allowlisted shell command for inspect/build/test/git/install. No chaining, pipe, redirect, shell expansion, or inline eval; use file tools for mutations. Output includes exit_code, stderr, error_class, retry_hint.",
+    "description":"Run one allowlisted shell command for inspect/build/test/git/install. No chaining, pipe, redirect, shell expansion, or inline eval; use file tools for mutations. Executed commands include exit_code, stderr, error_class, retry_hint; policy-blocked commands return a policy error.",
     "parameters":{"type":"object","properties":{
       "command":{"type":"string"},
-      "timeout":{"type":"integer","description":"Seconds (default 30)"}
+      "timeout":{"type":"integer","minimum":1,"maximum":3600,"default":30,
+                  "description":"Seconds (default 30; range 1-3600)"}
     },"required":["command"]}
   }},
   {"type":"function","function":{
@@ -324,9 +325,9 @@ TOOLS = [
     "description":"Read file with line numbers or list directory as tree. Output includes an auto-generated Anchor map (functions/classes/CSS rules/headings near your offset) — check it first before grepping again. Prefer a small offset+limit over whole-file reads on large files; see system prompt Discovery policy for the full search order.",
     "parameters":{"type":"object","properties":{
       "path":  {"type":"string"},
-      "offset":{"type":"integer","minimum":1,"description":"Start line 1-indexed (files only)"},
-      "limit": {"type":"integer","minimum":1,"maximum":700,"description":"Max lines to read. Always pass explicitly. Hard cap 700 — use grep/view_symbol to narrow down instead of raising this."},
-      "depth": {"type":"integer","minimum":0,"maximum":20,"description":"Max tree depth for directories (default 4)"}
+      "offset":{"type":"integer","minimum":1,"default":1,"description":"Start line 1-indexed (files only)"},
+      "limit": {"type":"integer","minimum":1,"maximum":700,"default":80,"description":"Max lines to read (default 80). Hard cap 700 — use grep/view_symbol to narrow down instead of raising this."},
+      "depth": {"type":"integer","minimum":0,"maximum":20,"default":4,"description":"Max tree depth for directories (default 4)"}
     },"required":["path"]}
   }},
   {"type":"function","function":{
@@ -346,13 +347,13 @@ TOOLS = [
   }},
   {"type":"function","function":{
     "name":"extract",
-    "description":"Move or copy a LINE RANGE from one file into another file (appends if dst exists, creates if not) WITHOUT retyping content — use this when splitting/refactoring code into modules. mode='move' (default) removes the range from src after copying; mode='copy' keeps src unchanged. ALWAYS prefer this over read+write when relocating existing code blocks.",
+    "description":"Move or copy a LINE RANGE from one file into another file (appends if dst exists, creates if not) WITHOUT retyping content — use this when splitting/refactoring code into modules. mode='move' (default) removes the range from src after copying; mode='copy' keeps src unchanged. Normal failures roll back the compound operation; if rollback itself fails, the result explicitly says 'rollback failed' and both files must be verified before retrying. ALWAYS prefer this over read+write when relocating existing code blocks.",
     "parameters":{"type":"object","properties":{
       "src":  {"type":"string","description":"Source file path"},
-      "start":{"type":"integer","description":"First line to extract (1-indexed, inclusive)"},
-      "end":  {"type":"integer","description":"Last line to extract (1-indexed, inclusive)"},
+      "start":{"type":"integer","minimum":1,"description":"First line to extract (1-indexed, inclusive)"},
+      "end":  {"type":"integer","minimum":1,"description":"Last line to extract (1-indexed, inclusive)"},
       "dst":  {"type":"string","description":"Destination file path"},
-      "mode": {"type":"string","enum":["move","copy"],"description":"Default 'move' (remove from src). Use 'copy' to keep src unchanged."}
+      "mode": {"type":"string","enum":["move","copy"],"default":"move","description":"Default 'move' (remove from src). Use 'copy' to keep src unchanged."}
     },"required":["src","start","end","dst"]}
   }},
   {"type":"function","function":{
@@ -366,7 +367,7 @@ TOOLS = [
   }},
   {"type":"function","function":{
     "name":"multiedit",
-    "description":"Multiple targeted replacements in one file, one call. Use when changing 2-5 known locations. Each old_str must be unique. Applied atomically: edits run in order against the file state as it stands after the previous edits in this call, and if ANY edit fails, NONE of them are written - the file is left completely unchanged and you must fix the failing edit and retry the whole call.",
+    "description":"Multiple targeted replacements in one file, one call. Use when changing 2-5 known locations. Each old_str must be unique. Normal failures are atomic: edits run in order against the file state as it stands after the previous edits in this call, and if ANY edit fails, NONE are written. If rollback itself fails, the result explicitly says 'rollback failed' and the file must be verified before retrying.",
     "parameters":{"type":"object","properties":{
       "path":  {"type":"string"},
       "edits": {"type":"array","description":"List of edits to apply in order","items":{
@@ -379,7 +380,7 @@ TOOLS = [
   }},
   {"type":"function","function":{
     "name":"apply_patch",
-    "description":"Atomic patching for a substantial or structural change in one existing file. Prefer edit for one exact replacement and multiedit for 2-5 independent exact replacements. Supports multiple unified-diff hunks and the common *** Begin Patch / *** Update File wrapper; every hunk must target the same path. On any failure the file remains unchanged.",
+    "description":"Atomic patching for a substantial or structural change in one existing file. Prefer edit for one exact replacement and multiedit for 2-5 independent exact replacements. Supports multiple unified-diff hunks and the common *** Begin Patch / *** Update File wrapper; every hunk must target the same path. Normal failures leave the file unchanged; if rollback itself fails, the result explicitly says 'rollback failed' and the file must be verified before retrying.",
     "parameters":{"type":"object","properties":{
       "path": {"type":"string","description":"File to patch"},
       "patch":{"type":"string","description":"Unified diff with numbered @@ hunks, or the common bare-@@ form inside a single *** Begin Patch / *** Update File wrapper. Include 2-3 unchanged context lines around each change when possible. File headers (---/+++) are optional."}
@@ -389,7 +390,7 @@ TOOLS = [
     "name":"glob",
     "description":"Find files by glob pattern e.g. '**/*.py'. Returns paths relative to cwd.",
     "parameters":{"type":"object","properties":{
-      "pattern":{"type":"string"},
+      "pattern":{"type":"string","maxLength":4096},
       "cwd":    {"type":"string","description":"Search root (default: current directory)"}
     },"required":["pattern"]}
   }},
@@ -397,15 +398,15 @@ TOOLS = [
     "name":"grep",
     "description":"Search regex in files. Returns file:line:content. Extended regex syntax (\\d, \\w, (a|b), {2,4}, + ?) all supported.",
     "parameters":{"type":"object","properties":{
-      "pattern":     {"type":"string","description":"Regex pattern (or literal string if fixed_string=true)"},
+      "pattern":     {"type":"string","maxLength":4096,"description":"Regex pattern (or literal string if fixed_string=true)"},
       "path":        {"type":"string","description":"File or directory (default: cwd)"},
-      "glob":        {"type":"string","description":"Only files matching this glob e.g. '*.py'"},
+      "glob":        {"type":"string","maxLength":4096,"description":"Only files matching this glob e.g. '*.py'"},
       "ignore_case": {"type":"boolean","description":"Case-insensitive match (like -i)"},
       "fixed_string":{"type":"boolean","description":"Treat pattern as literal text, not regex (like -F). Use when pattern has unescaped ., (, [, + etc. that should match literally."},
       "invert":      {"type":"boolean","description":"Return lines that do NOT match (like -v)"},
       "word":        {"type":"boolean","description":"Match whole words only (like -w), avoids matching inside longer identifiers"},
-      "context":     {"type":"integer","description":"Include N lines of context before/after each match (like -C N)"},
-      "max_count":   {"type":"integer","description":"Stop after N matches per file (like -m N), use for broad/common patterns to avoid huge output"},
+      "context":     {"type":"integer","minimum":0,"default":0,"description":"Include N lines of context before/after each match (like -C N)"},
+      "max_count":   {"type":"integer","minimum":1,"description":"Stop after N matches per file (like -m N), use for broad/common patterns to avoid huge output"},
       "files_only":  {"type":"boolean","description":"Only list file paths that contain a match, not the matching lines (like -l)"},
       "multiline":   {"type":"boolean","description":"Let pattern span multiple lines, e.g. to match a whole block like 'class Foo {...}'. Slower, use only when a single-line grep can't express the match."}
     },"required":["pattern"]}
@@ -414,25 +415,25 @@ TOOLS = [
     "name":"webfetch",
     "description":"Fetch text content of a URL.",
     "parameters":{"type":"object","properties":{
-      "url":{"type":"string"}
+      "url":{"type":"string","maxLength":4096}
     },"required":["url"]}
   }},
   {"type":"function","function":{
     "name":"websearch",
     "description":"Search the web for current info, docs, or errors.",
     "parameters":{"type":"object","properties":{
-      "query":{"type":"string","description":"Search query"},
-      "num":  {"type":"integer","description":"Number of results (default 5)"}
+      "query":{"type":"string","maxLength":4096,"description":"Search query"},
+      "num":  {"type":"integer","minimum":1,"maximum":20,"default":5,"description":"Number of results (default 5; range 1-20)"}
     },"required":["query"]}
   }},
   {"type":"function","function":{
     "name":"todowrite",
     "description":"Replace the current todo list with a new one. See system prompt Task management policy for when and how often to call this.",
     "parameters":{"type":"object","properties":{
-      "todos":{"type":"array","description":"Full list of todos (replaces existing)","items":{
+      "todos":{"type":"array","maxItems":100,"description":"Full list of todos (replaces existing; max 100 items)","items":{
         "type":"object","properties":{
-          "id":      {"type":"string","description":"Short unique id e.g. '1','2a'"},
-          "content": {"type":"string","description":"Task description"},
+          "id":      {"type":"string","maxLength":128,"description":"Short unique id e.g. '1','2a'"},
+          "content": {"type":"string","maxLength":2000,"description":"Task description"},
           "status":  {"type":"string","enum":["pending","in_progress","completed"]},
           "priority":{"type":"string","enum":["high","medium","low"]}
         },"required":["id","content","status","priority"]
@@ -448,8 +449,8 @@ TOOLS = [
     "name":"question",
     "description":"Ask user a clarifying question. Provide options when answer is a fixed set. ALWAYS write the question and options in Vietnamese.",
     "parameters":{"type":"object","properties":{
-      "question":{"type":"string","description":"The question to ask the user"},
-      "options": {"type":"array","items":{"type":"string"},"description":"Optional list of choices for the user to pick from"}
+      "question":{"type":"string","maxLength":4000,"description":"The question to ask the user"},
+      "options": {"type":"array","maxItems":20,"items":{"type":"string","maxLength":300},"description":"Optional list of choices for the user to pick from (max 20)"}
     },"required":["question"]}
   }},
 
@@ -457,10 +458,10 @@ TOOLS = [
     "name":"task",
     "description":"Spawn subagent for open-ended search or analysis whose scope isn't fully known yet — use once you expect several rounds of searching/reading before you'd have enough to act. Do NOT use for something resolvable in your next tool call or two — do that directly. Defaults to 20 internal steps if you don't set max_steps — scope the work to fit, or expect a partial (Gaps) result.",
     "parameters":{"type":"object","properties":{
-      "description":{"type":"string","description":"What the subagent should do. The subagent has NO memory of this conversation and cannot ask you or the user anything back — state every fact, constraint, and goal it needs up front. For open-ended exploration, describe the exploration goal and what would count as a satisfying answer, not just a single narrow question."},
+      "description":{"type":"string","maxLength":12000,"description":"What the subagent should do. The subagent has NO memory of this conversation and cannot ask you or the user anything back — state every fact, constraint, and goal it needs up front. For open-ended exploration, describe the exploration goal and what would count as a satisfying answer, not just a single narrow question."},
       "tools":      {"type":"array","items":{"type":"string"},
                      "description":"Extra tools to add ON TOP of the subagent's always-available default (bash, read, write, edit, multiedit, apply_patch, glob, grep, webfetch, websearch, todoread) — this list adds to that default, it does not replace or restrict it; there is no way to give the subagent fewer than the default tools. task, delegate, and question are never available to it no matter what you pass here (recursion and asking back are both blocked)."},
-      "max_steps":  {"type":"integer","minimum":1,"maximum":50,
+      "max_steps":  {"type":"integer","minimum":1,"maximum":50,"default":20,
                      "description":"Optional. How many internal tool-call steps the subagent gets before it's forced to stop and answer with what it has. Default 20 if omitted. Use fewer (e.g. 5-10) for a quick, narrow lookup; use more (up to 50) for a genuinely large exploration you don't want cut short. Whatever the budget, running out never produces silence — the subagent is always forced to output a structured partial answer instead of nothing."}
     },"required":["description"]}
   }},
@@ -468,7 +469,7 @@ TOOLS = [
     "name":"skill",
     "description":"Load an existing skill file (SKILL.md) by name. Read-only — never attempt to create or write skill files. Use for domain-specific guidance.",
     "parameters":{"type":"object","properties":{
-      "name":{"type":"string","description":"Skill name or path from the injected available-skill list, e.g. 'testing', 'debugging', 'design'"}
+      "name":{"type":"string","maxLength":256,"description":"Skill name or path from the injected available-skill list, e.g. 'testing', 'debugging', 'design'"}
     },"required":["name"]}
   }},
   {"type":"function","function":{
@@ -477,15 +478,15 @@ TOOLS = [
     "parameters":{"type":"object","properties":{
       "task_type":{"type":"string","enum":["web_search","fix_bug","edit_code","find_bug","find_code","read_summarize","other"],
                    "description":"What kind of work this is — shapes the helper's instructions and expected result shape."},
-      "instruction":{"type":"string","description":"Full, self-contained request. The helper does NOT see this conversation's history — write every needed fact directly, never 'as discussed above'."},
+      "instruction":{"type":"string","maxLength":12000,"description":"Full, self-contained request. The helper does NOT see this conversation's history — write every needed fact directly, never 'as discussed above'."},
       "target_files":{"type":"array","items":{"type":"string"},
                       "description":"Relevant file/dir paths, if known."},
       "target_location":{"type":"string",
                       "description":"Known location if any — 'file.py lines 40-60', 'function foo()', 'class Bar'. Saves the helper from re-searching."},
-      "expected_output":{"type":"string","description":"What YOU need back — e.g. 'just the diff', 'bug location + cause, do NOT fix', '3 web sources with links', 'the edited file contents'. Required — this is what keeps the helper's answer short and on-target instead of rambling."},
+      "expected_output":{"type":"string","maxLength":6000,"description":"What YOU need back — e.g. 'just the diff', 'bug location + cause, do NOT fix', '3 web sources with links', 'the edited file contents'. Required — this is what keeps the helper's answer short and on-target instead of rambling."},
       "tools":{"type":"array","items":{"type":"string"},
                "description":"Extra tools to add ON TOP of the helper's always-available default (bash, read, write, edit, multiedit, apply_patch, glob, grep, webfetch, websearch, todoread) — this list adds to that default, it does not replace or restrict it; there is no way to give the helper fewer than the default tools. task, delegate, and question are never available to it no matter what you pass here (recursion and asking back are both blocked)."},
-      "max_steps":{"type":"integer","minimum":1,"maximum":50,
+      "max_steps":{"type":"integer","minimum":1,"maximum":50,"default":20,
                "description":"Optional. How many internal tool-call steps the helper gets before it's forced to stop and answer with what it has. Default 20 if omitted. Use fewer (e.g. 5-10) for a quick, narrow lookup; use more (up to 50) for a task you know needs a lot of back-and-forth. Whatever the budget, running out never produces silence — the helper is always forced to output a structured partial answer instead of nothing."}
     },"required":["task_type","instruction","expected_output"]}
   }},
@@ -495,9 +496,9 @@ TOOLS = [
     "parameters":{"type":"object","properties":{
       "operation":{"type":"string","enum":["documentSymbol","hover","definition","references","workspace_symbol"]},
       "file":     {"type":"string","description":"File path (required for all except workspace_symbol)"},
-      "line":     {"type":"integer","description":"1-indexed line number (for hover/definition/references)"},
-      "character":{"type":"integer","description":"0-indexed character offset (for hover/definition)"},
-      "query":    {"type":"string","description":"Symbol name (for definition/references/workspace_symbol)"}
+      "line":     {"type":"integer","minimum":1,"default":1,"description":"1-indexed line number (for hover/definition/references)"},
+      "character":{"type":"integer","minimum":0,"default":0,"description":"0-indexed character offset (for hover/definition)"},
+      "query":    {"type":"string","maxLength":512,"description":"Symbol name (for definition/references/workspace_symbol)"}
     },"required":["operation"]}
   }},
   {"type":"function","function":{
@@ -517,8 +518,8 @@ TOOLS = [
     "name":"verify",
     "description":"Ask the user to inspect a file/UI/output and describe the real observed result. Never read source and claim that proves visual/runtime success; use bash for automated tests.",
     "parameters":{"type":"object","properties":{
-      "path":   {"type":"string","description":"File or directory path to verify"},
-      "reason": {"type":"string","description":"Why you want to verify (optional)"}
+      "path":   {"type":"string","maxLength":4096,"description":"File or directory path to verify"},
+      "reason": {"type":"string","maxLength":2000,"description":"Why you want to verify (optional)"}
     },"required":["path"]}
   }},
 

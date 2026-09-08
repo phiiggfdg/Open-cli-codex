@@ -221,14 +221,17 @@ def tool_grep(pattern, path=None, glob=None, ignore_case=False, fixed_string=Fal
         return "[policy] grep pattern exceeds 4096 characters"
     if glob is not None and (not isinstance(glob, str) or len(glob) > 4096):
         return "[error: grep glob must be a string of at most 4096 characters]"
-    try:
-        context = max(0, int(context or 0))
-    except (TypeError, ValueError):
+    if context is None:
+        context = 0
+    elif isinstance(context, bool) or not isinstance(context, int):
         return "[error: grep context must be an integer]"
-    try:
-        max_count = None if max_count in (None, "") else max(1, int(max_count))
-    except (TypeError, ValueError):
+    context = max(0, context)
+    if max_count in (None, ""):
+        max_count = None
+    elif isinstance(max_count, bool) or not isinstance(max_count, int):
         return "[error: grep max_count must be an integer]"
+    else:
+        max_count = max(1, max_count)
     if path:
         base_p = _resolve_read_path(path)
     elif _project_dir is not None:
@@ -743,10 +746,10 @@ def tool_websearch(query, num=5):
     # việc model truyền số quá lớn khiến vòng lặp regex quét toàn bộ HTML dài
     # không cần thiết. Toàn bộ 6 chỗ dùng `int(num)` bên dưới đổi sang dùng
     # biến `num` đã chuẩn hóa này (nay là `len(results) >= num`).
-    try:
-        num = int(num)
-    except (TypeError, ValueError):
+    if num is None:
         num = 5
+    elif isinstance(num, bool) or not isinstance(num, int):
+        return "[error: websearch num must be an integer]"
     num = max(1, min(num, 20))
 
     # ── Nhánh 1: SearXNG public instances — scrape HTML ──────────────────────
@@ -1276,11 +1279,18 @@ def tool_lsp(operation, file=None, line=None, character=None, query=None):
         return "[lsp] file must be a string"
     if query is not None and not isinstance(query, str):
         return "[lsp] query must be a string"
-    try:
-        line = max(1, int(line or 1))
-        character = max(0, int(character or 0))
-    except (TypeError, ValueError):
+    if line is None:
+        line = 1
+    elif isinstance(line, bool) or not isinstance(line, int):
         return "[lsp] line and character must be integers"
+    else:
+        line = max(1, line)
+    if character is None:
+        character = 0
+    elif isinstance(character, bool) or not isinstance(character, int):
+        return "[lsp] line and character must be integers"
+    else:
+        character = max(0, character)
     if query is not None and len(query) > 512:
         return "[policy] lsp query exceeds 512 characters"
 

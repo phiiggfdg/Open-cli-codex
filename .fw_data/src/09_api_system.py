@@ -2879,7 +2879,7 @@ After modifying code, MUST verify the change before claiming completion (load `s
 - `delegate`: hand off a self-contained, well-scoped unit (search, fix/edit at a known location, find-bug, find-code, summarize) to a helper with its own model, chosen once via `/delegate-model`. Use it once you can already state the target and the expected result — that's what `task_type`/`expected_output` require up front. Do NOT use it for architecture decisions, work that still needs the user clarified first, or anything whose scope you're still discovering — those go to `task` or direct work instead. See `skill(name="multi-agent")`.
 - `task`/`delegate` shared traits: both get full edit power (edit/multiedit/apply_patch, not just single replacements) and always see their actual tool list, so either can handle multi-file changes on its own. Both default to a 20-internal-step budget — override per-call with `max_steps` (1-50) if you know the work is unusually small or unusually large; too low forces a premature partial result, too high just wastes steps it won't need. If a run finishes normally, the result starts with `[task]`/`[delegate:<type>]`. If it runs out of budget before finishing, it is ALWAYS forced to answer instead of returning nothing — you get a structured report ending in a numbered **Gaps** section naming exactly what it did not get to check. A result with a Gaps section is NOT a completed result — treat it as partial. Do not summarize it to the user as done. Pick one: finish the named gaps yourself directly, re-spawn `task`/`delegate` scoped ONLY to what the Gaps section lists (raise `max_steps` if the gap was itself caused by running out of budget), or — if the gap changes what you'd recommend — surface it via `question` instead of guessing. Never silently drop a stated gap.
 - `lsp`: local code intelligence and references.
-- `verify`: visually confirm output after edits.
+- `verify`: ask the user to visually confirm output after edits; the tool cannot see the UI itself.
 - `skill`: load specialized SKILL.md by name (see project rules for triggers and composition/precedence; do not batch-load skills up front—load them sequentially when the task reaches each stage).
 - `bash`: 1 command per call. No chaining (`;`, `&&`, `||`, pipe, redirect, subshell, `$`, multiline). Do not call executables by path; explicit paths must stay inside project.
   - Allowed inspect/status: `pwd`, `ls` (non-recursive), `rg`, `grep`, `wc`, `file`, `stat`, `tree`, `which`, `basename`, `dirname`, `date`, `uname`, `whoami`, `echo`, `printf`.
@@ -2912,7 +2912,7 @@ def build_mode_hint(agent=AGENT_BUILD, state=None) -> str:
     if agent == AGENT_PLAN:
         parts.append(
             "\n\n[Mode: plan/read-only] KHÔNG write, delete, extract, edit, multiedit, "
-            "apply_patch, Bash, hoặc MCP mutation. "
+            "apply_patch, Bash, hoặc bất kỳ MCP tool nào. "
             "Chỉ đọc, phân tích, và đề xuất. Bash bị từ chối ở mode này; "
             "dùng read/glob/grep hoặc chuyển sang build mode nếu thật sự cần chạy lệnh."
         )
