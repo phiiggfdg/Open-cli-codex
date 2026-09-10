@@ -517,6 +517,12 @@ _WEBFETCH_STRIP_TAGS = (
 _WEBFETCH_MAIN_TAGS = ("main", "article")
 
 _WEB_RESPONSE_LIMIT = 5 * 1024 * 1024
+_WEB_TEXT_OUTPUT_LIMIT = 10_000
+_WEB_TEXTUAL_APPLICATION_TYPES = {
+    "application/javascript", "application/x-javascript", "application/ecmascript",
+    "application/graphql", "application/sql", "application/toml",
+    "application/x-yaml", "application/yaml",
+}
 
 def _read_http_limited(resp, limit=_WEB_RESPONSE_LIMIT) -> bytes:
     chunks, total = [], 0
@@ -529,7 +535,13 @@ def _read_http_limited(resp, limit=_WEB_RESPONSE_LIMIT) -> bytes:
         if total > limit:
             raise RuntimeError(f"HTTP response exceeds {limit:,} bytes")
 
-def _validate_public_http_url(url: str) -> None:
+def _validate_public_http_url(url: str) -> tuple[str, str]:
+    """Validate an HTTP URL and return the hostname plus one pinned IP.
+
+    The returned IP must be used for the subsequent connection.  Resolving a
+    hostname here and then letting urllib resolve it again leaves a DNS-rebind
+    window between the policy check and the network connection.
+    """
     if not isinstance(url, str) or not url.strip():
         raise ValueError("URL must be a non-empty string")
     if len(url) > 4096:
@@ -543,10 +555,189 @@ def _validate_public_http_url(url: str) -> None:
         infos = socket.getaddrinfo(parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80))
     except socket.gaierror as e:
         raise ValueError(f"cannot resolve host: {e}") from e
+    resolved_ips = []
     for info in infos:
         ip = ipaddress.ip_address(info[4][0].split("%", 1)[0])
         if not ip.is_global:
             raise ValueError(f"private/local address is blocked: {ip}")
+        resolved_ips.append(str(ip))
+    if not resolved_ips:  # defensive: getaddrinfo normally never returns this
+        raise ValueError("host did not resolve to an address")
+    return parsed.hostname, resolved_ips[0]
+
+
+def _open_pinned_no_redirect(url, tls_hostname, pinned_ip, headers, cookiejar=None,
+                             timeout=15):
+    """Open one checked URL directly, without proxy or automatic redirects."""
+    import http.client
+
+    class _PinnedHTTPConnection(http.client.HTTPConnection):
+        def __init__(self, host, *, pinned_ip, **kwargs):
+            self._pinned_ip = pinned_ip
+            super().__init__(host, **kwargs)
+
+        def connect(self):
+            self.sock = socket.create_connection(
+                (self._pinned_ip, self.port), self.timeout, self.source_address)
+            if self._tunnel_host:
+                self._tunnel()
+
+    class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+        def __init__(self, host, *, pinned_ip, tls_hostname, **kwargs):
+            self._pinned_ip = pinned_ip
+            self._tls_hostname = tls_hostname
+            super().__init__(host, **kwargs)
+
+        def connect(self):
+            self.sock = socket.create_connection(
+                (self._pinned_ip, self.port), self.timeout, self.source_address)
+            if self._tunnel_host:
+                self._tunnel()
+            self.sock = self._context.wrap_socket(
+                self.sock, server_hostname=self._tls_hostname)
+
+    class _PinnedHTTPHandler(urllib.request.HTTPHandler):
+        def http_open(self, req):
+            return self.do_open(
+                lambda host, **kw: _PinnedHTTPConnection(host, pinned_ip=pinned_ip, **kw), req)
+
+    class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+        def https_open(self, req):
+            return self.do_open(
+                lambda host, **kw: _PinnedHTTPSConnection(
+                    host, pinned_ip=pinned_ip, tls_hostname=tls_hostname, **kw), req,
+                context=self._context)
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args, **kwargs):
+            return None
+
+    handlers = [urllib.request.ProxyHandler({})]
+    if cookiejar is not None:
+        handlers.append(urllib.request.HTTPCookieProcessor(cookiejar))
+    handlers.extend([_PinnedHTTPHandler(), _PinnedHTTPSHandler(), _NoRedirect()])
+    opener = urllib.request.build_opener(*handlers)
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        resp = opener.open(req, timeout=timeout)
+        return resp.status, resp, resp.headers, None
+    except urllib.error.HTTPError as e:
+        return e.code, None, e.headers, e
+
+
+def _webfetch_content_type(value: str | None) -> tuple[str, str | None]:
+    """Return normalized MIME type and optional declared charset."""
+    raw = value or ""
+    mime = raw.split(";", 1)[0].strip().lower()
+    match = re.search(r"(?:^|;)\s*charset\s*=\s*(?:\"([^\"]+)\"|'([^']+)'|([^;\s]+))",
+                      raw, flags=re.IGNORECASE)
+    charset = next((part for part in match.groups() if part), None) if match else None
+    return mime, charset
+
+
+def _webfetch_binary_metadata(mime: str, size: int, url: str) -> str:
+    label = mime or "unknown"
+    return (f"[binary response: content-type '{label}'; size {size:,} bytes; "
+            f"URL: {url}. Binary content is not decoded.]")
+
+
+def _webfetch_decode_text(raw: bytes, charset: str | None) -> tuple[str | None, str | None]:
+    """Decode declared text without turning binary bytes into replacement-char noise."""
+    if b"\x00" in raw:
+        return None, None
+    encoding = charset or "utf-8"
+    try:
+        text = raw.decode(encoding)
+    except LookupError:
+        return None, f"unsupported charset '{encoding}'"
+    except UnicodeDecodeError:
+        return None, None
+    # C0 controls other than ordinary whitespace are a strong binary signal.
+    controls = sum(1 for ch in text if ord(ch) < 32 and ch not in "\n\r\t")
+    if controls > max(8, len(text) // 100):
+        return None, None
+    return text, None
+
+
+def _webfetch_truncate_text(text: str) -> str:
+    if len(text) <= _WEB_TEXT_OUTPUT_LIMIT:
+        return text
+    remaining = len(text) - _WEB_TEXT_OUTPUT_LIMIT
+    return text[:_WEB_TEXT_OUTPUT_LIMIT] + f"\n\n... [truncated, {remaining:,} more chars]"
+
+
+def _webfetch_json_result(text: str, mime: str, size: int) -> str:
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError as e:
+        return f"[error: invalid JSON response for content-type '{mime}': {e.msg}]"
+    formatted = json.dumps(value, indent=2, ensure_ascii=False)
+    if len(formatted) <= _WEB_TEXT_OUTPUT_LIMIT:
+        return formatted
+    if isinstance(value, dict):
+        shape = {"type": "object", "keys": list(value)[:50], "key_count": len(value)}
+    elif isinstance(value, list):
+        shape = {"type": "array", "item_count": len(value)}
+    else:
+        shape = {"type": type(value).__name__}
+    return json.dumps({
+        "_webfetch": {
+            "truncated": True,
+            "content_type": mime,
+            "response_bytes": size,
+            "formatted_chars": len(formatted),
+        },
+        "shape": shape,
+    }, indent=2, ensure_ascii=False)
+
+
+def _webfetch_html_to_markdown(raw: str) -> str:
+    # Remove non-content regions before selecting the article/main region.
+    for tag in ("title",) + _WEBFETCH_STRIP_TAGS:
+        raw = re.sub(rf"<{tag}\b[^>]*>.*?</{tag}>", " ", raw,
+                     flags=re.DOTALL | re.IGNORECASE)
+    for tag in _WEBFETCH_MAIN_TAGS:
+        match = re.search(rf"<{tag}\b[^>]*>(.*?)</{tag}>", raw,
+                          flags=re.DOTALL | re.IGNORECASE)
+        if match and len(match.group(1)) > 200:
+            raw = match.group(1)
+            break
+    raw = re.sub(r"<h1\b[^>]*>(.*?)</h1>", r"\n\n# \1\n", raw, flags=re.DOTALL | re.IGNORECASE)
+    raw = re.sub(r"<h2\b[^>]*>(.*?)</h2>", r"\n\n## \1\n", raw, flags=re.DOTALL | re.IGNORECASE)
+    raw = re.sub(r"<h3\b[^>]*>(.*?)</h3>", r"\n\n### \1\n", raw, flags=re.DOTALL | re.IGNORECASE)
+    raw = re.sub(r"<li\b[^>]*>(.*?)</li>", r"\n- \1", raw, flags=re.DOTALL | re.IGNORECASE)
+    raw = re.sub(r"</p>|<br\s*/?>", "\n", raw, flags=re.IGNORECASE)
+    raw = _html.unescape(re.sub(r"<[^>]+>", " ", raw))
+    raw = re.sub(r"[ \t]+", " ", raw)
+    raw = re.sub(r"\n\s*\n\s*\n+", "\n\n", raw)
+    return raw.strip()
+
+
+def _webfetch_format_response(raw: bytes, content_type: str, url: str) -> str:
+    """Format HTTP data by MIME type; never decode an untrusted binary as text."""
+    mime, charset = _webfetch_content_type(content_type)
+    is_json = mime == "application/json" or mime.endswith("+json") or mime == "text/json"
+    is_html = mime in {"text/html", "application/xhtml+xml"}
+    is_xml = mime in {"text/xml", "application/xml"} or mime.endswith("+xml")
+    is_markdown = mime in {"text/markdown", "text/x-markdown", "application/markdown"}
+    is_text = mime.startswith("text/") or mime in _WEB_TEXTUAL_APPLICATION_TYPES
+
+    # A missing header may come from a simple static server. Only treat it as
+    # text after strict UTF-8 decoding; otherwise return binary metadata.
+    if not (is_json or is_html or is_xml or is_markdown or is_text or not mime):
+        return _webfetch_binary_metadata(mime, len(raw), url)
+    text, decode_error = _webfetch_decode_text(raw, charset)
+    if decode_error:
+        return f"[error: {decode_error} in response content-type '{mime or 'unknown'}']"
+    if text is None:
+        return _webfetch_binary_metadata(mime, len(raw), url)
+    if is_json:
+        return _webfetch_json_result(text, mime, len(raw))
+    if is_html:
+        text = _webfetch_html_to_markdown(text)
+        if not text:
+            return "[error: no extractable text content found on page]"
+    return _webfetch_truncate_text(text)
 
 def tool_webfetch(url):
     if not isinstance(url, str) or not url.strip():
@@ -581,36 +772,20 @@ def tool_webfetch(url):
         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept-Language": "en-US,en;q=0.9",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/json,application/*+json,"
+                  "text/plain,text/markdown,application/xml,text/xml;q=0.9,*/*;q=0.2",
     }
     MAX_REDIRECTS = 10
-
-    def _fetch_no_redirect(u):
-        """Mở URL với opener KHÔNG auto-follow redirect (chặn bằng handler
-        rỗng), trả về (status, response_hoặc_None, headers, error_body)."""
-        class _NoRedirect(urllib.request.HTTPRedirectHandler):
-            def redirect_request(self, *a, **kw):
-                return None  # chặn urllib tự nhảy — mình tự xử lý bên ngoài
-        opener = urllib.request.build_opener(
-            urllib.request.HTTPCookieProcessor(cj), _NoRedirect())
-        req = urllib.request.Request(u, headers=headers)
-        try:
-            resp = opener.open(req, timeout=15)
-            return resp.status, resp, resp.headers, None
-        except urllib.error.HTTPError as e:
-            # Với redirect handler bị chặn, 30x cũng đi vào đây dưới dạng
-            # HTTPError (vì opener không tự resolve được) — đọc header/status
-            # trực tiếp từ exception thay vì coi là lỗi thật.
-            return e.code, None, e.headers, e
 
     chain = []  # để báo lỗi rõ ràng: A -> B -> C -> A
     visit_count = {}   # url -> số lần đã ghé, để phân biệt loop thật vs "cần ghé lại nhờ cookie mới"
     cookie_snapshot_at_visit = {}  # url -> tập cookie tại lần ghé gần nhất
     current = url
     resp = None
+    err = None
     try:
         for _ in range(MAX_REDIRECTS):
-            _validate_public_http_url(current)
+            hostname, pinned_ip = _validate_public_http_url(current)
             n = visit_count.get(current, 0)
             cookies_now = frozenset((c.name, c.value) for c in cj)
 
@@ -629,7 +804,8 @@ def tool_webfetch(url):
             cookie_snapshot_at_visit[current] = cookies_now
             chain.append(current)
 
-            status, resp, resp_headers, err = _fetch_no_redirect(current)
+            status, resp, resp_headers, err = _open_pinned_no_redirect(
+                current, hostname, pinned_ip, headers, cj)
 
             if status in (301, 302, 303, 307, 308):
                 loc = resp_headers.get("Location") if resp_headers else None
@@ -655,48 +831,7 @@ def tool_webfetch(url):
         else:
             raise RuntimeError("redirect loop: too many redirects (" + " -> ".join(chain) + " -> ...)")
 
-        # Không phải HTML/text (pdf, image, binary...) — báo rõ thay vì trả rác nhị phân.
-        if ctype and not any(t in ctype.lower() for t in ("text/html", "text/plain", "application/xhtml", "xml")):
-            return f"[error: unsupported content-type '{ctype}', cannot extract text]"
-
-        raw = raw_bytes.decode("utf-8", errors="replace")
-
-        # 1) Xóa toàn bộ tag không phải nội dung, kèm nội dung bên trong.
-        for tag in ("title",) + _WEBFETCH_STRIP_TAGS:
-            raw = re.sub(rf"<{tag}\b[^>]*>.*?</{tag}>", " ", raw, flags=re.DOTALL | re.IGNORECASE)
-
-        # 2) Nếu có <main> hoặc <article>, ưu tiên lấy nội dung trong đó
-        #    (thường là phần bài viết/nội dung chính, ít rác menu/sidebar hơn).
-        for tag in _WEBFETCH_MAIN_TAGS:
-            m = re.search(rf"<{tag}\b[^>]*>(.*?)</{tag}>", raw, flags=re.DOTALL | re.IGNORECASE)
-            if m and len(m.group(1)) > 200:  # tránh match nhầm <main> rỗng/quá ngắn
-                raw = m.group(1)
-                break
-
-        # 3) Giữ lại cấu trúc heading cơ bản dạng markdown trước khi xóa tag,
-        #    để output không bị dính hết thành 1 khối văn xuôi.
-        raw = re.sub(r"<h1\b[^>]*>(.*?)</h1>", r"\n\n# \1\n", raw, flags=re.DOTALL | re.IGNORECASE)
-        raw = re.sub(r"<h2\b[^>]*>(.*?)</h2>", r"\n\n## \1\n", raw, flags=re.DOTALL | re.IGNORECASE)
-        raw = re.sub(r"<h3\b[^>]*>(.*?)</h3>", r"\n\n### \1\n", raw, flags=re.DOTALL | re.IGNORECASE)
-        raw = re.sub(r"<li\b[^>]*>(.*?)</li>", r"\n- \1", raw, flags=re.DOTALL | re.IGNORECASE)
-        raw = re.sub(r"</p>|<br\s*/?>", "\n", raw, flags=re.IGNORECASE)
-
-        # 4) Xóa tag còn lại (giữ text bên trong), decode HTML entity (&amp; &#39; ...).
-        raw = re.sub(r"<[^>]+>", " ", raw)
-        raw = _html.unescape(raw)
-
-        # 5) Gộp khoảng trắng/dòng trống thừa.
-        raw = re.sub(r"[ \t]+", " ", raw)
-        raw = re.sub(r"\n\s*\n\s*\n+", "\n\n", raw)
-        raw = raw.strip()
-
-        if not raw:
-            return "[error: no extractable text content found on page]"
-
-        LIMIT = 10000
-        if len(raw) > LIMIT:
-            raw = raw[:LIMIT] + f"\n\n... [truncated, {len(raw) - LIMIT} more chars — refine query or fetch specific section]"
-        return raw
+        return _webfetch_format_response(raw_bytes, ctype, current)
     except RuntimeError as e:
         if "redirect loop" in str(e):
             return (f"[error: {e} — this is a genuine redirect loop the server keeps making "
@@ -715,6 +850,79 @@ def tool_webfetch(url):
                 resp.close()
             except Exception:
                 pass
+        if err is not None:
+            try:
+                err.close()
+            except Exception:
+                pass
+
+
+def _websearch_fetch_html(url, headers, timeout):
+    """Fetch one configured search endpoint with the same network policy as webfetch."""
+    hostname, pinned_ip = _validate_public_http_url(url)
+    resp = None
+    err = None
+    try:
+        status, resp, response_headers, err = _open_pinned_no_redirect(
+            url, hostname, pinned_ip, headers, timeout=timeout)
+        if status not in (200,):
+            if err is not None:
+                raise err
+            raise RuntimeError(f"unexpected HTTP status {status}")
+        mime, charset = _webfetch_content_type(
+            response_headers.get("Content-Type", "") if response_headers else "")
+        if mime not in {"", "text/html", "application/xhtml+xml"}:
+            raise RuntimeError(f"unexpected search response content-type '{mime}'")
+        raw = _read_http_limited(resp)
+        text, decode_error = _webfetch_decode_text(raw, charset)
+        if decode_error:
+            raise RuntimeError(decode_error)
+        if text is None:
+            raise RuntimeError("search response is not decodable text")
+        return text
+    finally:
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:
+                pass
+        if err is not None:
+            try:
+                err.close()
+            except Exception:
+                pass
+
+
+def _websearch_clean_text(value, limit):
+    """Normalize scraped display text so a result cannot add hidden formatting noise."""
+    text = _html.unescape(re.sub(r"<[^>]+>", " ", value or ""))
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:limit].rstrip()
+
+
+def _websearch_append_result(results, seen_urls, title, url, snippet="", *, encoded_url=False):
+    """Validate, deduplicate, and render one scraped result in the tool's stable format."""
+    candidate = _html.unescape(url or "")
+    if encoded_url:
+        candidate = urllib.parse.unquote(candidate)
+    if len(candidate) > 4096 or any(ord(ch) < 32 for ch in candidate):
+        return
+    try:
+        parsed = urllib.parse.urlsplit(candidate)
+    except ValueError:
+        return
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+        return
+    if candidate in seen_urls:
+        return
+    clean_title = _websearch_clean_text(title, 200) or parsed.hostname
+    clean_snippet = _websearch_clean_text(snippet, 500)
+    # Escape the few Markdown control characters used by the surrounding output.
+    clean_title = re.sub(r"([\\\\`*_\[\]])", r"\\\1", clean_title)
+    seen_urls.add(candidate)
+    results.append(f"**{clean_title}**\n{candidate}" +
+                   (f"\n{clean_snippet}" if clean_snippet else ""))
 
 
 
@@ -769,12 +977,11 @@ def tool_websearch(query, num=5):
     for base in _SEARXNG_INSTANCES:
         try:
             url = f"{base}/search?q={q_enc}&language=en&safesearch=0"
-            req = urllib.request.Request(url, headers={
+            html = _websearch_fetch_html(url, {
                 "User-Agent": _SEARXNG_UA,
                 "Accept-Language": "en-US,en;q=0.9",
-            })
-            with urllib.request.urlopen(req, timeout=8) as resp:
-                html = _read_http_limited(resp).decode("utf-8", errors="replace")
+                "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.1",
+            }, timeout=8)
 
             results = []
             seen_urls = set()
@@ -787,13 +994,7 @@ def tool_websearch(query, num=5):
                 r'(?:.*?<p[^>]+class="[^"]*content[^"]*"[^>]*>(.*?)</p>)?',
                 html, re.DOTALL
             ):
-                url_r   = m.group(1)
-                title   = re.sub(r"<[^>]+>", "", m.group(2)).strip()
-                snippet = re.sub(r"<[^>]+>", "", m.group(3) or "").strip()[:250]
-                if url_r not in seen_urls and title:
-                    seen_urls.add(url_r)
-                    results.append(f"**{title}**\n{url_r}\n{snippet}" if snippet
-                                   else f"**{title}**\n{url_r}")
+                _websearch_append_result(results, seen_urls, m.group(2), m.group(1), m.group(3) or "")
                 if len(results) >= num:
                     break
 
@@ -803,11 +1004,7 @@ def tool_websearch(query, num=5):
                     r'<h3[^>]*>.*?<a[^>]+href="(https?://[^"#][^"]+)"[^>]*>(.*?)</a>',
                     html, re.DOTALL
                 ):
-                    url_r = m.group(1)
-                    title = re.sub(r"<[^>]+>", "", m.group(2)).strip()
-                    if url_r not in seen_urls and title and len(title) > 5:
-                        seen_urls.add(url_r)
-                        results.append(f"**{title}**\n{url_r}")
+                    _websearch_append_result(results, seen_urls, m.group(2), m.group(1))
                     if len(results) >= num:
                         break
 
@@ -828,15 +1025,14 @@ def tool_websearch(query, num=5):
     try:
         q   = urllib.parse.quote_plus(query)
         url = f"https://html.duckduckgo.com/html/?q={q}"
-        req = urllib.request.Request(url, headers={
+        html = _websearch_fetch_html(url, {
             "User-Agent": (
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             ),
             "Accept-Language": "en-US,en;q=0.9",
-        })
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            html = _read_http_limited(resp).decode("utf-8", errors="replace")
+            "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.1",
+        }, timeout=10)
 
         results = []
         seen_urls = set()
@@ -847,12 +1043,8 @@ def tool_websearch(query, num=5):
             r'class="result__snippet"[^>]*>(.*?)</(?:a|span)>',
             html, re.DOTALL
         ):
-            url_r   = urllib.parse.unquote(m.group(1))
-            title   = re.sub(r"<[^>]+>", "", m.group(2)).strip()
-            snippet = re.sub(r"<[^>]+>", "", m.group(3)).strip()
-            if url_r not in seen_urls and url_r.startswith("http"):
-                seen_urls.add(url_r)
-                results.append(f"**{title}**\n{url_r}\n{snippet}")
+            _websearch_append_result(results, seen_urls, m.group(2), m.group(1), m.group(3),
+                                     encoded_url=True)
             if len(results) >= num:
                 break
 
@@ -864,12 +1056,7 @@ def tool_websearch(query, num=5):
                 r'(?=<(?:h2|h3)|<div[^>]+class="result|$)',
                 html, re.DOTALL
             ):
-                url_r   = m.group(1)
-                title   = re.sub(r"<[^>]+>", "", m.group(2)).strip()
-                snippet = re.sub(r"<[^>]+>", "", m.group(3)).strip()[:200]
-                if url_r not in seen_urls and title:
-                    seen_urls.add(url_r)
-                    results.append(f"**{title}**\n{url_r}\n{snippet}")
+                _websearch_append_result(results, seen_urls, m.group(2), m.group(1), m.group(3))
                 if len(results) >= num:
                     break
 
@@ -893,20 +1080,17 @@ def tool_websearch(query, num=5):
                 r'<a[^>]+uddg=(https?%3A%2F%2F[^&"]+)',
                 html
             ):
-                title = m.group(1).strip()
                 url_r = urllib.parse.unquote(m.group(2))
-                if url_r not in seen_urls and not _is_junk_result(url_r):
-                    seen_urls.add(url_r)
-                    results.append(f"**{title}**\n{url_r}")
+                if not _is_junk_result(url_r):
+                    _websearch_append_result(results, seen_urls, m.group(1), url_r)
                 if len(results) >= num:
                     break
             # fallback: chỉ URL nếu vẫn không có title
             if not results:
                 for m in re.finditer(r'uddg=(https?%3A%2F%2F[^&"]+)', html):
                     url_r = urllib.parse.unquote(m.group(1))
-                    if url_r not in seen_urls and not _is_junk_result(url_r):
-                        seen_urls.add(url_r)
-                        results.append(url_r)
+                    if not _is_junk_result(url_r):
+                        _websearch_append_result(results, seen_urls, "", url_r)
                     if len(results) >= num:
                         break
 

@@ -19,54 +19,23 @@
 # hiện tại là phần tử đầu tiên (lazy migrate, không cần script riêng).
 #
 # THREAD-SAFETY: 10_main.py chạy _auto_rename_session trong 1 thread riêng
-# (threading.Thread, gọi _call_simple song song với main loop). save_config()
-# ghi thẳng file, không lock — 2 thread cùng đọc-sửa-ghi pool gần như đồng
-# thời có thể mất update của 1 bên (lost update, read-modify-write race).
-# Xác suất thấp (rename chỉ chạy 1 lần/session, timeout 15s) nhưng có thật.
-# Dùng RLock module-level bọc quanh mọi read-modify-write để tránh race.
+# (threading.Thread, gọi _call_simple song song với main loop). Thao tác
+# read-modify-write dùng RLock này và _config_file_lock() xuyên tiến trình;
+# save_config() thay thế config.json nguyên tử để không hỏng tệp nếu bị ngắt.
 _pool_lock = threading.RLock()
 
 _KEY_COOLDOWN_DEFAULT = 60.0   # giây — dùng khi 429 không kèm Retry-After
 _KEY_POOL_STRATEGIES  = ("round_robin", "fill_first")
 
-# Ngưỡng để nhận biết "đây là lần gọi LẶP LẠI của CÙNG 1 sự kiện 429 vừa
-# đánh dấu xong" thay vì "1 lần 429 MỚI thật sự xảy ra sau đó". Không thể
-# dùng "cooldown_until > now" đơn thuần để phân biệt 2 trường hợp này, vì cả
-# 2 đều cho kết quả True (key vẫn đang cooldown là chuyện bình thường trong
-# cả 2 trường hợp). Dấu hiệu đáng tin hơn: nếu cooldown_until đã được set xa
-# hơn thời điểm hiện tại ÍT NHẤT gần bằng khoảng cooldown vừa yêu cầu (retry_after
-# hoặc mặc định) trừ đi 1 sai số nhỏ, nghĩa là bản ghi cooldown đó vừa được
-# tạo ra RẤT GẦN ĐÂY (không phải còn sót lại từ 1 lần 429 cũ đã qua từ lâu,
-# lúc đó cooldown_until sẽ gần hết hạn, chênh lệch với now nhỏ hơn nhiều).
-_DEDUPE_WINDOW_SEC = 2.0
-
-
 def _mark_429(entry: dict, now: float, retry_after: float | None):
-    """Đánh dấu 1 entry vừa dính 429 -- CHUẨN HOÁ DÙNG CHUNG cho cả
-    pool_rotate_after_429 và pool_rotate_after_429_verbose (trước đây mỗi
-    hàm tự viết `fail_count += 1` + set cooldown_until riêng, giống hệt
-    nhau nhưng KHÔNG dùng chung 1 hàm -- khiến việc sửa bug ở 1 chỗ dễ quên
-    sửa chỗ còn lại).
+    """Record every observed 429 and refresh its provider-requested cooldown.
 
-    BUG ĐÃ SỬA: trước đây `fail_count += 1` chạy VÔ ĐIỀU KIỆN mỗi lần hàm
-    được gọi -- kể cả khi gọi 2 lần liên tiếp CHO CÙNG 1 sự kiện 429 (đúng
-    tình huống mà pool_rotate_after_429_verbose tự nhận trong docstring cũ
-    là "AN TOÀN, idempotent" nhưng thực tế lại cộng dồn fail_count 2 lần).
-    Test thực nghiệm xác nhận: gọi verbose 2 lần liên tiếp cùng current_key
-    làm fail_count tăng 1 -> 2 thay vì giữ nguyên.
-
-    Fix: nếu entry NÀY đã có cooldown_until đặt trong khoảng RẤT GẦN đây
-    (còn lại >= khoảng cooldown vừa yêu cầu - _DEDUPE_WINDOW_SEC), coi đây
-    là lần gọi LẶP LẠI của CÙNG 1 lần 429 vừa xử lý xong ngay trước đó ->
-    CHỈ giữ nguyên cooldown_until cũ (không rút ngắn lại nếu retry_after lần
-    gọi lặp nhỏ hơn), KHÔNG cộng thêm fail_count. Chỉ khi cooldown đã gần hết
-    hạn hoặc chưa từng đặt (đúng nghĩa 1 lần 429 MỚI xảy ra) mới cộng
-    fail_count + set cooldown mới."""
+    There is no response/event identifier available at this layer, so timing
+    cannot safely distinguish a duplicate handler invocation from a second,
+    real 429.  Favour the provider's most recent Retry-After over an
+    unreliable local deduplication heuristic.
+    """
     requested = retry_after if retry_after is not None else _KEY_COOLDOWN_DEFAULT
-    remaining = entry.get("cooldown_until", 0) - now
-    is_duplicate_call = remaining >= (requested - _DEDUPE_WINDOW_SEC) and remaining > 0
-    if is_duplicate_call:
-        return  # cùng 1 lần 429 đã xử lý -- không đổi gì thêm, đúng ý "idempotent"
     entry["cooldown_until"] = now + requested
     entry["fail_count"] = entry.get("fail_count", 0) + 1
 
@@ -215,7 +184,7 @@ def pool_get_current(prov_key: str | None = None) -> str | None:
     Danh sách xét gồm CẢ key đơn (nếu có set) gộp cùng pool thật — xem
     _pool_load_with_single(). Key đơn giờ tham gia xoay vòng y hệt 1 key
     pool, không còn là lớp fallback tách biệt."""
-    with _pool_lock:
+    with _pool_lock, _config_file_lock():
         prov_key = prov_key or _active_provider
         pool = _pool_load_with_single(prov_key)
         if not pool:
@@ -227,7 +196,13 @@ def pool_get_current(prov_key: str | None = None) -> str | None:
                 avail.sort(key=lambda e: e.get("fail_count", 0))
             else:  # round_robin: ưu tiên key lâu chưa dùng nhất
                 avail.sort(key=lambda e: e.get("last_used", 0))
-            return avail[0]["key"]
+            chosen = avail[0]
+            # Reserve the choice while holding the lock.  Without this update,
+            # concurrent requests all observe the same oldest key before the
+            # first request succeeds and round-robin degenerates into a stampede.
+            chosen["last_used"] = time.time()
+            _pool_save_entry_state(chosen, prov_key)
+            return chosen["key"]
         # Hết key rảnh → chọn key sắp hết cooldown SỚM NHẤT (không phải
         # key lâu chưa dùng nhất — 2 tiêu chí khác nhau, dùng last_used ở
         # đây có thể trả về đúng key còn cooldown dài nhất).
@@ -240,7 +215,7 @@ def pool_mark_success(current_key: str, prov_key: str | None = None):
     Xét cả key đơn (qua _pool_load_with_single) — nếu current_key chính là
     key đơn, ghi state trở lại field state riêng (_pool_save_entry_state),
     không lẫn vào field pool."""
-    with _pool_lock:
+    with _pool_lock, _config_file_lock():
         prov_key = prov_key or _active_provider
         pool = _pool_load_with_single(prov_key)
         if not pool:
@@ -260,30 +235,10 @@ def pool_rotate_after_429(current_key: str, retry_after: float | None,
     rồi trả về 1 key KHÁC đang rảnh trong pool (None nếu không có / pool
     chỉ có 1 key → caller tự rơi về nhánh sleep-and-retry cũ).
     """
-    with _pool_lock:
-        prov_key = prov_key or _active_provider
-        pool = _pool_load(prov_key)
-        now = time.time()
-        if len(pool) <= 1:
-            # Chỉ 1 key (hoặc chưa cấu hình pool) — không có gì để xoay.
-            # Vẫn ghi cooldown để lần request kế (sau khi hết retry ở đây)
-            # không vội đấm lại đúng key này ngay lập tức nếu caller gọi lại.
-            if pool:
-                _mark_429(pool[0], now, retry_after)
-                _pool_save(prov_key, pool)
-            return None
-
-        for e in pool:
-            if e["key"] == current_key:
-                _mark_429(e, now, retry_after)
-                break
-        _pool_save(prov_key, pool)
-
-        others = [e for e in pool if e["key"] != current_key and e.get("cooldown_until", 0) <= now]
-        if not others:
-            return None
-        others.sort(key=lambda e: e.get("last_used", 0))
-        return others[0]["key"]
+    # Preserve the compact legacy return type while sharing the authoritative
+    # implementation used by the live API paths.  This keeps key-single and
+    # key-pool behaviour identical for every caller.
+    return pool_rotate_after_429_verbose(current_key, retry_after, prov_key)["new_key"]
 
 
 def pool_rotate_after_429_verbose(current_key: str, retry_after: float | None,
@@ -316,10 +271,12 @@ def pool_rotate_after_429_verbose(current_key: str, retry_after: float | None,
     True, KHÔNG còn trả soonest_wait để sleep chờ nữa — caller phải dừng
     và báo lỗi thẳng cho người dùng thay vì tự chờ.
 
-    Gọi 2 lần liên tiếp cho CÙNG current_key vẫn idempotent (dùng chung
-    _mark_429() dedupe như trước) — không cộng dồn fail_count.
+    Mỗi phản hồi 429 được ghi nhận riêng và làm mới cooldown theo giá trị
+    Retry-After của phản hồi đó. Lớp gọi hiện không có response/event ID để
+    nhận diện an toàn hai lần xử lý cùng một sự kiện, nên không suy đoán dựa
+    trên cửa sổ thời gian ngắn (vốn có thể bỏ qua 429 thật).
     """
-    with _pool_lock:
+    with _pool_lock, _config_file_lock():
         prov_key = prov_key or _active_provider
         pool = _pool_load_with_single(prov_key)
         total = len(pool)
@@ -397,7 +354,7 @@ def pool_rotate_after_429_verbose(current_key: str, retry_after: float | None,
 
 def pool_add_key(key: str, prov_key: str | None = None) -> int:
     """Thêm 1 key vào pool. Trả về số lượng key trong pool sau khi thêm."""
-    with _pool_lock:
+    with _pool_lock, _config_file_lock():
         prov_key = prov_key or _active_provider
         pool = _pool_load(prov_key)
         if any(e["key"] == key for e in pool):
@@ -415,7 +372,7 @@ def pool_remove_key(index: int, prov_key: str | None = None) -> str | None:
     key đơn (field config_key), vì key đơn không còn được migrate/lẫn vào
     field pool nữa (xem _pool_load). Muốn xoá key đơn, dùng /deletekey
     riêng — /rmkey chỉ thao tác trên pool thật."""
-    with _pool_lock:
+    with _pool_lock, _config_file_lock():
         prov_key = prov_key or _active_provider
         pool = _pool_load(prov_key)
         if not (1 <= index <= len(pool)):
@@ -428,7 +385,7 @@ def pool_remove_key(index: int, prov_key: str | None = None) -> str | None:
 def pool_set_strategy(strategy: str, prov_key: str | None = None) -> bool:
     if strategy not in _KEY_POOL_STRATEGIES:
         return False
-    with _pool_lock:
+    with _pool_lock, _config_file_lock():
         prov_key = prov_key or _active_provider
         cfg = load_config()
         cfg[f"{_pool_config_key(prov_key)}_strategy"] = strategy
@@ -440,7 +397,7 @@ def pool_list(prov_key: str | None = None) -> list[dict]:
     """Trả về pool THẬT kèm trạng thái cooldown đã tính sẵn (giây còn lại,
     >0 nghĩa là đang bận). KHÔNG gồm key đơn — dùng pool_list_with_single()
     nếu cần hiển thị cả key đơn (vd /listkeys)."""
-    with _pool_lock:
+    with _pool_lock, _config_file_lock():
         prov_key = prov_key or _active_provider
         now = time.time()
         out = []
@@ -455,7 +412,7 @@ def pool_list_with_single(prov_key: str | None = None) -> list[dict]:
     "_is_single": bool để caller (vd /listkeys) hiển thị rõ nguồn gốc,
     tránh tình trạng key đơn đang tham gia xoay vòng thật sự mà người dùng
     không biết vì /listkeys cũ chỉ đọc pool thật."""
-    with _pool_lock:
+    with _pool_lock, _config_file_lock():
         prov_key = prov_key or _active_provider
         now = time.time()
         out = []

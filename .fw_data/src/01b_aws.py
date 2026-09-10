@@ -112,8 +112,10 @@ def _load_profile_cache():
         # Nếu có entry bị loại do hết hạn, ghi lại file cho gọn (best-effort)
         if len(still_valid) != len(saved):
             try:
-                cfg["aws_bedrock_profile_models"] = still_valid
-                save_config(cfg)
+                with _pool_lock, _config_file_lock():
+                    cfg = load_config()
+                    cfg["aws_bedrock_profile_models"] = still_valid
+                    save_config(cfg)
             except Exception:
                 pass
     except Exception:
@@ -124,11 +126,12 @@ def _remember_profile_required(model_id: str):
     """Đánh dấu model_id cần prefix, lưu cả vào RAM lẫn config.json (kèm timestamp)."""
     _PROFILE_REQUIRED_MODELS.add(model_id)
     try:
-        cfg = load_config()
-        saved = cfg.get("aws_bedrock_profile_models", {})
-        saved[model_id] = _dt.datetime.now(_dt.timezone.utc).isoformat()
-        cfg["aws_bedrock_profile_models"] = saved
-        save_config(cfg)
+        with _pool_lock, _config_file_lock():
+            cfg = load_config()
+            saved = cfg.get("aws_bedrock_profile_models", {})
+            saved[model_id] = _dt.datetime.now(_dt.timezone.utc).isoformat()
+            cfg["aws_bedrock_profile_models"] = saved
+            save_config(cfg)
     except Exception:
         pass   # ghi lỗi (vd disk full) — không chặn luồng chính, vẫn dùng RAM
 

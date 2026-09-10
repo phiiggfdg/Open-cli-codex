@@ -227,7 +227,7 @@ def clear_current_state():
     _state_local.value = None
 
 
-# ── CLI renderer: nhận Event, in ra ANSI y hệt hành vi cũ ───────────────────
+# ── CLI renderer: compact blocks for a readable coding transcript ────────────
 # Đăng ký hàm này vào bus của session khi chạy qua main() (10_main.py) để
 # giữ nguyên trải nghiệm terminal, không lộ thay đổi kiến trúc ra người dùng.
 _cli_render_flags = {"first_token": True, "first_thinking": True}
@@ -237,6 +237,58 @@ def cli_render_reset():
     """Gọi ở đầu mỗi turn (agent_turn) để reset cờ 'đã in AI:/[thinking] chưa'."""
     _cli_render_flags["first_token"] = True
     _cli_render_flags["first_thinking"] = True
+
+
+_ANSI_CSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+def _terminal_width(text: str) -> int:
+    """Display width for Termux: ANSI-free, CJK/emoji-aware enough for cards."""
+    import unicodedata
+    width = 0
+    for char in _ANSI_CSI_RE.sub("", str(text)):
+        if unicodedata.combining(char):
+            continue
+        if unicodedata.east_asian_width(char) in ("W", "F") or ord(char) >= 0x1F300:
+            width += 2
+        else:
+            width += 1
+    return width
+
+
+def _clip_terminal_text(text: str, limit: int) -> str:
+    """Clip untrusted tool text by rendered columns, never in the middle of ANSI."""
+    clean = _ANSI_CSI_RE.sub("", str(text)).replace("\n", " ↵ ").strip()
+    limit = max(8, limit)
+    if _terminal_width(clean) <= limit:
+        return clean
+    out, used = [], 0
+    for char in clean:
+        char_width = _terminal_width(char)
+        if used + char_width > limit - 1:
+            break
+        out.append(char)
+        used += char_width
+    return "".join(out).rstrip() + "…"
+
+
+def _cli_card_line(content: str, width: int, edge: str = "│",
+                   accent: str = BLUE, tone: str = WHITE) -> str:
+    """Render a compact outlined card row without a fragile full-line background."""
+    usable = max(12, width - _terminal_width(edge) - 2)
+    return f"{accent}{edge}{R} {tone}{_clip_terminal_text(content, usable)}{R}"
+
+
+def _tool_card_outcome(brief: str) -> tuple[str, str, str]:
+    """Choose a restrained semantic colour for the card footer."""
+    low = str(brief).lstrip().lower()
+    if low.startswith(("[error", "[tool_error", "[permission denied", "[not found")):
+        return RED, "✕", "failed"
+    if low.startswith(("[policy]", "[sandbox]", "[serve]")):
+        return YELLOW, "!", "blocked"
+    if "status: error" in low or "status: timeout" in low:
+        return RED, "✕", "failed"
+    return GREEN, "✓", "done"
 
 
 def render_cli(ev: Event):
@@ -262,28 +314,60 @@ def render_cli(ev: Event):
     t, d = ev.type, ev.data
     if t == EV_THINKING_DELTA:
         if _cli_render_flags["first_thinking"]:
-            print(f"\n{DIM}┌─ thinking ─────────────────────{R}")
-            print(f"{DIM}│ {R}", end="", flush=True)
+            print(f"\n{GRAY}╭─ Suy nghĩ{R}")
+            print(f"{GRAY}│ {R}", end="", flush=True)
             _cli_render_flags["first_thinking"] = False
         # Thụt lề "│ " sau mỗi lần xuống dòng bên trong nội dung thinking,
         # để cả khối luôn nằm gọn trong khung, không lẫn với text chat.
-        chunk = d["text"].replace("\n", f"{R}\n{DIM}│ {R}{DIM}")
-        print(f"{DIM}{chunk}{R}", end="", flush=True)
+        chunk = d["text"].replace("\n", f"{R}\n{GRAY}│ {R}{GRAY}")
+        print(f"{GRAY}{chunk}{R}", end="", flush=True)
     elif t == EV_TEXT_DELTA:
         if _cli_render_flags["first_token"]:
             if not _cli_render_flags["first_thinking"]:
-                print(f"\n{DIM}└─────────────────────────────────{R}")
-            print(f"\n{GREEN}{BOLD}AI:{R} ", end="", flush=True)
+                print(f"\n{GRAY}╰────────────────────────────────{R}")
+            print(f"\n{TEAL}{BOLD}● AI{R}  ", end="", flush=True)
             _cli_render_flags["first_token"] = False
         print(d["text"], end="", flush=True)
     elif t == EV_STEP:
-        print(f"{DIM}  ┤ step {d['step']}  ctx ~{d['ctx_est']:,} tok  "
-              f"model {d['model']}{R}")
+        width = shutil.get_terminal_size((80, 24)).columns
+        model = str(d['model'])
+        prefix = f"  ◌ Step {d['step']}  ·  ctx ~{d['ctx_est']:,} tok  ·  "
+        limit = max(1, width - len(prefix) - 1)
+        model = model[:limit] + ("…" if len(model) > limit else "")
+        print(f"{GRAY}{prefix}{model}{R}")
     elif t == EV_TOOL_START:
         icon = TOOL_ICONS.get(d["name"], f"{DIM}⚙")
-        print(f"  {icon} {BOLD}{d['name']}{R}  {DIM}{d['preview']}{R}")
+        width = shutil.get_terminal_size((80, 24)).columns
+        preview = _clip_terminal_text(d['preview'], max(12, width - 24))
+        icon = _ANSI_CSI_RE.sub("", icon)
+        title = f"{icon} {d['name']}  ·  {preview}" if preview else f"{icon} {d['name']}"
+        print("\n" + _cli_card_line(title, width, edge="╭─", accent=BLUE, tone=WHITE))
+        diff = d.get("diff")
+        if diff:
+            path = _clip_terminal_text(diff["path"], max(10, width - 18))
+            print(_cli_card_line(
+                f"{diff['action']} · {path}", width, accent=BLUE, tone=GRAY
+            ))
+            for row in diff.get("lines", []):
+                mark = {"add": "+", "del": "-", "ctx": " ", "hunk": "@"}.get(row.get("kind"), " ")
+                color = GREEN if row.get("kind") == "add" else RED if row.get("kind") == "del" else CYAN if row.get("kind") == "hunk" else GRAY
+                old = "" if row.get("old") is None else str(row["old"])
+                new = "" if row.get("new") is None else str(row["new"])
+                text = _clip_terminal_text(row.get("text", ""), max(12, width - 18))
+                print(_cli_card_line(
+                    f"{old:>4} {new:>4} {mark} {text}", width, accent=BLUE, tone=color
+                ))
+            if diff.get("hidden"):
+                print(_cli_card_line(
+                    f"… +{diff['hidden']} dòng khác", width, accent=BLUE, tone=GRAY
+                ))
     elif t == EV_TOOL_END:
-        print(f"  {DIM}╰─ {d['brief']}{'…' if d.get('truncated') else ''}{R}")
+        width = shutil.get_terminal_size((80, 24)).columns
+        brief = _clip_terminal_text(d['brief'], max(12, width - 15))
+        color, mark, label = _tool_card_outcome(brief)
+        print(_cli_card_line(
+            f"{mark} {label}  ·  {brief}", width, edge="╰─", accent=BLUE, tone=color
+        ))
     elif t == EV_TOOL_DENIED:
         if d.get("by_user"):
             print(f"  {RED}✗ Denied by user.{R}")
@@ -300,7 +384,7 @@ def render_cli(ev: Event):
     elif t == EV_ERROR:
         print(f"{RED}{d['text']}{R}")
     elif t == EV_INTERRUPTED:
-        print(f"{YELLOW}  checkpoint {d.get('checkpoint_id')} saved after interrupt{R}")
+          print(f"{YELLOW}  ◌ checkpoint {d.get('checkpoint_id')} saved after interrupt{R}")
     elif t == EV_TURN_END:
         if d.get("summary_line"):
             print(f"{DIM}  {d['summary_line']}{R}")

@@ -90,144 +90,13 @@ def _delete_session_project_dir(session: dict) -> bool:
 # ════════════════════════════════════════════════════════════════════════════
 
 def _print_welcome_banner():
-    """Hiển thị banner chào mừng lần đầu khởi động — chỉ gọi khi chưa có session nào."""
-    import time as _time
-    import random as _random
-
-    _GLITCH_CHARS = "!@#$%^&*<>?/|\\[]{}~`±§"
-
-    def _glitch_line(line: str, intensity: int = 3) -> str:
-        """Corrupt ngẫu nhiên một vài ký tự trong line để tạo glitch."""
-        if not line.strip():
-            return line
-        chars = list(line)
-        # Chỉ corrupt ký tự printable, không đụng ANSI escape
-        printable_idx = []
-        in_esc = False
-        for i, c in enumerate(chars):
-            if c == "\033":
-                in_esc = True
-            elif in_esc and c == "m":
-                in_esc = False
-            elif not in_esc and c not in (" ", "\n"):
-                printable_idx.append(i)
-        for _ in range(min(intensity, len(printable_idx))):
-            idx = _random.choice(printable_idx)
-            chars[idx] = _random.choice(_GLITCH_CHARS)
-        return "".join(chars)
-
-    # ── ASCII art lines ───────────────────────────────────────────────────────
-    raw_banner = [
-        "",
-        f"  {CYAN}{BOLD}  ___  ____  ____  _  _     ___  __    ____     ___  _____  ____  ____  _  _  {R}",
-        f"  {CYAN}{BOLD} / __)(  _ \\( ___)( \\( )   / __)(  )  (_  _)   / __)(  _  )(  _ \\( ___)( \\/ ) {R}",
-        f"  {TEAL}{BOLD}( (__  )___/ )__)  )  (   ( (__  )(__  _)(_   ( (__  )(_)(  )(_) ))__)  )  (  {R}",
-        f"  {TEAL}{BOLD} \\___)(_)   (____)(_)\\_)   \\___)(____)(____) o  \\___)(_____)(__,_/(____)(_/\\_) {R}",
-        "",
-    ]
-    n = len(raw_banner)
-
-    # ── Phase 1: scanline sweep — dòng trắng quét xuống ──────────────────────
-    SCAN = f"\033[38;5;231m"   # near-white scanline
-    for sweep in range(n):
-        # In lại toàn bộ banner, highlight dòng sweep
-        sys.stdout.write(f"\033[{n}A\r") if sweep > 0 else None
-        for i, line in enumerate(raw_banner):
-            if i == sweep and line.strip():
-                # Glitch nặng trong lúc scanline đi qua
-                sys.stdout.write(_glitch_line(line, intensity=6) + "\n")
-            else:
-                sys.stdout.write(line + "\n")
-        sys.stdout.flush()
-        _time.sleep(0.045)
-
-    # ── Phase 2: glitch burst — rung 4 lần rồi resolve về clean ─────────────
-    for burst in range(4):
-        sys.stdout.write(f"\033[{n}A\r")
-        intensity = 5 - burst  # giảm dần → settle
-        for line in raw_banner:
-            corrupted = _glitch_line(line, intensity=intensity) if burst < 3 else line
-            sys.stdout.write(corrupted + "\n")
-        sys.stdout.flush()
-        _time.sleep(0.07)
-
-    # ── Phase 3: final clean render ───────────────────────────────────────────
-    sys.stdout.write(f"\033[{n}A\r")
-    for line in raw_banner:
-        sys.stdout.write(line + "\n")
-    sys.stdout.flush()
-    _time.sleep(0.12)
-
-    # ── Tagline typing effect — character by character ────────────────────────
-    tagline_parts = [
-        (TEAL,    "  ▸ "),
-        (WHITE,   "Open Source  ·  "),
-        (CYAN,    "Multi-Provider  ·  "),
-        (YELLOW,  "Terminal AI Coding Agent"),
-    ]
-    for color, part in tagline_parts:
-        for ch in part:
-            sys.stdout.write(f"{color}{ch}{R}")
-            sys.stdout.flush()
-            _time.sleep(0.013)
+    """Static startup card: fast and readable on narrow terminal screens."""
+    width = min(shutil.get_terminal_size((80, 20)).columns - 4, 68)
     print()
-
-    # ── Separator draw animation — line grows left→right ─────────────────────
-    w = shutil.get_terminal_size((80, 20)).columns
-    sep_w = min(w - 4, 72)
-    print()
-    sys.stdout.write("  ")
-    for i in range(sep_w):
-        sys.stdout.write(f"{GRAY}╌{R}")
-        sys.stdout.flush()
-        _time.sleep(0.008)
-    print()
-
-    # ── Info block — cascade fade-in, each row slides from left ──────────────
-    info = [
-        (TEAL,    "◈", "Project   ", "Open CLI Codex"),
-        (GREEN,   "◈", "Author    ", "Trần Phi"),
-        (YELLOW,  "◈", "Contact   ", "phihhhhhhhhhh@gmail.com"),
-        (CYAN,    "◈", "Inspired  ", "opencode · claude-code · codex"),
-    ]
-    for color, icon, label, value in info:
-        full = f"  {color}{icon}{R}  {DIM}{label}{R}{WHITE}{value}{R}"
-        # Print ký tự nhanh nhưng có micro-delay tạo cảm giác "drop in"
-        sys.stdout.write(f"\033[2m{' ' * 4}{R}")   # dim placeholder
-        sys.stdout.write("\r")
-        sys.stdout.flush()
-        _time.sleep(0.04)
-        print(full)
-        _time.sleep(0.055)
-
-    # ── Separator close ───────────────────────────────────────────────────────
-    sys.stdout.write("  ")
-    for i in range(sep_w):
-        sys.stdout.write(f"{GRAY}╌{R}")
-        sys.stdout.flush()
-        _time.sleep(0.006)
-    print()
-    _time.sleep(0.12)
-
-    # ── Ready message — typewriter với cursor blinking ────────────────────────
-    ready = "  System ready. Start your session  ◆"
-    print()
-    for i, ch in enumerate(ready):
-        # Cursor blink: hiện underscore lúc gõ
-        sys.stdout.write(f"{TEAL}{ch}{R}")
-        sys.stdout.flush()
-        _time.sleep(0.018 if ch != " " else 0.009)
-    # Blink ◆ 3 lần sau khi xong
-    for _ in range(3):
-        sys.stdout.write(f"\r{' ' * (len(ready) - 1)}{TEAL}◆{R}")
-        sys.stdout.flush()
-        _time.sleep(0.18)
-        sys.stdout.write(f"\r{' ' * (len(ready) - 1)}{GRAY}◆{R}")
-        sys.stdout.flush()
-        _time.sleep(0.12)
-    sys.stdout.write(f"\r{' ' * (len(ready) - 1)}{TEAL}◆{R}\n\n")
-    sys.stdout.flush()
-    _time.sleep(0.1)
+    print(f"  {GRAY}╭{'─' * width}{R}")
+    print(f"  {GRAY}│{R} {WHITE}{BOLD}Open CLI Codex{R}  {DIM}terminal coding agent{R}")
+    print(f"  {GRAY}│{R} {DIM}Choose a provider, model and agent mode to start.{R}")
+    print(f"  {GRAY}╰{'─' * width}{R}\n")
 
 
 
@@ -243,37 +112,13 @@ def pick_session(conn, api_key):
     w = shutil.get_terminal_size((80, 20)).columns
     box_w = min(w - 2, 72)
 
-    # ── Animate header wipe in ────────────────────────────────────────────────
-    import time as _time
-    header = f"  {TEAL}{BOLD}◈ Open CLI Codex{R}  {GRAY}sessions{R}"
-    rule   = f"  {GRAY}{'─' * (box_w - 2)}{R}"
+    # Static structure keeps the selector stable on small Termux terminals.
     print()
-    # Header types in char by char
-    _stripped = f"  ◈ Open CLI Codex  sessions"
-    sys.stdout.write("  ")
-    for i, ch in enumerate(f"◈ Open CLI Codex  sessions"):
-        color = TEAL if i < 17 else GRAY
-        sys.stdout.write(f"{color}{ch}{R}")
-        sys.stdout.flush()
-        _time.sleep(0.018)
-    print()
-    # Rule draws left→right
-    sys.stdout.write("  ")
-    for _ in range(box_w - 2):
-        sys.stdout.write(f"{GRAY}─{R}")
-        sys.stdout.flush()
-        _time.sleep(0.004)
-    print()
-
-    # "new session" row fades in
-    _time.sleep(0.05)
-    print(f"  {GRAY} 0 {R}  {DIM}+ new session{R}")
-    sys.stdout.write("  ")
-    for _ in range(box_w - 2):
-        sys.stdout.write(f"{GRAY}·{R}")
-        sys.stdout.flush()
-        _time.sleep(0.003)
-    print()
+    print(f"  {GRAY}╭{'─' * (box_w - 2)}{R}")
+    print(f"  {GRAY}│{R} {WHITE}{BOLD}Sessions{R}  {DIM}resume or start a workspace{R}")
+    print(f"  {GRAY}├{'─' * (box_w - 2)}{R}")
+    print(f"  {GRAY}│{R} {CYAN}{BOLD}0{R}  {WHITE}+ New session{R}")
+    print(f"  {GRAY}├{'─' * (box_w - 2)}{R}")
 
     for i, s in enumerate(sessions, 1):
         dt    = datetime.fromtimestamp(s["updated_at"]).strftime("%m-%d %H:%M")
@@ -290,18 +135,10 @@ def pick_session(conn, api_key):
             prov_badge = f"  {GRAY}{prov_name}{R}"
         else:
             prov_badge = ""
-        # ── Cascade: brief dim placeholder then snap to full color ────────────
-        _time.sleep(0.03)
-        print(f"  {CYAN}{BOLD}{i:>2}{R}  {WHITE}{title_trunc}{R}  {ag_cl}[{ag}]{R}{prov_badge}")
-        print(f"      {GRAY}{short_model}  ·  {dt}  ·  {tok:,} tok  ·  {s['directory']}{R}")
+        print(f"  {GRAY}│{R} {CYAN}{BOLD}{i:>2}{R}  {WHITE}{title_trunc}{R}  {ag_cl}[{ag}]{R}{prov_badge}")
+        print(f"  {GRAY}│{R}     {DIM}{short_model}  ·  {dt}  ·  {tok:,} tok  ·  {s['directory']}{R}")
 
-    # Bottom rule draws in
-    sys.stdout.write("  ")
-    for _ in range(box_w - 2):
-        sys.stdout.write(f"{GRAY}─{R}")
-        sys.stdout.flush()
-        _time.sleep(0.004)
-    print()
+    print(f"  {GRAY}╰{'─' * (box_w - 2)}{R}")
     print()
 
     while True:
@@ -351,9 +188,9 @@ def pick_session(conn, api_key):
             continue
 
 def choose_agent():
-    print(f"\n  {GRAY}agent mode{R}")
-    print(f"  {CYAN}1{R}  {GREEN}build{R}   {DIM}full access — write, edit, bash{R}")
-    print(f"  {CYAN}2{R}  {BLUE}plan{R}    {DIM}read-only — safe analysis{R}")
+    print(f"\n  {WHITE}{BOLD}Agent mode{R}")
+    print(f"  {CYAN}1{R}  {GREEN}{BOLD}build{R}  {DIM}write, edit and bash{R}")
+    print(f"  {CYAN}2{R}  {BLUE}{BOLD}plan{R}   {DIM}read-only analysis{R}")
     try:
         n = input(f"  {TEAL}❯{R} {DIM}[1]{R} ").strip()
         return AGENT_PLAN if n == "2" else AGENT_BUILD
@@ -580,51 +417,11 @@ def main():
     w = shutil.get_terminal_size((80, 20)).columns
     bar_w = min(w - 4, 72)
 
-    import time as _t2
     print()
-
-    # ── Top bar: ━ draws from center outward ─────────────────────────────────
-    half = bar_w // 2
-    sys.stdout.write("  ")
-    parts_l, parts_r = [], []
-    for i in range(half):
-        parts_l.insert(0, f"{TEAL}━{R}")
-        parts_r.append(f"{TEAL}━{R}")
-        sys.stdout.write(f"\r  {''.join(parts_l)}{''.join(parts_r)}")
-        sys.stdout.flush()
-        _t2.sleep(0.005)
-    print()
-
-    # ── Title line types in ───────────────────────────────────────────────────
-    title_text = f"◈ Open CLI Codex  [{sid[:8]}]  {session['title']}"
-    sys.stdout.write("  ")
-    for ch in title_text:
-        if ch == "◈":
-            sys.stdout.write(f"{TEAL}{BOLD}◈{R}")
-        elif ch == "[":
-            sys.stdout.write(f"{GRAY}[")
-        elif ch == "]":
-            sys.stdout.write(f"]{R}")
-        else:
-            sys.stdout.write(ch)
-        sys.stdout.flush()
-        _t2.sleep(0.012)
-    print()
-
-    # ── Meta line ────────────────────────────────────────────────────────────
-    print(f"  {GRAY}{short}{R}  "
-          f"{ag_cl}◆ {agent}{R}  "
-          f"{tm_cl}◆ {tm_label}{R}  "
-          f"{GRAY}{os.getcwd()}{R}"
-          f"{rules_hint}")
-
-    # ── Bottom rule draws left→right ─────────────────────────────────────────
-    sys.stdout.write("  ")
-    for _ in range(bar_w):
-        sys.stdout.write(f"{GRAY}─{R}")
-        sys.stdout.flush()
-        _t2.sleep(0.003)
-    print()
+    print(f"  {GRAY}╭{'─' * bar_w}{R}")
+    print(f"  {GRAY}│{R} {WHITE}{BOLD}Open CLI Codex{R}  {DIM}{session['title']}  ·  {sid[:8]}{R}")
+    print(f"  {GRAY}│{R} {CYAN}{short}{R}  {ag_cl}{agent}{R}  {tm_cl}{tm_label}{R}  {DIM}{os.getcwd()}{R}{rules_hint}")
+    print(f"  {GRAY}╰{'─' * bar_w}{R}")
     print(f"  {DIM}Type /help for commands  ·  @file to attach  ·  \\ to continue line{R}\n")
 
     while True:
@@ -879,6 +676,29 @@ def main():
             else: print(out)
             continue
 
+        if user.lower().startswith("/toolcall"):
+            global _TOOLCALL_DEBUG
+            parts = user.split()
+            sub   = parts[1].lower() if len(parts) > 1 else "show"
+
+            def _emit_tc(text):
+                if state is not None: state.emit(EV_INFO, text=text, raw=True)
+                else: print(text)
+
+            if sub in ("debug", "on"):
+                _TOOLCALL_DEBUG = True
+                _emit_tc(f"{GREEN}✓ toolcall debug ON{R} — khi 1 tool call bị "
+                         "discard vì JSON hỏng, in raw arguments + finish_reason "
+                         "+ usage để phân biệt \"model viết sai cú pháp\" với "
+                         "\"response bị cắt vì hết max_tokens giữa chừng\".\n")
+                continue
+            if sub in ("off",):
+                _TOOLCALL_DEBUG = False
+                _emit_tc(f"{YELLOW}✓ toolcall debug OFF{R}\n"); continue
+            _emit_tc(f"{DIM}  toolcall debug: {'ON' if _TOOLCALL_DEBUG else 'OFF'}"
+                     f"  (dùng /toolcall on|off){R}\n")
+            continue
+
         if user.lower().startswith("/cache"):
             global _cache_debug
             parts = user.split()
@@ -1063,10 +883,11 @@ def main():
                     out = f"{RED}✗ Thiếu model_id sau \"::\".{R}\n"
                     state.emit(EV_INFO, text=out, raw=True)
                     continue
-                cfg = load_config()
-                cfg["delegate_model"] = _dm_model
-                cfg["delegate_provider"] = _dm_provider
-                save_config(cfg)
+                with _pool_lock, _config_file_lock():
+                    cfg = load_config()
+                    cfg["delegate_model"] = _dm_model
+                    cfg["delegate_provider"] = _dm_provider
+                    save_config(cfg)
                 out = (f"{GREEN}✓ delegate provider = {PROVIDERS[_dm_provider]['name']}"
                        f"  model = {_dm_model}{R}\n")
                 state.emit(EV_INFO, text=out, raw=True)
@@ -1117,10 +938,11 @@ def main():
                         finally:
                             _active_provider = _saved_provider
             if new_dmodel and new_dmodel != "__add_custom__" and new_dprovider is not None:
-                cfg = load_config()
-                cfg["delegate_model"] = new_dmodel
-                cfg["delegate_provider"] = new_dprovider
-                save_config(cfg)
+                with _pool_lock, _config_file_lock():
+                    cfg = load_config()
+                    cfg["delegate_model"] = new_dmodel
+                    cfg["delegate_provider"] = new_dprovider
+                    save_config(cfg)
                 short_d = new_dmodel.split("/")[-1]
                 out = (f"{GREEN}✓ delegate provider = {PROVIDERS[new_dprovider]['name']}"
                        f"  model = {short_d}{R}\n")
@@ -1576,7 +1398,7 @@ def main():
             # khác (pool). Ghi thẳng bằng `cfg` cũ sẽ xoá mất thay đổi đó
             # (lost update) — đã verify bằng test thực nghiệm. Bọc _pool_lock
             # + load_config() LẠI ngay trước khi set/pop field rồi save.
-            with _pool_lock:
+            with _pool_lock, _config_file_lock():
                 cfg = load_config()
                 if new_key:
                     cfg[ck] = new_key
@@ -1612,7 +1434,7 @@ def main():
             # write — không chờ input giữa chừng như /setkey nên cửa sổ
             # race hẹp hơn, nhưng vẫn có thể trùng với thread nền đang ghi
             # pool đúng lúc lệnh này chạy. Cùng nguyên tắc, cùng lock.
-            with _pool_lock:
+            with _pool_lock, _config_file_lock():
                 cfg = load_config()
                 ck  = _prov()["config_key"]
                 cur = cfg.get(ck, "")
@@ -1664,7 +1486,9 @@ def main():
 
         if user.lower() == "/listkeys":
             pool = pool_list()
-            if not pool:
+            all_keys = pool_list_with_single()
+            single = next((e for e in all_keys if e.get("_is_single")), None)
+            if not pool and single is None:
                 _txt = (f"{YELLOW}Chưa có key nào trong pool [{_prov()['name']}]. "
                       f"Dùng /addkey <key> để thêm.{R}\n")
             else:
@@ -1674,6 +1498,13 @@ def main():
                               if e["cooldown_remaining"] > 0 else f"{GREEN}sẵn sàng{R}")
                     _lines.append(f"  {WHITE}{i}{R}. {_pool_mask(e['key'])}  "
                           f"{DIM}fail={e['fail_count']}{R}  {status}")
+                if single is not None:
+                    status = (f"{YELLOW}cooldown {single['cooldown_remaining']:.0f}s{R}"
+                              if single["cooldown_remaining"] > 0 else f"{GREEN}sẵn sàng{R}")
+                    _lines.append(f"  {CYAN}single{R}. {_pool_mask(single['key'])}  "
+                                  f"{DIM}fail={single['fail_count']}{R}  {status}")
+                if not pool:
+                    _lines.append(f"  {DIM}(/rmkey chỉ áp dụng cho key được đánh số trong pool){R}")
                 _txt = "\n".join(_lines) + "\n"
             if state: state.emit(EV_INFO, text=_txt, raw=True)
             else: print(_txt)

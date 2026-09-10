@@ -30,30 +30,24 @@ def _read_response_limited(resp, limit=_HTTP_BODY_LIMIT) -> bytes:
         if total > limit:
             raise RuntimeError(f"HTTP response exceeds {limit:,} bytes")
 
-# ── Màu — Open CLI Codex · amber-on-dark hacker palette ─────────────────────
+# ── Màu — Open CLI Codex · dark terminal palette ─────────────────────────────
 R="\033[0m"; BOLD="\033[1m"
-# Primary: warm amber / gold
-CYAN="\033[38;5;214m"       # amber-gold  (thay cyan mặc định)
-TEAL="\033[38;5;220m"       # bright gold (accent mạnh)
-# Secondary: xanh lá terminal kinh điển
-GREEN="\033[38;5;114m"      # muted terminal green
-BLUE="\033[38;5;74m"        # steel blue (plan mode)
-# Alert / warning
-YELLOW="\033[38;5;229m"     # pale yellow
-RED="\033[38;5;196m"        # sharp red
-# Neutral
-WHITE="\033[38;5;231m"      # near-white
-GRAY="\033[38;5;240m"       # dark gray
-MAGENTA="\033[38;5;177m"    # soft violet (giữ cho backward compat)
+CYAN="\033[38;5;110m"       # interactive controls / active focus
+TEAL="\033[38;5;116m"       # assistant heading / informational accent
+GREEN="\033[38;5;114m"      # confirmed success / additions
+BLUE="\033[38;5;75m"         # tool-card border / plan mode
+YELLOW="\033[38;5;179m"     # warnings only
+RED="\033[38;5;210m"        # errors / deletions
+WHITE="\033[38;5;255m"      # primary text; never dim inside a card
+GRAY="\033[38;5;246m"       # readable secondary text / structure
+MAGENTA="\033[38;5;177m"    # backward compatibility
 DIM="\033[2m"
 
 # ── Spinner ──────────────────────────────────────────────────────────────────
 class Spinner:
     """Hiển thị spinner animation trên terminal khi AI đang xử lý."""
-    # Rotating bar — clean, universal
+    # Rotating bar — compact, legible on Termux.
     FRAMES = ["─", "\\", "│", "/", "─", "\\", "│", "/"]
-    # Matrix rain drops — chars hiện nhanh bên cạnh label
-    _RAIN  = "01アイウエオカキクケコサシスセソタチツテトナニヌネノ"
 
     def __init__(self, label="Thinking"):
         self.label   = label
@@ -62,10 +56,8 @@ class Spinner:
         self._start_t = 0.0
 
     def _run(self):
-        import random as _r
         i = 0
         self._start_t = time.time()
-        rain_buf = ["  ", "  ", "  "]
         was_hidden = False
         while not self._stop.is_set():
             # ── Im lặng khi web đang armed ───────────────────────────────
@@ -96,12 +88,8 @@ class Spinner:
             frame   = self.FRAMES[i % len(self.FRAMES)]
             elapsed = time.time() - self._start_t
             elapsed_s = f" {elapsed:.1f}s" if elapsed >= 1 else ""
-            if i % 2 == 0:
-                rain_buf = [_r.choice(self._RAIN) for _ in range(3)]
-            rain_str = "".join(f"{GRAY}{c}{R}" for c in rain_buf)
             sys.stdout.write(
-                f"\r{TEAL}{frame}{R} {CYAN}{self.label}{R} "
-                f"{rain_str}"
+                f"\r{CYAN}{frame}{R} {WHITE}{self.label}{R}"
                 f"{GRAY}{elapsed_s}{R}"
                 f"   "
             )
@@ -211,6 +199,7 @@ def _multiline_input_with_hint(prompt: str) -> str | None:
     hist_idx  = len(_input_history)
     hist_saved = ""
     has_hint  = [False]
+    previous_winch = None
 
     # ── render: hint hiện inline sau text trên cùng dòng ─────────────────────
     _ANSI_RE = re.compile(r"\033\[[0-9;]*m")
@@ -258,6 +247,14 @@ def _multiline_input_with_hint(prompt: str) -> str | None:
                     hint = f"@{files[0]}" + (f"  +{len(files)-1}" if len(files) > 1 else "")
         has_hint[0] = bool(hint)
         _redraw(text, hint)
+
+    # Termux emits SIGWINCH when font zoom changes the terminal column count.
+    # Redraw the active raw-mode input immediately instead of waiting for a key.
+    if hasattr(signal, "SIGWINCH"):
+        previous_winch = signal.getsignal(signal.SIGWINCH)
+        def _on_resize(_signum, _frame):
+            _render("".join(buf))
+        signal.signal(signal.SIGWINCH, _on_resize)
 
     # ── main raw loop ─────────────────────────────────────────────────────────
     try:
@@ -378,6 +375,8 @@ def _multiline_input_with_hint(prompt: str) -> str | None:
     except Exception:
         return _multiline_input(prompt)
     finally:
+        if previous_winch is not None:
+            signal.signal(signal.SIGWINCH, previous_winch)
         try:
             sys.stdout.write("\x1b[?2004l")
             sys.stdout.flush()

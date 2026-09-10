@@ -925,9 +925,11 @@ def _resolve_delegate_model(main_model, api_key, conn, sid, state):
     if chosen and chosen != "__add_custom__" and chosen_provider is not None:
         delegate_key = _get_api_key_for_provider(chosen_provider) if not _web_armed else api_key
         if delegate_key is not None:
-            cfg["delegate_model"] = chosen
-            cfg["delegate_provider"] = chosen_provider
-            save_config(cfg)
+            with _pool_lock, _config_file_lock():
+                cfg = load_config()
+                cfg["delegate_model"] = chosen
+                cfg["delegate_provider"] = chosen_provider
+                save_config(cfg)
             return chosen, chosen_provider, delegate_key, None
 
     return (main_model, _active_provider, api_key,
@@ -1061,7 +1063,7 @@ def _tool_delegate_inner(task_type, instruction, expected_output, target_files,
 # Không có rủi ro mới: "edit" đã ghi file được
 # rồi, multiedit/apply_patch chỉ đổi CÁCH ghi (gộp nhiều thay đổi 1 lần
 # gọi), không mở quyền nào chưa từng có.
-_DEFAULT_SUB_TOOLS = {"bash","read","write","edit","multiedit","apply_patch",
+_DEFAULT_SUB_TOOLS = {"bash","read","write","append","edit","multiedit","apply_patch",
                       "glob","grep","webfetch","websearch","todoread"}
 
 
@@ -1464,7 +1466,16 @@ def _run_subagent_loop(sub_messages, sub_sys, allowed, model, api_key, conn, sid
                     _sub_seen_state, _sub_seen_effect, _sub_resource_epochs,
                     name, args, _sub_epoch)
                 if duplicate:
-                    out = f"[dedup] Skipped unchanged duplicate call: {name}"
+                    out = (
+                        f"[dedup] Skipped unchanged duplicate call: {name}; reuse its previous result.\n"
+                        "[tool_status] "
+                        + json.dumps({
+                            "ok": True, "pass": True, "status": "completed",
+                            "changed": False, "verified": "not_requested",
+                            "executed": False, "deduplicated": True,
+                            "reuse_previous_result": True,
+                        }, separators=(",", ":"))
+                    )
                     sub_messages.append({"role":"tool","tool_call_id":tc.get("id",""),"content":out})
                     continue
                 _sub_line = f"  {BLUE}[{log_prefix}:{name}]{R} {DIM}{json.dumps(args)[:80]}{R}"
@@ -1888,6 +1899,7 @@ def _dispatch_tool(name, args, model, api_key, conn, sid, state=None):
         "bash":        lambda a: tool_bash(a["command"], a.get("timeout",30)),
         "read":        lambda a: tool_read(a["path"], a.get("offset",1), a.get("limit",READ_DEFAULT_LIMIT), a.get("depth",4), state),
         "write":       lambda a: tool_write(a["path"], a["content"], conn, sid),
+        "append":      lambda a: tool_append(a["path"], a["content"], a.get("create", False), conn, sid),
         "delete":      lambda a: tool_delete(a["path"], conn, sid),
         "extract":     lambda a: tool_extract(a["src"], a["start"], a["end"], a["dst"], a.get("mode","move"), conn, sid),
         "edit":        lambda a: tool_edit(a["path"], a["old_str"], a["new_str"], conn, sid),
@@ -1931,6 +1943,7 @@ TOOL_ICONS = {
     "bash":        f"{YELLOW}$",
     "read":        f"{CYAN}📄",
     "write":       f"{GREEN}✎",
+    "append":      f"{GREEN}✎",
     "delete":      f"{RED}🗑",
     "extract":     f"{GREEN}✂",
     "edit":        f"{GREEN}✎",
@@ -1952,6 +1965,145 @@ TOOL_ICONS = {
     "verify":      f"{CYAN}⊙",
 }
 
+
+def _tool_change_preview(name: str, args: dict, limit: int = 36) -> dict | None:
+    """Return a small, transport-safe diff preview for CLI and Web renderers."""
+    if name not in ("write", "append", "edit", "multiedit", "apply_patch"):
+        return None
+    path = str(args.get("path") or "untitled")
+    action = {"write": "Create", "append": "Append", "edit": "Edit", "multiedit": "Edit", "apply_patch": "Patch"}[name]
+    rows = []
+
+    def add_diff(old_text, new_text):
+        old_no = new_no = 1
+        for line in difflib.ndiff(str(old_text).splitlines(), str(new_text).splitlines()):
+            kind, text = line[:2], line[2:]
+            if kind == "? ":
+                continue
+            if kind == "  ":
+                rows.append({"kind": "ctx", "old": old_no, "new": new_no, "text": text})
+                old_no += 1; new_no += 1
+            elif kind == "- ":
+                rows.append({"kind": "del", "old": old_no, "new": None, "text": text})
+                old_no += 1
+            elif kind == "+ ":
+                rows.append({"kind": "add", "old": None, "new": new_no, "text": text})
+                new_no += 1
+
+    if name == "edit":
+        add_diff(args.get("old_str", ""), args.get("new_str", ""))
+    elif name == "multiedit":
+        for edit in args.get("edits", [])[:4]:
+            add_diff(edit.get("old_str", ""), edit.get("new_str", ""))
+    elif name in ("write", "append"):
+        add_diff("", args.get("content", ""))
+    else:
+        for text in str(args.get("patch", "")).splitlines():
+            if text.startswith("+") and not text.startswith("+++"):
+                rows.append({"kind": "add", "old": None, "new": None, "text": text[1:]})
+            elif text.startswith("-") and not text.startswith("---"):
+                rows.append({"kind": "del", "old": None, "new": None, "text": text[1:]})
+            elif text.startswith("@@"):
+                rows.append({"kind": "hunk", "old": None, "new": None, "text": text})
+
+    changed = [r for r in rows if r["kind"] != "ctx"]
+    if not changed:
+        return None
+    # Keep a little context only; never let an edit flood Termux or mobile Web.
+    if len(rows) > limit:
+        first = max(0, min(next(i for i, r in enumerate(rows) if r["kind"] != "ctx") - 2, len(rows) - limit))
+        shown = rows[first:first + limit]
+    else:
+        shown = rows
+    return {"action": action, "path": path, "lines": shown, "hidden": max(0, len(rows) - len(shown))}
+
+
+# ── Tool result contract ───────────────────────────────────────────────────
+# Tool implementations intentionally keep their useful human-readable output
+# (file snippets, compiler output, search results, ...).  Appending this small
+# JSON record gives every caller one unambiguous machine-readable conclusion
+# without forcing each of the many early-return branches to duplicate it.
+#
+# It is appended, not prepended: existing failure-prefix consumers
+# (_tool_result_is_failure(), loop guard, history migration and provider
+# adapters) still see their established [error]/[policy]/[sandbox] prefixes.
+_TOOL_MUTATION_NAMES = {
+    "write", "append", "delete", "extract", "edit", "multiedit", "apply_patch",
+    "todowrite",
+}
+_TOOL_READONLY_NAMES = {
+    "read", "glob", "grep", "view_symbol", "webfetch", "websearch",
+    "todoread", "skill", "lsp", "file_index",
+}
+
+
+def _tool_result_contract(name: str, result, args: dict | None = None) -> str:
+    """Return a compact, conservative status record for every tool result.
+
+    ``ok`` says whether the requested tool operation completed successfully.
+    ``changed`` never guesses: it is true only for a confirmed built-in file/
+    todo mutation, false for known read-only tools, otherwise ``"unknown"``.
+    Remote MCP tools and Bash can have opaque or external side effects, so
+    their changed state deliberately remains unknown.
+    """
+    text = str(result or "")
+    low = text.lstrip().lower()
+    blocked = low.startswith(("[policy]", "[sandbox]", "[permission denied"))
+    failed = _tool_result_is_failure(text)
+
+    # Bash reports its own structured status but does not use the usual
+    # [error...] prefix.  Treat a non-zero/timeout diagnostic as failure here
+    # so models and the result contract agree on the outcome.
+    if name == "bash":
+        bash_status = re.search(r"^status:\s*(\w+)", text, re.MULTILINE | re.IGNORECASE)
+        if bash_status and bash_status.group(1).lower() != "ok":
+            failed = True
+        # serve: has a separate result format; the known failure messages are
+        # deliberately recognised without declaring an opaque server start a
+        # stronger guarantee than its handler actually provides.
+        if low.startswith("[serve]") and any(marker in low for marker in (
+                "thiếu lệnh", "đang do tiến trình khác sử dụng",
+                "không khởi động được", "thoát ngay")):
+            failed = True
+
+    no_result = (
+        (name in {"glob", "grep", "websearch"} and "(no match" in low)
+        or (name == "todoread" and low.startswith("(no todos)"))
+        or (name == "question" and low.startswith(("(no answer)", "(user did not answer)")))
+    )
+
+    if blocked:
+        state = "blocked"
+    elif failed:
+        state = "failed"
+    elif no_result:
+        state = "no_result"
+    else:
+        state = "completed"
+
+    ok = not failed
+    if name in _TOOL_MUTATION_NAMES:
+        changed = True if ok else False
+    elif name in _TOOL_READONLY_NAMES or name in {"question", "verify"}:
+        changed = False
+    else:
+        changed = "unknown"
+
+    # `verify` is semantically different from a tool execution: it may run
+    # correctly yet still lack a human observation.  Expose that separately.
+    verified = "not_requested"
+    if name == "verify":
+        verified = not low.startswith("[verify] no user observation") and not failed
+
+    contract = {
+        "ok": ok,
+        "pass": ok and state == "completed",
+        "status": state,
+        "changed": changed,
+        "verified": verified,
+    }
+    return "\n\n[tool_status] " + json.dumps(contract, ensure_ascii=False, separators=(",", ":"))
+
 def run_tool(name, args, model, api_key, conn, sid, state=None):
     if not isinstance(name, str) or not name or not isinstance(args, dict):
         error = "[tool_error: tool name must be a string and arguments must be an object]"
@@ -1961,8 +2113,9 @@ def run_tool(name, args, model, api_key, conn, sid, state=None):
         preview = json.dumps(args, ensure_ascii=False)[:100]
     except Exception:
         preview = "<unserializable arguments>"
+    change_preview = _tool_change_preview(name, args)
     if state is not None:
-        state.emit(EV_TOOL_START, name=name, args=args, preview=preview)
+        state.emit(EV_TOOL_START, name=name, args=args, preview=preview, diff=change_preview)
     else:
         print(f"  {icon} {BOLD}{name}{R}  {DIM}{preview}{R}")
     result = _dispatch_tool(name, args, model, api_key, conn, sid, state)
@@ -1990,7 +2143,7 @@ def run_tool(name, args, model, api_key, conn, sid, state=None):
     # trước khi gọi, để codeweb_maybe_auto_preview không cần biết gì về sự
     # khác biệt tên field giữa các tool.
     success = not _tool_result_is_failure(str(result))
-    if success and name in ("write", "edit", "multiedit", "apply_patch", "extract"):
+    if success and name in ("write", "append", "edit", "multiedit", "apply_patch", "extract"):
         try:
             _cw_args = args
             if name == "extract" and isinstance(args, dict) and "dst" in args:
@@ -2004,11 +2157,12 @@ def run_tool(name, args, model, api_key, conn, sid, state=None):
     # đọc giờ tới 700 dòng và 1 cap cố định 12k chars sẽ cắt giữa oan hầu hết
     # các lần đọc lớn. Các tool khác (bash/grep/glob/...) không đổi.
     _model_cap = _read_output_cap(args.get("limit", READ_DEFAULT_LIMIT)) if name == "read" else TOOL_OUTPUT_MAX_CHARS
-    result_for_model   = _head_tail(str(result), _model_cap,  label=name)
+    result_with_contract = str(result) + _tool_result_contract(name, result, args)
+    result_for_model   = _head_tail(result_with_contract, _model_cap,  label=name)
     # Cap what stays in context history (even smaller — lives forever).
     # KHÔNG co giãn theo read — tầng này tồn tại vĩnh viễn sau khi bị prune,
     # phình theo limit đọc sẽ làm đúng điều cần tránh: context cũ phí chỗ.
-    result_for_history = _head_tail(str(result), TOOL_HISTORY_MAX_CHARS, label=name)
+    result_for_history = _head_tail(result_with_contract, TOOL_HISTORY_MAX_CHARS, label=name)
     return result_for_model, result_for_history
 
 # ════════════════════════════════════════════════════════════════════════════

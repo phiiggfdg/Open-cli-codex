@@ -7,10 +7,64 @@ def load_config() -> dict:
             raise RuntimeError(f"Config hỏng hoặc không đọc được: {CONFIG_PATH}: {e}") from e
     return {}
 
+_config_file_lock_state = threading.local()
+
+
+class _ConfigFileLock:
+    """Re-entrant, best-effort exclusive lock shared by all config writers."""
+    def __enter__(self):
+        state = _config_file_lock_state
+        depth = getattr(state, "depth", 0)
+        if depth:
+            state.depth = depth + 1
+            return self
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        handle = open(DATA_DIR / ".config.lock", "a", encoding="utf-8")
+        try:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            state.fcntl = fcntl
+        except (ImportError, OSError):
+            state.fcntl = None
+        state.handle = handle
+        state.depth = 1
+        return self
+
+    def __exit__(self, *_):
+        state = _config_file_lock_state
+        state.depth -= 1
+        if state.depth:
+            return
+        try:
+            if state.fcntl is not None:
+                state.fcntl.flock(state.handle.fileno(), state.fcntl.LOCK_UN)
+        finally:
+            state.handle.close()
+            del state.handle
+            del state.fcntl
+
+
+def _config_file_lock():
+    return _ConfigFileLock()
+
+
 def save_config(cfg: dict):
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    CONFIG_PATH.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
-    CONFIG_PATH.chmod(0o600)
+    """Persist config atomically so an interrupted write cannot corrupt JSON."""
+    with _config_file_lock():
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(prefix=".config.", dir=str(DATA_DIR))
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, indent=2, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_name, CONFIG_PATH)
+        finally:
+            try:
+                Path(tmp_name).unlink(missing_ok=True)
+            except OSError:
+                pass
 
 def history_load() -> list[str]:
     """Load input history từ .fw_data/history."""
@@ -142,7 +196,7 @@ def get_api_key():
             # Nếu ghi thẳng bằng `cfg` cũ, save_config() sẽ ghi đè TOÀN FILE
             # bằng bản cfg cũ đó, xoá mất thay đổi của thread kia (lost
             # update) — đã verify race này bằng test thực nghiệm.
-            with _pool_lock:
+            with _pool_lock, _config_file_lock():
                 cfg = load_config()
                 cfg[p["config_key"]] = key
                 save_config(cfg)
@@ -231,13 +285,17 @@ def _load_extra_models() -> list[str]:
 
 def _save_extra_model(model_id: str):
     """Thêm 1 model vào danh sách extra của provider active."""
-    cfg  = load_config()
-    key  = f"{_active_provider}_extra_models"
-    lst  = cfg.get(key, [])
-    if model_id not in lst:
-        lst.append(model_id)
-        cfg[key] = lst
-        save_config(cfg)
+    # This can run while the background rename request updates key-pool state.
+    # Re-read under the shared lock immediately before saving to avoid a stale
+    # config snapshot overwriting that update.
+    with _pool_lock, _config_file_lock():
+        cfg  = load_config()
+        key  = f"{_active_provider}_extra_models"
+        lst  = cfg.get(key, [])
+        if model_id not in lst:
+            lst.append(model_id)
+            cfg[key] = lst
+            save_config(cfg)
 
 # ── Tab groups cho CLI model picker ──────────────────────────────────────────
 # Mỗi tuple: (tên_tab, [keywords]). Keywords khớp substring tên model (lower).
@@ -424,7 +482,7 @@ def _choose_model_tui(models: list, is_requesty: bool, free_set: set,
         lines = 0
 
         # ── Header ──────────────────────────────────────────────────────────
-        hdr = f"  {BOLD}{CYAN}◈ Chọn model  {DIM}[{provider_name}]{R}"
+        hdr = f"  {BOLD}{WHITE}Select model{R}  {GRAY}· {provider_name}{R}"
         if is_requesty:
             hdr += f"  {DIM}🆓 = free (200 req/day){R}"
         lines += _emit(hdr, tw)
@@ -435,7 +493,7 @@ def _choose_model_tui(models: list, is_requesty: bool, free_set: set,
             for i, (tname, tlst) in enumerate(tabs):
                 cnt = len(tlst)
                 if i == st["tab"]:
-                    parts.append(f"{TEAL}{BOLD}[{tname} {cnt}]{R}")
+                    parts.append(f"{CYAN}{BOLD}[{tname} {cnt}]{R}")
                 else:
                     parts.append(f"{GRAY}{tname} {cnt}{R}")
             lines += _emit("  " + "  ".join(parts), tw)
@@ -444,8 +502,8 @@ def _choose_model_tui(models: list, is_requesty: bool, free_set: set,
         if st["mode"] == "search":
             q_disp = f"{CYAN}{st['q']}{R}" if st["q"] else ""
             lines += _emit(
-                f"  {YELLOW}🔍 {R}{q_disp}{TEAL}▌{R}"
-                f"  {DIM}Esc quay lại{R}", tw
+                f"  {GRAY}Search{R}  {CYAN}{q_disp}{R}{CYAN}▌{R}"
+                f"  {DIM}Esc to browse{R}", tw
             )
             cnt_info = (f"  {DIM}{len(st['sres'])} kết quả "
                         f"(trang {(st['scur']//PAGE_SIZE)+1}/"
@@ -454,7 +512,7 @@ def _choose_model_tui(models: list, is_requesty: bool, free_set: set,
             lines += _emit(cnt_info, tw)
 
         # ── Divider ──────────────────────────────────────────────────────────
-        lines += _emit(f"  {GRAY}{'─' * dw}{R}", tw)
+        lines += _emit(f"  {GRAY}╭{'─' * max(dw - 1, 1)}{R}", tw)
 
         # ── Model list ───────────────────────────────────────────────────────
         items = _cur_items()
@@ -470,25 +528,25 @@ def _choose_model_tui(models: list, is_requesty: bool, free_set: set,
                 display = m if is_requesty else m.split("/")[-1]
                 badge   = f" {GREEN}🆓{R}" if is_free else ""
                 if is_sel:
-                    lines += _emit(f"  {TEAL}▶ {BOLD}{display}{R}{badge}", tw)
+                    lines += _emit(f"  {CYAN}│{R} {CYAN}▶{R} {WHITE}{BOLD}{display}{R}{badge}", tw)
                 else:
-                    lines += _emit(f"  {GRAY}  {R}{display}{badge}", tw)
+                    lines += _emit(f"  {GRAY}│  {R}{WHITE}{display}{R}{badge}", tw)
 
         # ── Divider ──────────────────────────────────────────────────────────
-        lines += _emit(f"  {GRAY}{'─' * dw}{R}", tw)
+        lines += _emit(f"  {GRAY}╰{'─' * max(dw - 1, 1)}{R}", tw)
 
         # ── Footer nav ───────────────────────────────────────────────────────
         if st["mode"] == "browse":
             cp, tp, tc = _page_info()
             pg = f"{GRAY}Trang {cp+1}/{tp}  ({tc} model){R}"
-            nav = (f"{CYAN}↑↓{R} chọn  {CYAN}←→{R} tab  "
-                   f"{CYAN}[]{R} trang  {YELLOW}/{R} tìm  "
-                   f"{YELLOW}T{R} thêm  {RED}q{R} thoát")
+            nav = (f"{CYAN}↑↓{R} move  {CYAN}←→{R} group  "
+                   f"{CYAN}[]{R} page  {CYAN}/{R} search  "
+                   f"{CYAN}T{R} add  {GRAY}q{R} cancel")
             lines += _emit(f"  {pg}", tw)
             lines += _emit(f"  {nav}", tw)
         else:
-            nav = (f"{CYAN}↑↓{R} chọn  {GREEN}Enter{R} xác nhận  "
-                   f"{RED}Esc{R} quay lại")
+            nav = (f"{CYAN}↑↓{R} move  {GREEN}Enter{R} select  "
+                   f"{GRAY}Esc{R} browse")
             lines += _emit(f"  {nav}", tw)
 
         sys.stdout.flush()
@@ -499,6 +557,13 @@ def _choose_model_tui(models: list, is_requesty: bool, free_set: set,
         except Exception: pass
 
     result = [None]
+    previous_winch = None
+
+    if hasattr(signal, "SIGWINCH"):
+        previous_winch = signal.getsignal(signal.SIGWINCH)
+        def _on_resize(_signum, _frame):
+            _clear(); _draw()
+        signal.signal(signal.SIGWINCH, _on_resize)
 
     try:
         _tty.setraw(fd)
@@ -619,6 +684,8 @@ def _choose_model_tui(models: list, is_requesty: bool, free_set: set,
     except Exception:
         pass
     finally:
+        if previous_winch is not None:
+            signal.signal(signal.SIGWINCH, previous_winch)
         _exit_raw()
 
     return result[0]
@@ -703,25 +770,27 @@ def choose_model(api_key):
         # Xử lý region cho Requesty
         if is_requesty:
             free_regions = p.get("free_model_regions", {})
-            cfg = load_config()
             if chosen_model in free_set:
                 auto_region = free_regions.get(chosen_model)
                 if auto_region:
-                    cfg["requesty_region"] = auto_region
                     print(f"  {GREEN}✓ Vùng tự động: {auto_region} (free model){R}\n")
                 else:
-                    cfg.pop("requesty_region", None)
                     print(f"  {GREEN}✓ Vùng: Global (free model){R}\n")
-                save_config(cfg)
+                desired_region = auto_region
             else:
                 if "@" in chosen_model:
-                    cfg.pop("requesty_region", None)
+                    desired_region = None
                 else:
                     region = _requesty_choose_region(chosen_model)
-                    if region and region.lower() != "global":
-                        cfg["requesty_region"] = region
-                    else:
-                        cfg.pop("requesty_region", None)
+                    desired_region = region if region and region.lower() != "global" else None
+            # Do not retain a config snapshot while the region picker waits
+            # for input: re-read and alter only this field under both locks.
+            with _pool_lock, _config_file_lock():
+                cfg = load_config()
+                if desired_region:
+                    cfg["requesty_region"] = desired_region
+                else:
+                    cfg.pop("requesty_region", None)
                 save_config(cfg)
 
         return chosen_model
@@ -771,18 +840,21 @@ def _web_choose_model(state, api_key):
     # return None, không được thoát hẳn tiến trình CLI).
     if is_requesty:
         free_regions = p.get("free_model_regions", {})
-        cfg = load_config()
         if chosen_model in free_set:
             auto_region = free_regions.get(chosen_model)
-            if auto_region:
-                cfg["requesty_region"] = auto_region
-            else:
-                cfg.pop("requesty_region", None)
-            save_config(cfg)
+            with _pool_lock, _config_file_lock():
+                cfg = load_config()
+                if auto_region:
+                    cfg["requesty_region"] = auto_region
+                else:
+                    cfg.pop("requesty_region", None)
+                save_config(cfg)
         else:
             if "@" in chosen_model:
-                cfg.pop("requesty_region", None)
-                save_config(cfg)
+                with _pool_lock, _config_file_lock():
+                    cfg = load_config()
+                    cfg.pop("requesty_region", None)
+                    save_config(cfg)
             # Model trả phí không phải dạng "@region" -- CLI gốc mở thêm 1
             # bước chọn region tương tác (_requesty_choose_region, raw-mode
             # input riêng). KHÔNG portable lên web trong lần này (yêu cầu
@@ -990,7 +1062,20 @@ def _stream_response(resp, text_parts, tc_raw, usage_out, spinner_ref, reasoning
                       handle_gemini_metadata=False, valid_tool_names=None, state=None):
     """
     Đọc SSE stream từ resp, fill vào text_parts / tc_raw / usage_out (dict).
-    Trả về finish_reason (str | None).
+    Trả về (finish_reason, saw_done):
+      - finish_reason: str | None — lấy từ choice["finish_reason"] nếu provider
+        có gửi ("stop"/"length"/"tool_calls"/...).
+      - saw_done: bool — True chỉ khi vòng lặp thoát vì thấy đúng dòng
+        "data: [DONE]". False cho MỌI lối thoát khác (raw_line rỗng /
+        StopIteration) — đây là trường hợp kết nối/stream bị ngắt bất
+        thường (mạng rớt, gateway đóng sớm...) TRƯỚC KHI provider kịp báo
+        kết thúc, khác hẳn "server chủ động đóng sau khi xong việc". Caller
+        (call_api_stream) dùng saw_done để phân biệt lỗi mạng thật với lỗi
+        tool call/JSON hỏng, thay vì báo nhầm 1 trong 2 loại như trước.
+        Cả 3 adapter (Bedrock/Anthropic/OpenAI Responses — xem
+        wrap_stream_response/wrap_anthropic_stream/wrap_openai_responses_stream)
+        đều tự chèn "data: [DONE]" khi dịch xong 1 stream hợp lệ, nên tín
+        hiệu này đúng cho mọi provider, không riêng OpenAI-compatible gốc.
     spinner_ref: list[Spinner] — stop spinner khi token đầu tiên về.
     reasoning_parts: list | None — nếu truyền vào, gom delta.reasoning_content
         (DeepSeek thinking mode / adapter dịch sang field này) và delta.reasoning
@@ -1017,6 +1102,7 @@ def _stream_response(resp, text_parts, tc_raw, usage_out, spinner_ref, reasoning
     """
     global _thinking_leak_warned_session
     finish_reason = None
+    saw_done      = False
     first_token   = True
     first_thinking = True
     # Web: mỗi lần nhận được 1 dòng SSE mới, kiểm tra xem web_bridge có yêu
@@ -1081,7 +1167,9 @@ def _stream_response(resp, text_parts, tc_raw, usage_out, spinner_ref, reasoning
             continue
         _data_line_count += 1
         ds = line[5:].strip()
-        if ds == "[DONE]": break
+        if ds == "[DONE]":
+            saw_done = True
+            break
         try:
             chunk  = json.loads(ds)
             if not isinstance(chunk, dict):
@@ -1310,7 +1398,7 @@ def _stream_response(resp, text_parts, tc_raw, usage_out, spinner_ref, reasoning
     for tc in tc_raw.values():
         tc["function"]["name"] = _resolve_streamed_tool_name(
             tc.pop("_name_parts", []), valid_tool_names)
-    return finish_reason
+    return finish_reason, saw_done
 
 
 def _sanitize_tool_turns(messages: list) -> list:
@@ -1352,14 +1440,8 @@ def _sanitize_tool_turns(messages: list) -> list:
                     continue
                 if not isinstance(name, str) or not name.strip():
                     continue
-                # Một số history cũ lưu arguments đã decode thành object;
-                # chuyển lại thành JSON để adapter nhận đúng kiểu chuẩn.
-                if isinstance(args, (dict, list)):
-                    try:
-                        args = json.dumps(args, ensure_ascii=False)
-                    except Exception:
-                        continue
-                if not isinstance(args, str) or len(args) > 2 * 1024 * 1024:
+                args, _args_note = _normalize_tool_arguments(args)
+                if args is None:
                     continue
                 tc = dict(raw_tc)
                 tc["id"] = tc_id.strip()[:256]
@@ -1372,6 +1454,10 @@ def _sanitize_tool_turns(messages: list) -> list:
                 msg["tool_calls"] = clean_tcs
             else:
                 msg.pop("tool_calls", None)
+                if not msg.get("content"):
+                    # The only content was an invalid tool call.  Do not
+                    # replay an empty assistant message after dropping it.
+                    continue
         safe_messages.append(msg)
 
     # Rebuild each assistant→tool group in chronological order. This removes
@@ -1467,7 +1553,7 @@ def _thinking_support_set(model: str, supported: bool):
     # session có thể đang ghi pool cùng lúc). Bọc _pool_lock để tránh lost
     # update / crash JSONDecodeError khi save_config() (ghi đè toàn file,
     # không atomic) đụng độ giữa 2 thread.
-    with _pool_lock:
+    with _pool_lock, _config_file_lock():
         cfg = load_config()
         table = cfg.get("thinking_support", {})
         table[_thinking_key(model)] = supported
@@ -1625,7 +1711,7 @@ def _thinking_disable_mark_probed(model: str):
 
     FIX (đồng bộ key): bọc _pool_lock — cùng lý do với _thinking_support_set
     ở trên (share config.json với pool, thread nền có thể ghi cùng lúc)."""
-    with _pool_lock:
+    with _pool_lock, _config_file_lock():
         cfg = load_config()
         table = cfg.get("thinking_disable_warned", {})
         table[_thinking_disable_key(model)] = True
@@ -1650,13 +1736,13 @@ def _vision_support_get(model: str):
     # đọc-sửa-ghi file này gần như đồng thời (vd _auto_rename_session chạy
     # nền + turn có ảnh chạy cùng lúc) — dùng chung 1 lock loại bỏ race đó
     # thay vì chỉ bảo vệ pool mà bỏ sót vision_support.
-    with _pool_lock:
+    with _pool_lock, _config_file_lock():
         cfg = load_config()
         table = cfg.get("vision_support", {})
         return table.get(_vision_key(model))  # None nếu chưa biết
 
 def _vision_support_set(model: str, supported: bool):
-    with _pool_lock:
+    with _pool_lock, _config_file_lock():
         cfg = load_config()
         table = cfg.get("vision_support", {})
         table[_vision_key(model)] = supported
@@ -1726,7 +1812,7 @@ def _format_override_get_raw(model: str):
     """Trả về value thô đã lưu (dict mới hoặc bool cũ), None nếu chưa từng
     override. Dùng nội bộ bởi _format_anthropic_for/_format_base_url_for —
     code khác nên gọi 2 hàm đó thay vì đọc raw trực tiếp."""
-    with _pool_lock:
+    with _pool_lock, _config_file_lock():
         cfg = load_config()
         table = cfg.get("model_format_override", {})
         return table.get(_format_override_key(model))
@@ -1745,7 +1831,7 @@ def _format_override_set(model: str, format_kind: str, base_url: str | None = No
     vẫn ra đúng giá trị — không cần biết field "format_kind" mới tồn tại.
     Đây là lý do KHÔNG xoá field cũ, dù _format_anthropic_for() bên dưới
     giờ đã đọc qua _format_kind_for() là chính."""
-    with _pool_lock:
+    with _pool_lock, _config_file_lock():
         cfg = load_config()
         table = cfg.get("model_format_override", {})
         table[_format_override_key(model)] = {
@@ -1812,7 +1898,7 @@ def _format_override_clear(model: str) -> bool:
     lại (hỏi cũng vô ích vì override vừa lưu đã chứng minh sai). Trả về
     True nếu có override thật sự bị xoá, False nếu model này chưa từng có
     override (gọi nhầm/không cần thiết)."""
-    with _pool_lock:
+    with _pool_lock, _config_file_lock():
         cfg = load_config()
         table = cfg.get("model_format_override", {})
         key = _format_override_key(model)
@@ -2228,6 +2314,28 @@ def _probe_thinking_disable(model: str, api_key: str) -> bool:
 # Tránh việc turn nào cũng phải dính 400 rồi retry lại từ đầu.
 _known_max_tokens: dict = {}
 
+
+def _is_invalid_function_arguments_error(body: str) -> bool:
+    """Recognize provider-side rejection of model-generated tool arguments."""
+    low = (body or "").lower()
+    return any(marker in low for marker in (
+        "invalid function arguments",
+        "function arguments must be a valid json object",
+        "function arguments must be valid json",
+        "invalid tool arguments",
+        "tool arguments must be a valid json object",
+    ))
+
+
+_TOOL_ARGUMENT_RECOVERY_PROMPT = (
+    "[tool-call recovery] The provider rejected the previous tool call because "
+    "its arguments were not valid JSON. No tool ran. Retry the intended action "
+    "now with exactly one compact, complete JSON-object tool call. Do not emit "
+    "code fences, commentary, a partial JSON object, or unescaped control "
+    "characters inside arguments. For a large new file, first use write for a "
+    "small valid initial section, then use append in small chunks."
+)
+
 def call_api_stream(messages, model, api_key, tool_choice="auto", session_id=None, tools=None, state=None):
     # Ưu tiên key pool chọn (nếu có >1 key) — tránh mở turn mới bằng đúng
     # key vừa bị 429/cooldown ở turn trước, vì main() giữ biến api_key cũ
@@ -2281,6 +2389,7 @@ def call_api_stream(messages, model, api_key, tool_choice="auto", session_id=Non
 
     usage: dict   = {}
     finish_reason = None
+    saw_done      = False
     interrupted   = False
     spinner       = Spinner("Thinking")
     spinner.start()
@@ -2293,6 +2402,7 @@ def call_api_stream(messages, model, api_key, tool_choice="auto", session_id=Non
     # ở lần sau (_format_override_get_raw trả None) nên tự nhiên dừng — cờ
     # này chỉ để tránh trường hợp logic tương lai vô tình cho phép xoá lặp.
     _format_recovery_done = False
+    _tool_argument_recovery_done = False
     # Cờ chặn lặp cho cơ chế tự retry-bỏ-bash (xem nhánh "no endpoints found
     # that support tool use" bên dưới): 1 số provider free-tier trên
     # OpenRouter route model qua endpoint không hỗ trợ tool `bash` cụ thể
@@ -2341,7 +2451,7 @@ def call_api_stream(messages, model, api_key, tool_choice="auto", session_id=Non
                               else wrap_openai_responses_stream(resp)
                               if _fmt_kind_stream == "openai_responses"
                               else resp)
-                finish_reason = _stream_response(
+                finish_reason, saw_done = _stream_response(
                     stream_src, text_parts, tc_raw, usage, spinner_ref,
                     reasoning_parts=reasoning_parts,
                     thinking_parts=thinking_parts, thinking_sig=thinking_sig,
@@ -2354,7 +2464,44 @@ def call_api_stream(messages, model, api_key, tool_choice="auto", session_id=Non
                     },
                     state=state)
             _rate_limit_mark()
-            pool_mark_success(api_key)  # key này ổn → giảm fail_count (decay)
+            pool_mark_success(api_key)  # HTTP 200 nhận được, key ổn → giảm fail_count
+
+            # Phân biệt "stream bị ngắt giữa chừng do mất kết nối" với "server
+            # chủ động kết thúc" (xem docstring _stream_response): saw_done=False
+            # nghĩa là vòng đọc SSE không hề thấy "data: [DONE]" — không phải vì
+            # model quyết định dừng (finish_reason sẽ có giá trị, ví dụ "stop"/
+            # "length"/"tool_calls" — trường hợp đó KHÔNG coi là lỗi mạng, dữ
+            # liệu vẫn coi là đủ), mà vì kết nối/stream đóng bất thường TRƯỚC
+            # KHI provider kịp báo kết thúc. Trước đây trường hợp này lọt xuống
+            # dưới y hệt 1 turn thành công với tool call/text bị cụt giữa
+            # chừng, khiến _normalize_runtime_tool_calls báo "lỗi tool"/JSON
+            # hỏng cho model — sai bản chất, gây nhầm lẫn cho cả model lẫn
+            # người dùng (xem log stream-sse-parse-error/hiện tượng "cụt
+            # ngay từ đầu content" đã xác nhận trước đó).
+            if not saw_done and finish_reason is None:
+                if attempt < _RETRY_MAX - 1:
+                    wait = _RETRY_DELAYS[attempt]
+                    spinner_ref[0].stop()
+                    _txt = (f"\n{YELLOW}  ⚠ Stream bị ngắt giữa chừng (nghi mất kết nối "
+                            f"mạng, KHÔNG phải lỗi tool) — retry {attempt+1}/"
+                            f"{_RETRY_MAX-1} sau {wait:.0f}s...{R}")
+                    if state: state.emit(EV_WARN, text=_txt, raw=True)
+                    else: print(_txt, flush=True)
+                    __import__("time").sleep(wait)
+                    spinner = Spinner(f"Retry {attempt+1}")
+                    spinner.start()
+                    spinner_ref[0] = spinner
+                    continue
+                spinner_ref[0].stop()
+                _txt = (f"\n{RED}✗ Stream liên tục bị ngắt giữa chừng do mất kết nối "
+                        f"mạng (đã thử {_RETRY_MAX} lần). Đây KHÔNG phải lỗi tool "
+                        f"call — hãy kiểm tra kết nối internet rồi thử lại.{R}")
+                if state: state.emit(EV_ERROR, text=_txt, raw=True)
+                else: print(_txt)
+                return {"text": "", "tool_calls": [], "usage": usage, "truncated": False,
+                        "reasoning": "", "thinking": "", "thinking_signature": "",
+                        "redacted_thinking_data": "", "network_interrupted": True}
+
             if _has_current_image:
                 _full_text_so_far = "".join(text_parts)
                 if _looks_like_vision_denial(_full_text_so_far):
@@ -2386,6 +2533,30 @@ def call_api_stream(messages, model, api_key, tool_choice="auto", session_id=Non
             # (khoảng trắng, không gạch dưới) — parse N thật từ message để
             # chính xác theo từng model, thay vì đoán cố định 8192.
             body_lower = body_txt.lower()
+
+            # Some OpenAI-compatible gateways validate the JSON emitted by
+            # the model for a function call and reject the whole response
+            # before streaming it.  No tool ran, so one guided retry is safe.
+            # It is intentionally bounded to one attempt and uses sequential
+            # calls to reduce malformed large parallel payloads.
+            if (e.code in (400, 422) and not _tool_argument_recovery_done
+                    and _is_invalid_function_arguments_error(body_txt)):
+                _tool_argument_recovery_done = True
+                api_messages = list(api_messages) + [{
+                    "role": "user", "content": _TOOL_ARGUMENT_RECOVERY_PROMPT,
+                }]
+                payload["messages"] = api_messages
+                if "parallel_tool_calls" in payload:
+                    payload["parallel_tool_calls"] = False
+                spinner_ref[0].stop()
+                _txt = (f"\n{YELLOW}  ⚠ Provider rejected malformed tool arguments; "
+                        f"retrying once with compact sequential tool guidance...{R}")
+                if state: state.emit(EV_WARN, text=_txt, raw=True)
+                else: print(_txt, flush=True)
+                spinner = Spinner(f"Retry {attempt+1}")
+                spinner.start()
+                spinner_ref[0] = spinner
+                continue
 
             # Ảnh bị provider/model từ chối — ghi nhận False vào cache NGAY
             # (không retry, không đoán mò): UI /web đọc cache này để xám nút
@@ -2799,7 +2970,7 @@ Primary language: Vietnamese. Every response, question, and summary.
 # Rules are not negotiable
 Follow rules literally. Do not reinterpret, reframe, or find edge cases to bypass them.
 If a rule conflicts with the task → follow the rule, note the conflict, ask user via `question`.
-If user asks to skip a safety/permission rule ("đừng hỏi nữa", "cứ làm đi"): do not relax it — state why the rule exists, then offer a safe way (e.g. batch changes into one `question`).
+If user asks to skip a safety/permission rule ("stop asking", "just do it"): do not relax it — state why the rule exists, then offer a safe way (e.g. batch changes into one `question`).
 
 # Instruction priority
 1. System safety, tool rules, and sandbox limits.
@@ -2829,13 +3000,13 @@ Read-only network access (`websearch`/`webfetch`) is NOT a mutation — run with
 # EXECUTION MODEL — CRITICAL
 Every API call resends the context. Reduce unnecessary calls, but correctness and safety always outrank saving calls.
 - **Batch independent tools** in ONE response (`[tool1]+[tool2]+[tool3]`). Sequential only when B depends on A.
-- **Files read this turn** → reuse, do NOT re-read. After write/edit → content is known, never re-read the whole file just to confirm what was just written.
+- **Files read this turn** → reuse unless there is a concrete reason to observe disk again. After write/edit, use the returned snapshot; do not re-read the whole file merely to repeat known content. A scoped re-read or test is correct when a formatter, hook, command, external process, or doubtful patch may have changed state.
 - **Targeted verification** is allowed when state is doubtful (patch location, linter/formatter). Use scoped diff, `read(offset=N, limit=20)`, or syntax/lint/test check.
 - **Delegation is not "an extra call"**: this rule is about YOUR own redundant read/grep/verify loop, not about handing off. Spawning `task`/`delegate` trades one call now for fewer read/grep rounds spent in your own context later — judge it by the scope of the remaining work (see Tools below), never skip it just to keep this turn's call count low.
 - **Checkpoint**: After 3 consecutive read/grep rounds without editing, STOP and assess if enough evidence exists, if `question` is needed, or if the remaining scope is open-ended enough to hand to `task` instead of continuing solo.
 
 # Anti-loop
-- bash/test fails → use exit_code/error_class/retry_hint; retry only with changed hypothesis. After 3× → STOP, call `question` or change approach.
+- bash/test fails → use exit_code/error_class/retry_hint; retry only with a changed hypothesis. Before repeating a state-changing operation, verify that the failed attempt did not already commit a side effect; repeat it only when safe or idempotent. After 3× → STOP, call `question` or change approach.
 - grep/view_symbol no matches → accept and move on. NEVER retry same pattern. Fallback: `view_symbol` → `grep` → `read(offset=1, limit=30)`.
 - Repeating the same stable local tool call with same args without state changes is a loop → reuse prior result.
 
@@ -2845,15 +3016,10 @@ Every API call resends the context. Reduce unnecessary calls, but correctness an
 
 # Confidence discipline
 - Assumption ≠ fact. Verified (read this session, ran, tool output) vs assumed (inferred, typical-for-stack) must be distinguished.
-  - Ex: "Hàm `parse()` chắc trả None khi lỗi" → sai cách nói. Đúng: "Giả định `parse()` trả None khi lỗi (chưa xem nhánh except) — sẽ kiểm tra trước khi sửa" hoặc kiểm tra rồi nói chắc.
+  - Example: "`parse()` surely returns None on error" → incorrect certainty. Correct: "I assume `parse()` returns None on error (the except branch has not been inspected) — I will verify before editing," or inspect it first and then state it confidently.
 - Conflicting sources → name conflict explicitly and ask or check further. Do not silently pick one side.
+- **Tool availability**: never claim a tool is missing from memory/recall. Check the `# Tools` section above or just call it once — a real absence returns an explicit error. Reporting non-availability without checking is an assumption stated as fact.
 
-# User communication
-- Lead with core answer/finding first. Concise, on point.
-- Before edits, state specific files/areas being modified.
-- Final answer: concise summary, files changed, verification run, remaining risk.
-- No emojis. GitHub markdown. After task: summarize what changed and how to run.
-- Disagree when technically wrong; follow user's call ONLY for ordinary design choices (never for safety/sandbox rules).
 
 # Task management
 - Use `todowrite` only for multi-step tasks (3+ steps). Batch updates at major milestones (~50%, completion).
@@ -2868,10 +3034,12 @@ Every API call resends the context. Reduce unnecessary calls, but correctness an
 - **Discovery**: For large codebases, see `skill(name="code-discovery")`. For existing code, start with `file_index`; then prefer `view_symbol` or targeted `lsp`/`grep`, use `glob` only for unknown paths, and `read(offset, limit)` after locating the relevant region. Max read limit is 700.
 - **Path handling**: Relative paths always resolve directly against workspace root (use clean relative paths e.g. `01_ui.py` or `src/app.py`).
 - **Section markers**: New files >80 lines use `##== NAME ==##`.
-- **Editing**: Fix only what was requested. Use `edit` for 1 replacement, `multiedit` for 2-5 replacements, `apply_patch` for large diffs, `write` only for new files. To split/move modules, see `skill(name="file-refactoring")` (use `extract` with line range). For multi-module features, see `skill(name="large-change")`. `edit` requires `path`, `old_str`, `new_str`. `old_str` must be exact and unique. Never overwrite uncommitted user changes in working tree (see "Git & Working Tree" rule in AGENTS.md).
+- **Editing**: Keep the change scope minimal: fix only what was requested, and never overwrite unrelated or uncommitted user changes. Use `edit` for 1 replacement, `multiedit` for 2-5 replacements, `apply_patch` for large diffs, and `write` only for new files. For large new-file content, `write` a small valid initial section, then use `append` in small chunks. To split/move modules, see `skill(name="file-refactoring")` (use `extract` with line range). For multi-module features, see `skill(name="large-change")`. `edit` requires `path`, `old_str`, `new_str`. `old_str` must be exact and unique.
+  - **`apply_patch`**: context lines must match the file exactly (whitespace included) — no fuzzy fallback. Copy them verbatim from the latest `read`/`edit`/`write` output, never from memory; a hunk written before your own prior edit in this turn is already stale. On "context not found": `read` again and regenerate the hunk, don't retry the same text.
+
 
 # Verification
-After modifying code, MUST verify the change before claiming completion (load `skill(name="verification")` when preparing to conclude or when verifying changes). Run narrowest relevant test, typecheck, lint, or syntax check. If verification cannot run, state why and what remains unverified.
+After modifying code, MUST verify the real execution path reaches the change, the reported defect is fixed, and affected branches still work before claiming completion (load `skill(name="verification")` when preparing to conclude or when verifying changes). Read the final diff, then run the narrowest relevant test, typecheck, lint, or syntax check. Claim completion only from results actually verified; if verification cannot run, state why and what remains unverified.
 
 # Tools
 - `websearch`/`webfetch`: external docs, error codes, APIs, current facts.
@@ -2889,6 +3057,12 @@ After modifying code, MUST verify the change before claiming completion (load `s
   - `pip install` requires `--break-system-packages` on Termux. For dependencies, see `skill(name="dependency-management")`.
   - Background servers: only `serve: python -m http.server ...`, `serve: node <file>`, `serve: npm run/start ...`, or `serve: pnpm/yarn run|start|dev|serve|preview ...`.
 
+# User communication
+- Lead with core answer/finding first. Concise, on point.
+- Before edits, state specific files/areas being modified.
+- Final answer: concise summary, files changed, verification run, remaining risk.
+- No emojis. GitHub markdown. After task: summarize what changed and how to run.
+- Disagree when technically wrong; follow user's call ONLY for ordinary design choices (never for safety/sandbox rules).
 # Misc
 - Broad grep → set `max_count` (e.g. 50). No large log reads. Simplest solution that works — no overengineering.
 
@@ -2905,16 +3079,16 @@ def build_mode_hint(agent=AGENT_BUILD, state=None) -> str:
     effective_tool_mode = getattr(state, "tool_mode", _tool_mode) if state is not None else _tool_mode
     if effective_tool_mode == "sequential":
         parts.append(
-            "\n\n[Mode: sequential] Làm từng bước: một tool call mỗi turn, "
-            "verify kết quả trước khi tiếp theo. Ưu tiên độ chính xác hơn tốc độ. "
-            "Nếu model trả nhiều tool, hệ thống chỉ chạy tool đầu tiên."
+            "\n\n[Mode: sequential] Work step by step: one tool call per turn, "
+            "and verify the result before continuing. Prefer accuracy over speed. "
+            "If the model returns multiple tools, the system runs only the first tool."
         )
     if agent == AGENT_PLAN:
         parts.append(
-            "\n\n[Mode: plan/read-only] KHÔNG write, delete, extract, edit, multiedit, "
-            "apply_patch, Bash, hoặc bất kỳ MCP tool nào. "
-            "Chỉ đọc, phân tích, và đề xuất. Bash bị từ chối ở mode này; "
-            "dùng read/glob/grep hoặc chuyển sang build mode nếu thật sự cần chạy lệnh."
+            "\n\n[Mode: plan/read-only] DO NOT use write, append, delete, extract, edit, multiedit, "
+            "apply_patch, Bash, or any MCP tool. "
+            "Only read, analyze, and propose. Bash is rejected in this mode; "
+            "use read/glob/grep or switch to build mode if running a command is genuinely necessary."
         )
     return "".join(parts)
 
@@ -2973,7 +3147,7 @@ def _inject_agents_md_once(messages: list) -> list:
     except Exception:
         _skills = []
     if _skills:
-        skill_note = f"[Skills có sẵn: {', '.join(_skills)}. Gọi tool `skill(name=...)` để load.]"
+        skill_note = f"[Available skills: {', '.join(_skills)}. Call `skill(name=...)` to load one.]"
         rules = f"{rules}\n\n---\n{skill_note}" if rules else skill_note
     if not rules:
         return messages
@@ -2987,7 +3161,7 @@ def _inject_agents_md_once(messages: list) -> list:
             return messages  # đã có rồi
     inject = [
         {"role": "user",      "content": f"{marker}\n\n{rules}"},
-        {"role": "assistant", "content": "Đã đọc rules. Sẽ tuân theo trong suốt session."},
+        {"role": "assistant", "content": "Rules read. I will follow them throughout this session."},
     ]
     return inject + messages
 
@@ -3088,7 +3262,7 @@ _BASH_READONLY_RE = re.compile(
 )
 
 _LOCAL_MUTATING_TOOLS = {
-    "write", "delete", "extract", "edit", "multiedit", "apply_patch",
+    "write", "append", "delete", "extract", "edit", "multiedit", "apply_patch",
     "todowrite", "task", "delegate",
 }
 
@@ -3150,7 +3324,16 @@ def _tool_may_mutate_local_files(name: str, args: dict) -> bool:
 def _dedup_scope(name: str, args: dict) -> str:
     """Classify dedup lifetime: none, state-dependent query, or side effect."""
     if name == "bash":
-        return "none" if not _tool_may_mutate_state(name, args) else "effect"
+        # A shell command has no reliable, provider-independent declaration of
+        # which project files it observes.  Treating an unknown command as an
+        # effect used to make a test/build command permanently duplicate for
+        # the rest of the turn: ``python test.py`` → edit source → same test
+        # was incorrectly skipped.  Do not hard-dedup Bash at all.  The Bash
+        # validator and permission gate remain the safety boundary, while the
+        # loop guard below can still stop repeated *failed* calls where that is
+        # applicable.  This is intentionally general -- it does not depend on
+        # a brittle allowlist of test runners or build tools.
+        return "none"
     # Files can be changed by the user/editor between steps. Let observation
     # tools execute so they can detect that external state; history pruning
     # still collapses byte-identical old evidence later.
@@ -3269,7 +3452,7 @@ def _runtime_tool_call_signature(name: str, args: dict) -> str:
 def _dedup_resource_keys(name: str, args: dict) -> tuple[str, ...]:
     """Resources whose generation makes a local mutation meaningful again."""
     normalized = _canonical_tool_args(name, args)
-    if name in {"write", "delete", "edit", "multiedit", "apply_patch"}:
+    if name in {"write", "append", "delete", "edit", "multiedit", "apply_patch"}:
         return (normalized.get("path", ""),)
     if name == "extract":
         return tuple(sorted({normalized.get("src", ""), normalized.get("dst", "")}))
@@ -3309,7 +3492,84 @@ def _dedup_record(seen_state: dict, seen_effect: dict, resource_epochs: dict,
         seen_state[signature] = epoch
 
 
-def _normalize_runtime_tool_calls(raw_tcs):
+def _normalize_tool_arguments(raw_args) -> tuple[str | None, str | None]:
+    """Return valid object JSON, repairing only lossless control-character errors.
+
+    A malformed tool call must never enter conversation history: providers may
+    reject that historical assistant message on the following request with an
+    HTTP 400 before the model can correct itself.  ``strict=False`` only
+    accepts literal control characters inside an otherwise complete JSON
+    string; serializing the decoded object preserves their exact value while
+    making the transport valid.  Truncated or structurally invalid JSON is
+    deliberately rejected rather than guessing and writing partial content.
+    """
+    if isinstance(raw_args, (dict, list)):
+        try:
+            raw_args = json.dumps(raw_args, ensure_ascii=False)
+        except Exception:
+            return None, "arguments cannot be serialized"
+    if not isinstance(raw_args, str):
+        return None, "arguments must be a JSON string"
+    if len(raw_args) > 2 * 1024 * 1024:
+        return None, "arguments exceed 2 MiB"
+    try:
+        parsed = json.loads(raw_args)
+    except json.JSONDecodeError as strict_error:
+        try:
+            parsed = json.loads(raw_args, strict=False)
+        except json.JSONDecodeError:
+            return None, (f"invalid JSON at line {strict_error.lineno}, "
+                          f"column {strict_error.colno}: {strict_error.msg}")
+        if not isinstance(parsed, dict):
+            return None, "arguments must be a JSON object"
+        try:
+            return json.dumps(parsed, ensure_ascii=False, separators=(",", ":")), (
+                "normalized literal control characters")
+        except Exception:
+            return None, "arguments cannot be serialized"
+    if not isinstance(parsed, dict):
+        return None, "arguments must be a JSON object"
+    return raw_args, None
+
+
+_TOOLCALL_DEBUG: bool = os.environ.get("FW_TOOLCALL_DEBUG", "").strip() == "1"
+
+# Tools whose primary payload is one large string (the field genuinely at risk
+# of being cut off mid-JSON if the provider's response hits its output-token
+# ceiling before finishing the tool call). Used only to make the discard
+# warning below name the right cause — does not change dispatch or schema.
+_LARGE_PAYLOAD_TOOLS = {
+    "write": "content", "append": "content", "edit": "new_str",
+    "apply_patch": "patch",
+}
+
+
+def _toolcall_debug_log(name: str, raw_args_repr: str, args_note: str,
+                         truncated: bool, usage: dict | None, state=None):
+    """FW_TOOLCALL_DEBUG=1 (or /debug toolcall on): print exactly why a tool
+    call's arguments were rejected, with the raw string and finish/usage
+    context — so 'invalid JSON' can be told apart from 'response got cut off
+    mid-argument because it ran out of output tokens' instead of guessing.
+    """
+    if not _TOOLCALL_DEBUG:
+        return
+    usage = usage or {}
+    lines = [
+        f"[toolcall-debug] tool={name!r} reason={args_note!r} "
+        f"finish_reason_truncated={truncated}",
+        f"[toolcall-debug] usage={json.dumps(usage, ensure_ascii=False)}",
+        f"[toolcall-debug] raw_arguments ({len(raw_args_repr)} chars):",
+        raw_args_repr[-800:] if len(raw_args_repr) > 800 else raw_args_repr,
+    ]
+    text = "\n".join(lines)
+    if state is not None:
+        state.emit(EV_WARN, text=text, raw=True)
+    else:
+        print(f"{DIM}{text}{R}")
+
+
+def _normalize_runtime_tool_calls(raw_tcs, truncated: bool = False,
+                                  usage: dict | None = None, state=None):
     """Validate provider tool calls before they enter history/dispatch.
 
     Gateways occasionally emit a partial tool-call object (missing function,
@@ -3317,6 +3577,11 @@ def _normalize_runtime_tool_calls(raw_tcs):
     so one malformed SSE response could terminate the whole agent turn.  Keep
     valid calls, generate a local id when a provider omitted one, and report
     discarded entries without allowing untrusted sizes to reach json.loads.
+
+    `truncated`/`usage`/`state` are optional debug context (from the same
+    call_api_stream result this batch of raw_tcs came from) — they do not
+    affect which calls are kept or dropped, only what FW_TOOLCALL_DEBUG=1
+    prints when one is dropped for bad JSON.
     """
     if raw_tcs is None:
         return [], []
@@ -3337,17 +3602,31 @@ def _normalize_runtime_tool_calls(raw_tcs):
         if not isinstance(name, str) or not name.strip():
             warnings.append(f"[tool_error: discarded tool call #{index + 1} without a name]")
             continue
-        raw_args = fn.get("arguments", "{}")
-        if isinstance(raw_args, (dict, list)):
-            try:
-                raw_args = json.dumps(raw_args, ensure_ascii=False)
-            except Exception:
-                raw_args = None
-        if not isinstance(raw_args, str):
-            warnings.append(f"[tool_error: discarded `{name}` with invalid arguments]")
-            continue
-        if len(raw_args) > 2 * 1024 * 1024:
-            warnings.append(f"[tool_error: discarded `{name}` because arguments exceed 2 MiB]")
+        raw_input = fn.get("arguments", "{}")
+        raw_args, args_note = _normalize_tool_arguments(raw_input)
+        if raw_args is None:
+            _toolcall_debug_log(
+                name, raw_input if isinstance(raw_input, str) else repr(raw_input),
+                args_note or "", truncated, usage, state)
+            # If this tool's payload is a single large string and the response
+            # was cut off (finish_reason=length), say so plainly instead of
+            # leaving it looking like the model wrote malformed JSON on
+            # purpose — the two causes need different fixes.
+            if truncated and name in _LARGE_PAYLOAD_TOOLS:
+                warnings.append(
+                    f"[tool_error: discarded `{name}` — the response was cut off "
+                    f"(finish_reason=length) before the tool call finished, so its "
+                    f"`{_LARGE_PAYLOAD_TOOLS[name]}` argument is incomplete JSON "
+                    f"({args_note}). This is an output-length limit, not a JSON "
+                    "mistake. Split the content into smaller write/append calls "
+                    "so each call fits well under the model's output limit.]"
+                )
+            else:
+                warnings.append(
+                    f"[tool_error: discarded `{name}` because its arguments were invalid "
+                    f"({args_note}). No tool was run. Retry one compact valid call; for "
+                    "large new-file content, use write then append in small chunks.]"
+                )
             continue
         tc_id = raw_tc.get("id")
         if not isinstance(tc_id, str) or not tc_id.strip():
@@ -3385,6 +3664,18 @@ def _tool_result_is_failure(result: str) -> bool:
         return True
     if low.startswith("[verify] no user observation"):
         return True
+    # Bash deliberately returns a diagnostic record instead of an [error]
+    # prefix.  Honour its explicit status so retry/anti-loop logic receives
+    # the same failure signal that the model now sees in [tool_status].
+    if low.startswith("[bash diagnostic]"):
+        status = re.search(r"^status:\s*(\w+)", result or "",
+                           re.MULTILINE | re.IGNORECASE)
+        return bool(status and status.group(1).lower() != "ok")
+    if low.startswith("[serve]"):
+        return any(marker in low for marker in (
+            "thiếu lệnh", "đang do tiến trình khác sử dụng",
+            "không khởi động được", "thoát ngay",
+        ))
     if low.startswith(("[task] (unformatted output", "[delegate:")) and "[subagent error:" in low:
         return True
     if low.startswith("[lsp]"):
@@ -3484,7 +3775,7 @@ def _agent_turn_inner(messages, model, api_key, conn, sid, max_steps, agent, sta
     # phục vụ xong đúng 1 lượt API cuối cùng (xem chỗ chèn/chỗ revert bên
     # dưới), KHÔNG để tồn tại lâu dài trong `messages` như checkpoint nudge.
     _PROGRESS_TOOLS = {
-        "edit", "multiedit", "apply_patch", "write", "delete", "extract",
+        "edit", "multiedit", "apply_patch", "write", "append", "delete", "extract",
         "task", "delegate", "question",
     }
 
@@ -3600,15 +3891,40 @@ def _agent_turn_inner(messages, model, api_key, conn, sid, max_steps, agent, sta
                                    tools=_turn_api_tools, state=state)
         if not isinstance(result, dict):
             result = {"text": "", "tool_calls": [], "usage": {}, "truncated": False}
-        text    = result.get("text") or ""
-        tcs, _tc_warnings = _normalize_runtime_tool_calls(result.get("tool_calls"))
-        usage   = result.get("usage") if isinstance(result.get("usage"), dict) else {}
+        text      = result.get("text") or ""
+        usage     = result.get("usage") if isinstance(result.get("usage"), dict) else {}
+        truncated = result.get("truncated", False)
+        tcs, _tc_warnings = _normalize_runtime_tool_calls(
+            result.get("tool_calls"), truncated=truncated, usage=usage, state=state)
         if _tc_warnings:
             warning_text = "\n".join(_tc_warnings)
             text = (text.rstrip() + "\n\n" + warning_text).strip() if text else warning_text
             if state is not None:
                 state.emit(EV_WARN, text=warning_text)
-        truncated = result.get("truncated", False)
+        if result.get("network_interrupted"):
+            # Mất kết nối/stream bị ngắt bất thường lặp lại đến hết số lần
+            # retry của call_api_stream (xem saw_done trong _stream_response)
+            # — KHÔNG PHẢI lỗi tool/JSON hỏng, và text/tool_calls ở đây luôn
+            # rỗng (call_api_stream trả về sớm trước khi có nội dung dở
+            # dang nào bị coi là "kết quả"). Không ghi gì vào messages/lịch
+            # sử hội thoại (không có nội dung thật nào để ghi, và ghi 1
+            # placeholder rỗng chỉ khiến model turn sau tưởng nhầm nó đã
+            # trả lời gì đó) — chỉ lưu checkpoint để không mất tiến trình
+            # trước đó, dừng turn rõ ràng, và báo đúng bản chất cho người
+            # dùng thay vì lẫn với thông báo lỗi tool chung chung.
+            cid = checkpoint_save(conn, sid, "network_interrupted", messages,
+                                  "Network/stream was interrupted repeatedly (not a tool "
+                                  "error) even after retries; previous saved messages are "
+                                  "intact. Try again once the connection is stable.")
+            _net_txt = (f"⚠ Mất kết nối/stream bị ngắt liên tục dù đã tự động retry "
+                        f"(không phải lỗi tool). checkpoint {cid} đã lưu — thử lại khi "
+                        f"mạng ổn định.")
+            if state is not None:
+                state.emit(EV_ERROR, text=_net_txt)
+            else:
+                print(f"{RED}  {_net_txt}{R}")
+            break
+
         if result.get("interrupted"):
             if text:
                 partial = text.rstrip() + "\n\n[interrupted]"
@@ -3644,8 +3960,11 @@ def _agent_turn_inner(messages, model, api_key, conn, sid, max_steps, agent, sta
                                        tools=_turn_api_tools, state=state)
             if not isinstance(result2, dict):
                 result2 = {"text": "", "tool_calls": [], "usage": {}, "truncated": False}
-            text2   = result2.get("text") or ""
-            tcs2, _tc2_warnings = _normalize_runtime_tool_calls(result2.get("tool_calls"))
+            text2         = result2.get("text") or ""
+            _usage2_debug = result2.get("usage") if isinstance(result2.get("usage"), dict) else {}
+            tcs2, _tc2_warnings = _normalize_runtime_tool_calls(
+                result2.get("tool_calls"), truncated=result2.get("truncated", False),
+                usage=_usage2_debug, state=state)
             if _tc2_warnings:
                 warning_text = "\n".join(_tc2_warnings)
                 text2 = (text2.rstrip() + "\n\n" + warning_text).strip() if text2 else warning_text
@@ -3850,7 +4169,14 @@ def _agent_turn_inner(messages, model, api_key, conn, sid, max_steps, agent, sta
                 name, args, _mutation_epoch)
             if _duplicate:
                 dupe_msg = (
-                    f"[dedup] Skipped unchanged duplicate `{name}`; reuse its previous result."
+                    f"[dedup] Skipped unchanged duplicate `{name}`; reuse its previous result.\n"
+                    "[tool_status] "
+                    + json.dumps({
+                        "ok": True, "pass": True, "status": "completed",
+                        "changed": False, "verified": "not_requested",
+                        "executed": False, "deduplicated": True,
+                        "reuse_previous_result": True,
+                    }, separators=(",", ":"))
                 )
                 if state is not None:
                     state.emit(EV_WARN, text=f"[dedup] Blocked duplicate: {name} {json.dumps(args)[:60]}")
@@ -3874,7 +4200,7 @@ def _agent_turn_inner(messages, model, api_key, conn, sid, max_steps, agent, sta
                         _cache_touch(p_str)   # LRU: file này vừa được access
                     except Exception:
                         pass
-            elif name in ("write", "delete", "edit", "multiedit", "apply_patch", "view_symbol"):
+            elif name in ("write", "append", "delete", "edit", "multiedit", "apply_patch", "view_symbol"):
                 _cache_touch(str(Path(args.get("path","")).expanduser().resolve()))
             elif name == "extract":
                 for _path_arg in ("src", "dst"):
@@ -3916,9 +4242,9 @@ def _agent_turn_inner(messages, model, api_key, conn, sid, max_steps, agent, sta
             if _repeat_error_count >= 3:
                 _loop_break_requested = True
                 _loop_break_msg = (
-                    f"[no-progress] Đã dừng turn vì `{name}` được gọi lặp lại "
-                    "với cùng args và cùng lỗi 3 lần liên tiếp, trong khi không "
-                    "có state change nào xảy ra. Model có thể đang mắc vòng lặp."
+                    f"[no-progress] Stopped this turn because `{name}` was called "
+                    "three consecutive times with the same args and the same error, "
+                    "while no state change occurred. The model may be looping."
                 )
                 if state is not None:
                     state.emit(EV_WARN, text=_loop_break_msg)
@@ -3951,11 +4277,11 @@ def _agent_turn_inner(messages, model, api_key, conn, sid, max_steps, agent, sta
             _discovery_streak += 1
             if tool_results and _discovery_streak % 3 == 0:
                 _checkpoint_nudge = (
-                    f"\n\n[checkpoint] {_discovery_streak} step liên tiếp chỉ "
-                    "read/grep/glob/view_symbol/lsp, chưa edit/task/delegate/"
-                    "question. Dừng lại tự hỏi: đã đủ evidence để sửa chưa? "
-                    "Cần hỏi qua `question`? Hay phạm vi còn mở nên giao cho "
-                    "`task`/`delegate` thay vì tiếp tục tự đọc?"
+                    f"\n\n[checkpoint] {_discovery_streak} consecutive steps used only "
+                    "read/grep/glob/view_symbol/lsp, with no edit/task/delegate/"
+                    "question. Stop and assess: is there enough evidence to edit? "
+                    "Is `question` needed? Or is the scope still open enough to hand "
+                    "to `task`/`delegate` instead of continuing to read alone?"
                 )
                 tool_results[-1]["content"] = (tool_results[-1].get("content") or "") + _checkpoint_nudge
                 if tool_results_history:
@@ -3982,13 +4308,13 @@ def _agent_turn_inner(messages, model, api_key, conn, sid, max_steps, agent, sta
         if tool_results and max_steps >= 2 and steps == max_steps - 2:
             _orig_content = tool_results[-1].get("content") or ""
             _maxstep_notice = (
-                f"\n\n[step-budget] Chỉ còn ĐÚNG 1 lượt gọi API nữa trong turn "
-                f"này (bước {max_steps}/{max_steps}) — sau đó turn dừng cứng, "
-                "không còn cơ hội gọi thêm tool hay xem thêm kết quả nào. Đừng "
-                "bắt đầu việc mới dang dở (vd sửa nhiều file chưa xong, chạy "
-                "lệnh nhiều bước). Ưu tiên: chốt lại trạng thái hiện tại — đã "
-                "làm gì, còn thiếu gì — người dùng có thể gõ tiếp để tiếp tục "
-                "ở turn sau."
+                f"\n\n[step-budget] Exactly one API call remains in this turn "
+                f"(step {max_steps}/{max_steps}) — after that, the turn stops hard, "
+                "with no chance to call another tool or inspect another result. Do not "
+                "start unfinished work (for example, editing multiple files or running "
+                "a multi-step command). Prioritize closing the current state: what has "
+                "been done and what is still missing. The user can type again to continue "
+                "in the next turn."
             )
             tool_results[-1]["content"] = _orig_content + _maxstep_notice
             _maxstep_notice_ref = (tool_results[-1], _orig_content)
@@ -4012,8 +4338,8 @@ def _agent_turn_inner(messages, model, api_key, conn, sid, max_steps, agent, sta
 
     if steps >= max_steps:
         _max_step_msg = (
-            f"[max-steps] Đã dừng sau {max_steps} bước trong turn này — "
-            f"model có thể chưa hoàn thành xong việc. Gõ tiếp để tiếp tục nếu cần."
+            f"[max-steps] Stopped after {max_steps} steps in this turn — "
+            f"the model may not have completed the work. Type again to continue if needed."
         )
         if state is None or not (getattr(state, "web_bridge", None) and state.web_bridge.is_armed()):
             print(f"\n{YELLOW}{_max_step_msg}{R}")

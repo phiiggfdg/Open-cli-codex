@@ -332,10 +332,19 @@ TOOLS = [
   }},
   {"type":"function","function":{
     "name":"write",
-    "description":"Create a NEW file only. File must NOT exist yet. For existing files, always use edit or multiedit instead.",
+    "description":"Create a NEW file only. File must NOT exist yet. For existing files, use append, edit, or multiedit instead. For large new-file content, write a small valid initial section, then use append in smaller chunks rather than sending one very large function argument.",
     "parameters":{"type":"object","properties":{
       "path":   {"type":"string"},
       "content":{"type":"string"}
+    },"required":["path","content"]}
+  }},
+  {"type":"function","function":{
+    "name":"append",
+    "description":"Append text to an existing file. Use after write to add large new-file content in small chunks, or set create=true to create the file when it does not exist. This is append-only: use edit/multiedit/apply_patch for replacement or structural changes.",
+    "parameters":{"type":"object","properties":{
+      "path":   {"type":"string"},
+      "content":{"type":"string"},
+      "create": {"type":"boolean","default":False,"description":"Create the file only if it does not already exist"}
     },"required":["path","content"]}
   }},
   {"type":"function","function":{
@@ -413,7 +422,7 @@ TOOLS = [
   }},
   {"type":"function","function":{
     "name":"webfetch",
-    "description":"Fetch text content of a URL.",
+    "description":"Fetch a URL safely by content type: HTML is converted to readable text/Markdown; application/json and *+json are parsed and returned as structured JSON; text, XML, and Markdown are returned as text; binary responses return metadata without decoding.",
     "parameters":{"type":"object","properties":{
       "url":{"type":"string","maxLength":4096}
     },"required":["url"]}

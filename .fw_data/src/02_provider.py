@@ -632,7 +632,7 @@ def _save_custom_providers(custom: dict):
     vừa xác định anthropic_auth_mode cho custom provider) — share config.json
     với pool key, cần cùng 1 lock để tránh lost update."""
     try:
-        with _pool_lock:
+        with _pool_lock, _config_file_lock():
             cfg = load_config()
             cfg["custom_providers"] = custom
             save_config(cfg)
@@ -999,4 +999,3 @@ def _choose_provider_key_for_delegate() -> "str | None":
             return None
 
 # ── /end PROVIDER ─────────────────────────────────────────────────────────────
-

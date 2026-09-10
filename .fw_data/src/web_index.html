@@ -310,6 +310,20 @@ a.cw-chat-link:active { opacity: .7; }
 .tool-child.child-err { color: var(--err); }
 .tool-child.child-denied { color: var(--err); font-weight: 500; }
 
+/* Compact diff preview — same tool payload as the terminal renderer. */
+.tool-diff { margin: 4px 8px 6px 0; border: 1px solid var(--border); border-radius: var(--r-xs); overflow: hidden; min-width: 0; background: #121719; }
+.tool-diff-head { display: flex; gap: 7px; align-items: center; min-width: 0; padding: 6px 8px; background: #1a2226; color: var(--text-dim); font-size: 11px; }
+.tool-diff-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 1; }
+.tool-diff-body { font-family: "JetBrains Mono", monospace; font-size: 11px; line-height: 1.5; overflow: hidden; }
+.tool-diff-line { display: grid; grid-template-columns: 26px 26px 14px minmax(0, 1fr); min-width: 0; padding: 1px 6px; }
+.tool-diff-line .diff-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tool-diff-line.add { background: rgba(57, 116, 87, .38); color: #c7efcf; }
+.tool-diff-line.del { background: rgba(132, 58, 64, .34); color: #ffc8c8; }
+.tool-diff-line.hunk { background: rgba(56, 100, 128, .32); color: #b9e3fa; }
+.tool-diff-num { color: rgba(255,255,255,.38); text-align: right; padding-right: 5px; user-select: none; }
+.tool-diff-more { width: 100%; border: 0; border-top: 1px solid var(--border); background: #1a2226; color: var(--accent); padding: 6px 8px; text-align: left; font: 600 11px "Inter", sans-serif; }
+@media (max-width: 480px) { .tool-group { padding-right: 6px; } .tool-group-head { gap: 6px; padding-left: 10px; } .tool-diff-line { grid-template-columns: 22px 22px 12px minmax(0, 1fr); padding-left: 4px; padding-right: 4px; } .tool-diff-body { font-size: 10.5px; } }
+
 /* Info cards */
 .info-card {
   background: var(--bg-card); border: 1px solid var(--border-light);
@@ -1792,6 +1806,23 @@ function formatToolPreview(name, args, fallback) {
   return escapeHtml(oneLine.length > 200 ? oneLine.slice(0, 200) + "…" : oneLine);
 }
 
+function appendToolDiff(diff) {
+  if (!diff || !Array.isArray(diff.lines) || !currentGroup) return;
+  const esc = escapeHtml;
+  const cls = {add:"add", del:"del", hunk:"hunk", ctx:"ctx"};
+  const rows = diff.lines.map(row => `<div class="tool-diff-line ${cls[row.kind] || "ctx"}">`
+    + `<span class="tool-diff-num">${row.old == null ? "" : esc(row.old)}</span>`
+    + `<span class="tool-diff-num">${row.new == null ? "" : esc(row.new)}</span>`
+    + `<span>${row.kind === "add" ? "+" : row.kind === "del" ? "−" : row.kind === "hunk" ? "@" : ""}</span>`
+    + `<span class="diff-text">${esc(row.text || "")}</span></div>`).join("");
+  const more = diff.hidden ? `<button class="tool-diff-more" type="button">… ${esc(diff.hidden)} dòng khác</button>` : "";
+  const card = document.createElement("div"); card.className = "tool-diff";
+  card.innerHTML = `<div class="tool-diff-head"><span>${esc(diff.action || "Edit")}</span><span class="tool-diff-path mono">${esc(diff.path || "")}</span></div><div class="tool-diff-body">${rows}</div>${more}`;
+  const button = card.querySelector(".tool-diff-more");
+  if (button) button.onclick = () => { button.textContent = "Preview đã được giới hạn để bảo vệ màn hình mobile"; button.disabled = true; };
+  currentGroup.querySelector(".tool-children").appendChild(card);
+}
+
 /* ═══════════════════════════════════════════════════════════════════════
    11. BUSY/LOCK STATE
    ═══════════════════════════════════════════════════════════════════════ */
@@ -1890,11 +1921,12 @@ function handleEvent(msg) {
       currentGroup = null;
       appendInfoCard(`┤ step ${escapeHtml(d.step)}  ctx ~${escapeHtml((d.ctx_est||0).toLocaleString())} tok  model ${escapeHtml(d.model)}`, "step dim");
       break;
-    case "tool_start": {
+      case "tool_start": {
       stopSpinner();
       const icon = TOOL_ICON[d.name] || "⚙";
       const previewText = formatToolPreview(d.name, d.args, d.preview);
-      openToolGroup(d.name, icon, `<span class="mono tool-arg-chip">${previewText}</span>`);
+        openToolGroup(d.name, icon, `<span class="mono tool-arg-chip">${previewText}</span>`);
+        appendToolDiff(d.diff);
       break;
     }
     case "tool_end":

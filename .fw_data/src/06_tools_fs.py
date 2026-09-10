@@ -147,11 +147,18 @@ def _validate_bash_command(command: str, for_serve: bool = False):
 
 
     if name == "git":
-        lower = [a.lower() for a in argv[1:]]
-        if "push" in lower:
-            return False, "git push là thay đổi remote và không được chạy qua Bash tool.", argv
-        if "clean" in lower or ("reset" in lower and "--hard" in lower):
-            return False, "git clean và git reset --hard bị chặn vì khó khôi phục.", argv
+        # Git parses aliases, external diff drivers and global config before it
+        # executes a subcommand.  In particular, `git -c alias.x='!…' x`
+        # launches a second shell and bypasses this tool's no-chaining policy.
+        # Keep Bash Git access to direct, read-only built-ins only.
+        safe_git_subcommands = {"status", "diff", "log", "show", "rev-parse", "ls-files", "grep"}
+        if len(argv) < 2 or argv[1].lower() not in safe_git_subcommands:
+            return False, "Chỉ cho phép git status/diff/log/show/rev-parse/ls-files/grep.", argv
+        blocked_git_args = {"-c", "-C", "--config-env", "--exec-path", "--paginate", "-p",
+                            "--output", "--ext-diff", "--textconv", "--no-index"}
+        if any(a in blocked_git_args or a.startswith(("-c", "-C", "--config-env=", "--exec-path=", "--output="))
+               for a in argv[2:]):
+            return False, "Git config/path/pager/external-diff options bị chặn.", argv
     if name in ("npm", "pnpm", "yarn") and "publish" in [a.lower() for a in argv[1:]]:
         return False, "Publish package là thay đổi remote và bị chặn.", argv
 
@@ -332,7 +339,7 @@ def _serve_kill_existing(key: str) -> str | None:
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)  # cứng đầu -> kill hẳn
         except ProcessLookupError:
             pass  # đã chết giữa lúc kiểm tra -- không sao
-        except Exception as write_error:
+        except Exception:
             pass  # dọn best-effort, không để lỗi kill làm hỏng luồng start-mới
     return old_cmd
 
@@ -905,7 +912,7 @@ def _compact_heavy_tool_call(tc: dict) -> dict:
     """Strip large replay-unsafe payloads from an old tool call."""
     name = tc.get("function", {}).get("name", "")
     if name not in {
-        "write", "multiedit", "apply_patch", "edit", "todowrite",
+        "write", "append", "multiedit", "apply_patch", "edit", "todowrite",
         "task", "delegate", "question",
     }:
         return tc
@@ -1514,45 +1521,13 @@ def tool_read(path, offset=1, limit=READ_DEFAULT_LIMIT, depth=4, state=None):
         lines.append(f"\n({count} files shown, depth={depth})")
         return "\n".join(lines)
 
-    # B4 FIX: _recent_writes trước đây chỉ được .add()/.clear(), không bao giờ
-    # được đọc — comment "block read-after-write" không có tác dụng thật.
-    # Enforce mềm: nếu file vừa được write/edit trong turn này (đã có sẵn
-    # trong _file_cache, đúng nội dung mới nhất), trả thẳng từ cache kèm
-    # cảnh báo, không đọc lại disk — tiết kiệm 1 tool-call thật như rule
-    # "Re-read after edit = FORBIDDEN" trong system prompt đã yêu cầu.
+    # A write/edit result gives the model a useful immediate snapshot, but it
+    # must not become a read barrier.  Formatters, tests, hooks, background
+    # processes, and future tools can all change the file after a mutation.
+    # Returning the full cached slice also does not save model tokens -- it is
+    # still appended as a tool result.  Keep the marker for write/undo state,
+    # but let an explicit `read` observe disk normally.
     resolved_key = str(p.resolve())
-    # FIX (bug #7): trước đây nhánh này (a) không gọi _cache_invalidate() nên
-    # có thể trả về nội dung CŨ nếu file bị sửa từ bên ngoài app (process khác,
-    # user tự sửa tay, git checkout...) ngay sau write/edit gần nhất nhưng
-    # trước khi _cache_validate_all() chạy lại (nó chỉ chạy lazy, sau bước có
-    # write — xem 09_api_system.py); và (b) không cập nhật _file_read_time,
-    # khiến edit's version-safety check (tool_edit) dùng observation lỗi thời
-    # nếu thứ tự gọi đổi trong tương lai. Giờ luôn validate cache bằng hash
-    # trước khi quyết định dùng, và luôn cập nhật read-time khi trả từ cache.
-    if resolved_key in _recent_writes and resolved_key in _file_cache:
-        _cache_invalidate(resolved_key)  # pop khỏi _file_cache nếu hash lệch (external edit)
-    if resolved_key in _recent_writes and resolved_key in _file_cache:
-        cached = _file_cache[resolved_key]
-        cached_lines = cached["content"].splitlines()
-        ctotal = len(cached_lines)
-        start  = max(0, int(offset) - 1)
-        end    = start + int(limit)
-        sliced = cached_lines[start:end]
-        out = (
-            f"[policy] '{path}' đã được write/edit trong turn này — trả từ cache, "
-            f"không đọc lại disk (content đã biết, xem rule re-read).\n"
-            f"File: {p}\nVersion: {_content_hash(cached['content'])}\n"
-            f"Lines {start+1}-{min(end, ctotal)} of {ctotal}\n"
-            + "─" * 60 + "\n"
-            + "\n".join(f"{start+1+i}\t{l}" for i, l in enumerate(sliced))
-        )
-        remaining = ctotal - end
-        if remaining > 0:
-            out += f"\n\n(+{remaining} more lines — call read with offset={end+1} if truly needed)"
-        _record_file_observation(p, cached["content"])
-        return _head_tail(out, _read_output_cap(int(limit)), label="read output")
-    # Nếu vừa pop cache vì external edit, bỏ luôn khỏi _recent_writes để
-    # nhánh đọc disk thật bên dưới chạy bình thường, không tự coi là "đã biết".
     _recent_writes.discard(resolved_key)
 
     try:
@@ -1753,7 +1728,7 @@ def tool_write(path, content, conn=None, sid=None):
         except FileExistsError:
             return (f"[error] write only creates new files; '{p}' already exists. "
                     f"Use edit, multiedit, or apply_patch for existing files.")
-        except Exception:
+        except Exception as write_error:
             # An I/O failure during an exclusive create can leave a partial
             # new file. Remove only the file this call successfully created;
             # never touch a pre-existing target that lost the race.
@@ -1797,6 +1772,81 @@ def tool_write(path, content, conn=None, sid=None):
         amap = _anchor_map(lines)
         return (f"Written {content_bytes} bytes → {p} ({total} lines){redirected}"
                 + (f"\n{amap}" if amap else ""))
+    except UnicodeEncodeError as e:
+        return f"[error: content contains characters that cannot be encoded as UTF-8: {e}]"
+    except Exception as e:
+        return f"[error: {e}]"
+
+
+def tool_append(path, content, create=False, conn=None, sid=None):
+    """Append text atomically, with the same observation and undo guarantees as edit."""
+    if not isinstance(path, str) or not isinstance(content, str) or not isinstance(create, bool):
+        return "[error: path and content must be strings; create must be a boolean]"
+    if _contains_compaction_marker(content):
+        return _COMPACTION_MARKER_ERROR
+    try:
+        content_bytes = len(content.encode("utf-8"))
+    except UnicodeEncodeError as e:
+        return f"[error: content contains characters that cannot be encoded as UTF-8: {e}]"
+    if content_bytes > 5 * 1024 * 1024:
+        return (f"[error] appended content is too large ({content_bytes:,} bytes). "
+                "Split it into smaller append calls.")
+    try:
+        p = _resolve_to_sandbox(path)
+    except ValueError as e:
+        return f"[sandbox] {e}"
+    if not p.exists():
+        if create:
+            return tool_write(path, content, conn, sid)
+        return f"[not found: {p}] Use write first, or set create=true."
+    if p.is_dir():
+        return (f"[error] '{path}' is a directory; append only works on a single "
+                "file. Pick a file inside it if that's what you meant.")
+    try:
+        before_mode = p.stat().st_mode & 0o7777
+    except PermissionError as e:
+        return f"[error] permission denied reading '{path}' metadata: {e}"
+    try:
+        before = p.read_text()
+    except PermissionError as e:
+        return f"[error] permission denied reading '{path}': {e}"
+    except UnicodeDecodeError as e:
+        return (f"[error] '{path}' is not valid UTF-8 text and cannot be appended to "
+                f"as text: {e}")
+    try:
+        if not _file_matches_observation(p, before):
+            return (f"[error] File '{path}' differs from the version last read. "
+                    "Read it again before appending.")
+        after = before + content
+        after_bytes = len(after.encode("utf-8"))
+        if after_bytes > 10 * 1024 * 1024:
+            return (f"[error] resulting file would be too large ({after_bytes:,} bytes). "
+                    "Limit is 10 MiB; split the file or use extract/apply_patch.")
+        try:
+            _atomic_write_text(p, after)
+        except PermissionError as e:
+            return f"[error] permission denied writing '{path}': {e}"
+        _record_file_observation(p, after)
+        _cache_put(str(p), after, _active_session_id())
+        _recent_writes.add(str(p.resolve()))
+        if conn and sid:
+            try:
+                _undo_stack.append(snapshot_save(
+                    conn, sid, str(p.resolve()), before, after,
+                    before_mode=before_mode, after_mode=p.stat().st_mode & 0o7777))
+            except Exception as e:
+                try:
+                    _snapshot_restore(p, before, before_mode)
+                except Exception as rollback_error:
+                    return (f"[error] snapshot failed ({e}); append rollback failed: "
+                            f"{rollback_error}")
+                _cache_put(str(p), before, _active_session_id())
+                _record_file_observation(p, before)
+                _recent_writes.discard(str(p.resolve()))
+                return f"[error] snapshot failed; append rolled back: {e}"
+            _redo_stack.clear()
+        return (f"Appended {content_bytes} bytes → {p} "
+                f"({len(after.splitlines())} lines total)")
     except UnicodeEncodeError as e:
         return f"[error: content contains characters that cannot be encoded as UTF-8: {e}]"
     except Exception as e:
@@ -1929,7 +1979,8 @@ def tool_extract(src, start, end, dst, mode="move", conn=None, sid=None):
     dst_before = None
     src_before = None
     try:
-        src_lines = sp.read_text().splitlines(keepends=True)
+        src_before = sp.read_text()
+        src_lines = src_before.splitlines(keepends=True)
         src_before_mode = sp.stat().st_mode & 0o7777
         n = len(src_lines)
         if start < 1 or end < start or start > n:
@@ -1961,11 +2012,14 @@ def tool_extract(src, start, end, dst, mode="move", conn=None, sid=None):
         # khác sửa src giữa lúc agent đọc và lúc extract move, phần sửa đó
         # bị ghi đè mất trắng không cảnh báo. Check TRƯỚC khi ghi bất cứ gì
         # (kể cả dst) để giữ toàn bộ thao tác atomic-đúng-nghĩa khi fail.
-        if mode == "move":
-            resolved_src = str(sp.resolve())
-            if not _file_matches_observation(sp, "".join(src_lines)):
-                return (f"[error] File '{src}' differs from the version last read. "
-                        "Read it again before extracting with mode='move'.")
+        # A copy must also be internally consistent: do not write a destination
+        # from a source snapshot that changed while this operation was running.
+        if sp.read_text() != src_before:
+            return (f"[error] File '{src}' changed while extracting. "
+                    "Read it again and retry.")
+        if mode == "move" and not _file_matches_observation(sp, src_before):
+            return (f"[error] File '{src}' differs from the version last read. "
+                    "Read it again before extracting with mode='move'.")
 
         _atomic_write_text(dp, dst_after)
         dst_written = True
@@ -1998,7 +2052,6 @@ def tool_extract(src, start, end, dst, mode="move", conn=None, sid=None):
         result = f"Extracted lines {start}-{end} of {sp} → {dp} ({len(chunk)} lines)"
 
         if mode == "move":
-            src_before = "".join(src_lines)
             new_src_lines = src_lines[:start-1] + src_lines[end:]
             src_after = "".join(new_src_lines)
             _atomic_write_text(sp, src_after)

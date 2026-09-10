@@ -30,18 +30,20 @@ def mcp_is_active() -> bool:
 _DEFAULT_MCP_SERVERS: dict = {}
 
 def mcp_servers_load() -> dict:
-    cfg = load_config()
-    if "mcp_servers" not in cfg:
-        cfg["mcp_servers"] = dict(_DEFAULT_MCP_SERVERS)
-        save_config(cfg)
-    return cfg["mcp_servers"]
+    with _pool_lock, _config_file_lock():
+        cfg = load_config()
+        if "mcp_servers" not in cfg:
+            cfg["mcp_servers"] = dict(_DEFAULT_MCP_SERVERS)
+            save_config(cfg)
+        return cfg["mcp_servers"]
 
 def mcp_servers_save(servers: dict):
     if not isinstance(servers, dict):
         raise ValueError("mcp_servers must be an object")
-    cfg = load_config()
-    cfg["mcp_servers"] = servers
-    save_config(cfg)
+    with _pool_lock, _config_file_lock():
+        cfg = load_config()
+        cfg["mcp_servers"] = servers
+        save_config(cfg)
 
 def mcp_add_server(name: str, url: str, headers: dict | None = None, transport: str = "http"):
     if not _MCP_NAME_RE.fullmatch(name or ""):
